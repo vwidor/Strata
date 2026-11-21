@@ -38,7 +38,6 @@
 #define cudaGetLastError hipGetLastError
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaMemGetInfo hipMemGetInfo
-#define cudaDataType_t hipDataType
 #define cublasHandle_t hipblasHandle_t
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
@@ -46,10 +45,19 @@
 #define CUBLAS_STATUS_SUCCESS HIPBLAS_STATUS_SUCCESS
 #define CUBLAS_OP_T HIPBLAS_OP_T
 #define CUBLAS_OP_N HIPBLAS_OP_N
+#if HIP_VERSION_MAJOR < 6
+#define cudaDataType_t hipblasDatatype_t
+#define CUDA_R_32F HIPBLAS_R_32F
+#define CUDA_R_16F HIPBLAS_R_16F
+#define CUDA_R_16BF HIPBLAS_R_16B
+#define VIT_COMPUTE_32F HIPBLAS_R_32F
+#else
+#define cudaDataType_t hipDataType
 #define CUDA_R_32F HIP_R_32F
 #define CUDA_R_16F HIP_R_16F
 #define CUDA_R_16BF HIP_R_16BF
 #define VIT_COMPUTE_32F HIPBLAS_COMPUTE_32F
+#endif
 #define VIT_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 #define cublasGemmEx hipblasGemmEx
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx

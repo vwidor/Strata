@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import random
+import queue
+import threading
+from unittest.mock import Mock
 import sys
 import unittest
 from pathlib import Path
@@ -23,6 +26,26 @@ def engine(batch, groups, pipelined=True):
     e.slot_used = [0.0] * batch
     e.slot_gs = gs if pipelined and groups > 1 else 0
     return e
+
+
+class Retirement(unittest.TestCase):
+    def test_acknowledgement_releases_only_the_requested_slot(self):
+        e = engine(2, 1)
+        e.slot_busy = [True, True]
+        e.slot_q = [queue.Queue(), queue.Queue()]
+        e.slot_releasing, e.slot_claims = set(), {0, 1}
+        e.slot_cv = threading.Condition()
+        e.gen = 7
+        e.alive = lambda: True
+        e._send = Mock()
+        retired = threading.Event()
+        e._release_slot_when_done(0, [11, 12], 7, on_retired=retired.set)
+        e._send.assert_called_once_with("BSTOP 0")
+        self.assertFalse(retired.is_set())
+        e.slot_q[0].put("BDONE 0 2 stop")
+        self.assertTrue(retired.wait(2))
+        self.assertEqual(e.slot_busy, [False, True])
+        self.assertEqual(e.slot_held[0], [11])
 
 
 class Pipelined(unittest.TestCase):

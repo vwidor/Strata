@@ -602,6 +602,9 @@ ninja -C build-906 strata
 | IQ4 table lookup | llama.cpp's `v_perm_b32` sequence | none |
 | QSA prompt attention | The FP32 kernel | none |
 
+For two 32 GiB MI50s, the [Flash-Next profile generator](DUAL_MI50_FLASH_NEXT.md)
+includes an opt-in, three-slot IQ3_S configuration.
+
 **Two cards: try `--pipeline-windows 2` (off by default on gfx906).** The first card starts the next verify window while the
 second still verifies this one ([MULTI_GPU.md](MULTI_GPU.md)). Add `--trim-stage-weights` with the explicit `--layer-split`.
 In the config: `"args": [ ..., "--pipeline-windows", "2", "--trim-stage-weights" ]`. `--pipeline-windows 0` is the plain loop.

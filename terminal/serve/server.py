@@ -1597,7 +1597,7 @@ class StrataEngine:
         if self.gen == born and self.alive():
             self._silent(what)
 
-    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, born: int | None = None):
+    def _release_slot_when_done(self, slot: int, stream: list[int] | None = None, born: int | None = None, *, on_retired=None):
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
@@ -1655,6 +1655,8 @@ class StrataEngine:
                 busy[slot] = False
                 releasing.discard(slot)
                 self.slot_cv.notify_all()
+            if on_retired is not None and confirmed and self.gen == born and self.alive():
+                on_retired()
         threading.Thread(target=wait, daemon=True).start()
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
@@ -2327,7 +2329,14 @@ class StrataEngine:
                 elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream, born)    # freed at its BDONE
+                    observer = getattr(self, 'admission_retirement', None)
+                    # Capture a request-specific callback before its handler leaves this thread.
+                    on_retired = None
+                    try:
+                        if observer and cancel.is_set():
+                            on_retired = observer(born)
+                    finally:
+                        self._release_slot_when_done(slot, stream, born, on_retired=on_retired)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False

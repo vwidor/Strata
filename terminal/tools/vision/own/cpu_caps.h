@@ -10,6 +10,10 @@
 #include <cstring>
 #include <string>
 
+#if defined(__clang__) && __clang_major__ < 18 && defined(__x86_64__)
+#include <cpuid.h>
+#endif
+
 #if defined(_MSC_VER) && (defined(__x86_64__) || defined(_M_X64))
 #include <immintrin.h>
 #include <intrin.h>
@@ -55,7 +59,12 @@ inline Caps probe() {
     c.avx = __builtin_cpu_supports("avx");      // libgcc tests the OS ymm state for it
     c.avx2 = __builtin_cpu_supports("avx2");
     c.fma = __builtin_cpu_supports("fma");
+#if defined(__clang__) && __clang_major__ < 18
+    unsigned eax, ebx, ecx, edx;
+    c.f16c = c.avx && __get_cpuid(1, &eax, &ebx, &ecx, &edx) && (ecx & bit_F16C);
+#else
     c.f16c = __builtin_cpu_supports("f16c");
+#endif
     c.avx512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq") && __builtin_cpu_supports("avx512vl");
     return c;
 }

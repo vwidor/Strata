@@ -574,8 +574,17 @@ def gguf_facts(path: Any) -> dict[str, Any] | None:
                     break                                   # the words follow: everything wanted comes before them
                 if etype in _GGUF_SCALAR:
                     pos += count * _GGUF_SCALAR[etype]
+                elif etype == 8:                            # e.g. Orca general.tags before the dimensions
+                    if count > (len(head) - pos) // 8:
+                        return None
+                    for _ in range(count):
+                        (slen,) = struct.unpack_from("<Q", head, pos)
+                        pos += 8
+                        if slen > len(head) - pos:
+                            return None
+                        pos += slen                         # skip words only inside the bounded header
                 else:
-                    break                                   # an array of words before the tokens: not looked into
+                    break
             else:
                 break
             if pos > len(head):
