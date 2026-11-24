@@ -1,5 +1,7 @@
 # AGENTS.md
 
+**Git workflow:** This is our private fork. Always commit and push your changes after completing work unless explicitly told not to.
+
 Version 0.2.17, engine 0.1.63. The public model families are
 Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and
 source-backed claims. Articles and videos should use **[docs/MEDIA_KIT.md](docs/MEDIA_KIT.md)**.
