@@ -5317,6 +5317,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
+        // the entries of one expert as a chain in routing order (next_of: the next entry with the same first_of, -1 at the end), and each distinct
+        // expert's place in `distinct` (q_of, by its first entry): the walks below follow the chain instead of scanning all n entries per expert
+        int64_t next_of[kMaxWindowEntries], tail_of[kMaxWindowEntries];
+        int q_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
         // a helper GPU (RemoteExperts) holding the expert computes it in its own VRAM once begin() claims the row: like
         // the peer tier's, such an expert is no miss of this plan and never part of the PCIe share, which would read it
@@ -5327,11 +5331,34 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (d.remote[r]->holds(d.layers, e)) return true;
             return false;
         };
+        // first_of[i]: the first entry routed to ids[i] - a table by expert id (a generation stamp clears it), a scan only for an id outside it
+        static thread_local std::vector<int32_t> seen_at;
+        static thread_local std::vector<uint32_t> seen_gen;
+        static thread_local uint32_t gen = 0;
+        if (seen_at.size() < (size_t) std::max<int64_t>(d.n_expert, 0)) {
+            seen_at.assign((size_t) d.n_expert, -1);
+            seen_gen.assign((size_t) d.n_expert, 0u);
+        }
+        if (++gen == 0u) { std::fill(seen_gen.begin(), seen_gen.end(), 0u); gen = 1u; }
         for (int64_t i = 0; i < n; ++i) {
+            const int32_t ei = ids[i];
             first_of[i] = i;
-            for (int64_t j = 0; j < i; ++j)
-                if (ids[j] == ids[i]) { first_of[i] = first_of[j]; break; }
+            if (ei >= 0 && ei < d.n_expert) {
+                if (seen_gen[(size_t) ei] == gen) first_of[i] = seen_at[(size_t) ei];
+                else { seen_gen[(size_t) ei] = gen; seen_at[(size_t) ei] = (int32_t) i; }
+            } else {
+                for (int64_t j = 0; j < i; ++j)
+                    if (ids[j] == ei) { first_of[i] = first_of[j]; break; }
+            }
+            next_of[i] = -1;
+            if (first_of[i] != i) {
+                next_of[tail_of[first_of[i]]] = i;
+                tail_of[first_of[i]] = i;
+            } else {
+                tail_of[i] = i;
+            }
             if (first_of[i] == i) {
+                q_of[i] = nd;
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
@@ -5350,9 +5377,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
-                int q = 0;
-                while (q < nd && distinct[q] != first_of[i]) ++q;
-                if (q < nd) minr[q] = std::min(minr[q], (int) (i % k));
+                const int q = q_of[first_of[i]];
+                minr[q] = std::min(minr[q], (int) (i % k));
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
@@ -5415,8 +5441,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int kd = -1;
             unsigned long long ptr = 0;
             if (skip_d[q]) {                       // STRATA_ROUTE_TAIL_SKIP: neither copied nor computed
-                for (int64_t i = i0; i < n; ++i)
-                    if (first_of[i] == i0) kind[i] = -2;
+                for (int64_t i = i0; i >= 0; i = next_of[i]) kind[i] = -2;
                 continue;
             }
             if (e >= 0 && e < d.n_expert) {
@@ -5445,17 +5470,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++miss_rank;
                 }
             }
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+            for (int64_t i = i0; i >= 0; i = next_of[i]) kind[i] = kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
-                    P.dst[entries] = (int32_t) i;
-                    P.tok[entries] = (int32_t) (i / k);
-                    ++entries;
-                }
+            for (int64_t i = i0; i >= 0; i = next_of[i]) {
+                P.dst[entries] = (int32_t) i;
+                P.tok[entries] = (int32_t) (i / k);
+                ++entries;
+            }
             ++groups;
         }
         P.start[groups] = entries;
@@ -5465,12 +5488,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
-            for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
-                    P.dst[entries] = (int32_t) i;
-                    P.tok[entries] = (int32_t) (i / k);
-                    ++entries;
-                }
+            for (int64_t i = i0; i >= 0; i = next_of[i]) {
+                P.dst[entries] = (int32_t) i;
+                P.tok[entries] = (int32_t) (i / k);
+                ++entries;
+            }
             ++d.pcie_experts;
         }
         if (d.fetch_admit > 0 && P.dst2 != nullptr)
