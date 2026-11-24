@@ -274,3 +274,20 @@ While GPU 1 still waits on CPU misses, faster GPU 1 kernels mostly turn into mor
 Prefill (assumed shares of prefill time, pending `STRATA_PREFILL_TIMING`): P1 INT8 tile sweep and device-built group records (~45%) → 559 fresh / 856 long; P2 rocBLAS tuning enabled for gfx906 (~18%) → 579 / 887; P3 GDN prompt recurrence (~12%) → 598 / 915; P4 QSA mode-3 FP16-pair attention (~8%) → 614 / 939; P5 chunk and copy scheduling (2–5%) → **636 fresh (590–688) / 973 long (903–1,053)** from 509 / 761–797.
 
 Not counted: pipelining for penalized requests (same-cache `pw=2` gave +27% prose and +21% code), a ROCm 7.x rebuild (no controlled MI50 run), and moving the drafter to GPU 0 or split 27/28 (GPU 0 has 862 MiB beyond vision; the drafters need about 1.3 GiB and a layer about 953 MiB of experts).
+
+### 9.4 Prepared for the next benchmark window (built, not yet measured)
+New opt-in switches. The default path is unchanged, and none of them has a measurement yet:
+
+| Switch | Roadmap step | What it does | Output |
+|---|---|---|---|
+| `STRATA_BATCH_DF2_CAP=1` | 3 | With `STRATA_PIPED_MTP=N`, the slot drafters make N drafts a window, not `--spec - 1` (head, top-k and selector walk for N rows; the 8-row block is unchanged). | The first N drafts are bitwise the same (`set_max_drafts`). |
+| `STRATA_DF2_Q4_NARROW=1` | 3 | Q4_0 drafter GEMMs with 1–4 columns compute only those columns (variants 17, 26, 31, 36, 38). | Bitwise the same per column. |
+| `STRATA_PCIE_NEVER=1` | 2 | With `--pcie-frac 0`, verify windows skip the PCIe flag wait and the empty PCIe grouped launches, and the pool is told never to plan a PCIe share (a request's own `pcie_frac` included). | Unchanged: the share was always empty. |
+| (always on) | 2 | The host expert plan uses an id table and per-expert entry chains instead of O(n²) scans. | Identical groups and order (checked on 200,000 random windows). |
+
+`terminal/tools/decode_ab.py` runs the A/B: one profile, arms that differ by binary, environment or engine arguments, medians of fresh prefill, solo prose and code decode, and 3- and 4-request bursts, plus the engine's own batch rows/s. Planned rounds, each against a `base` arm of the same build with the switches off and, in round A, the production binary:
+- **A:** `STRATA_BATCH_DF2_CAP`, `STRATA_DF2_Q4_NARROW`, `STRATA_PCIE_NEVER`, and all three together.
+- **B:** `STRATA_CPU_IQ_ALL_EXACT1`, `STRATA_KQ_SPLIT`, `STRATA_FUSE_HITS`, `STRATA_BATCH_SLOT_RUNS`, `STRATA_PIPE_ADAPT_EVERY=0`, `STRATA_SH_STREAM`, one at a time.
+- **C:** `STRATA_EXP_MODE=8`, `STRATA_BATCH_GDN_GROUPS`, `STRATA_POOL_DEP=0`, `--pool-tasks 12` and `24`.
+
+Run the engine under the same user, groups and `LimitMEMLOCK=infinity` as the production service (for example with `systemd-run`), with the build configured exactly as production's (`STRATA_PORTABLE=ON`; a default configure gives a native-CPU build that differs).
