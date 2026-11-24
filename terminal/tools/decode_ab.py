@@ -5,7 +5,8 @@
         --arm cap:STRATA_BATCH_DF2_CAP=1 --arm new@/path/to/strata:STRATA_PCIE_NEVER=1 --runs 3 --out ab-results
 
 An arm is NAME, NAME:ENV=VALUE,ENV=VALUE or NAME@EXE:ENV=VALUE,...  (EXE replaces the profile's "exe"; ENV is added
-to the profile's "env", and ENV= with no value removes that variable).  For each arm the tool writes a copy of the
+to the profile's "env", and ENV= with no value removes that variable).  An item --flag=value sets an engine argument
+instead: it replaces the flag's value in the profile's "args", or is appended.  For each arm the tool writes a copy of the
 profile (its exe and env, its own engine log, no vision reader), starts the server with it, waits until the model is
 loaded, warms up, and measures:
 
@@ -99,11 +100,14 @@ def chat(base, key, model, text, max_tokens, timeout=900.0):
 def parse_arm(spec: str):
     name, _, envs = spec.partition(":")
     name, _, exe = name.partition("@")
-    env = {}
+    env, args = {}, []
     for kv in filter(None, envs.split(",")):
         k, _, v = kv.partition("=")
-        env[k.strip()] = v.strip()
-    return {"name": name, "exe": exe or None, "env": env}
+        if k.strip().startswith("--"):
+            args.append((k.strip(), v.strip()))
+        else:
+            env[k.strip()] = v.strip()
+    return {"name": name, "exe": exe or None, "env": env, "args": args}
 
 
 def med(xs):
@@ -122,6 +126,15 @@ def run_arm(arm, a, base_profile, out_dir: Path, log):
         else:
             env[k] = v
     prof["env"] = env
+    pargs = list(prof.get("args") or [])
+    for flag, val in arm.get("args", []):
+        if flag in pargs:
+            i = pargs.index(flag)
+            if val and i + 1 < len(pargs):
+                pargs[i + 1] = val
+        else:
+            pargs += [flag] + ([val] if val else [])
+    prof["args"] = pargs
     prof.pop("vision", None)
     engine_log = out_dir / f"{arm['name']}.engine.log"
     prof["log"] = str(engine_log)
@@ -196,6 +209,12 @@ def run_arm(arm, a, base_profile, out_dir: Path, log):
         else:
             acc = [r["draft_ok"] / r["draft_n"] for r in rows if r.get("draft_n")]
             s[k] = {"decode_tps": med([r["decode_tps"] for r in rows]), "accept": med(acc)}
+    try:   # the engine's own batch rate (the pipelined loop prints rows/s per burst, admissions included)
+        import re
+        rates = [float(m) for m in re.findall(r"rows in \d+ ms = ([0-9.]+) rows/s", engine_log.read_text(errors="replace"))]
+        s["engine_batch_rows_s"] = {"median": med(rates), "n": len(rates)}
+    except OSError:
+        pass
     res["summary"] = s
     return res
 
