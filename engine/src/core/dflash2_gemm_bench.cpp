@@ -1,12 +1,15 @@
 // src/core/dflash2_gemm_bench.cpp - the drafter's Q8 GEMM (kernels/dflash2.hpp df2_gemm) on random planar weights: GB/s per shape and column count.
 //
-//     dflash2_gemm_bench [iters] [q4]      (q4: the Q4_0 pack's GEMM, kernels/cuda/dflash2.cu gemm4_*)
+//     dflash2_gemm_bench [iters] [q4] [ncols]      (q4: the Q4_0 pack's GEMM, kernels/cuda/dflash2.cu gemm4_*; ncols 1..8, default 8)
+//
+// Every variant is compared bitwise against variant 1 at the same column count (STRATA_DF2_Q4_NARROW=1 with ncols <= 4: the narrow kernels).
 //
 // Weight sets are cycled through 2 GiB of distinct matrices so the L2 cache cannot hold them (the drafter reads each matrix once per round).
 #include "strata/kernels/dflash2.hpp"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +19,7 @@
 int main(int argc, char** argv) {
     const int iters = argc > 1 ? std::atoi(argv[1]) : 50;
     const bool q4 = argc > 2 && std::strcmp(argv[2], "q4") == 0;
+    const int ncols = argc > 3 ? std::max(1, std::min(8, std::atoi(argv[3]))) : 8;
     const int wnum = q4 ? 18 : 34;   // bytes of a 32-weight block: the Q8 pack's int8 + fp16 scale, the Q4_0 pack's nibbles + fp16 scale
     struct Shape { const char* name; int n_in, n_out; int mats; };
     const Shape shapes[] = {{"gate+up 2560->7680 x2", 2560, 7680, 2}, {"down 7680->2560", 7680, 2560, 1}, {"qkv 2560->(4096,1024,1024)", 2560, 4096, 3},
@@ -32,6 +36,15 @@ int main(int argc, char** argv) {
         for (auto& p : w) {
             if (cudaMalloc((void**) &p, wbytes) != cudaSuccess) { std::fprintf(stderr, "alloc\n"); return 1; }
             cudaMemset(p, 0x11, wbytes);
+        }
+        {   // the matrices the bitwise check reads: random codes (the fp16 scales stay 0x1111, finite)
+            uint32_t rw = 4242u;
+            for (int i = 0; i < sh.mats; ++i) {
+                const size_t codes = (size_t) sh.n_out * sh.n_in / (q4 ? 2 : 1);
+                std::vector<uint8_t> hw(codes);
+                for (auto& v : hw) { rw = rw * 1664525u + 1013904223u; v = (uint8_t) (rw >> 24); }
+                cudaMemcpy(w[(size_t) i], hw.data(), codes, cudaMemcpyHostToDevice);
+            }
         }
         uint8_t* xq;
         float *xd, *y;
@@ -52,7 +65,6 @@ int main(int argc, char** argv) {
         if (q4) for (int v = 24; v <= 45; ++v) vars.push_back(v);
         for (int var : vars) {
             strata::kernels::df2_gemm_variant(var);
-            const int ncols = 8;
             const size_t ny = (size_t) 8 * sh.n_out * (sh.mats == 3 ? 3 : sh.mats);
             {   // bitwise against variant 1
                 strata::kernels::Df2Mat m[3];
@@ -64,7 +76,7 @@ int main(int argc, char** argv) {
                 std::vector<float> hy(ny);
                 cudaMemcpy(hy.data(), y, ny * 4, cudaMemcpyDeviceToHost);
                 if (var == 1) yref = hy;
-                std::printf("%s %-30s variant %2d: %s  ", q4 ? "q4" : "q8", sh.name, var, std::memcmp(hy.data(), yref.data(), ny * 4) == 0 ? "bitwise" : "DIFFERS");
+                std::printf("%s c%d %-30s variant %2d: %s  ", q4 ? "q4" : "q8", ncols, sh.name, var, std::memcmp(hy.data(), yref.data(), ny * 4) == 0 ? "bitwise" : "DIFFERS");
             }
             cudaDeviceSynchronize();
             cudaEventRecord(a);
