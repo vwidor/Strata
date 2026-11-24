@@ -220,3 +220,57 @@ Note: if using a custom `model_name` not matched by `drafting.py:supported_model
 4. **Native wave64 `gfx906` expert hit kernels (`iq_kernels.cu`, `strata_hip.h`):** Targets **24.2% of all GPU compute (`15.50 ms/win`, currently `126–175 GB/s`)** — eliminate 32-lane logical warp overhead in `Split<18/21/22>`, audit VGPR spills, and switch unsigned `strata_dp4a` to `__builtin_amdgcn_udot4`.
 5. **Dynamic split sizing & token-conditioned `B` block in Pipelined DFlash2:** Pick the `A`/`B` split dynamically from `pp[0..6]` instead of fixed `half=4` and test conditioning DFlash2's block on `B.tok[1..B.T-1]`.
 6. **Modern ROCm (6.3+ / 7.x) + Clang 20+ container rebuild for `gfx906`:** Upgrade past Debian Trixie ROCm 5.7 / Clang 17 / `rocBLAS 5.5` for better VGPR allocation and faster FP16 prefill GEMMs.
+
+---
+
+## 9. Static Code Audit & Projected Roadmap (unconfirmed, not yet measured)
+
+Four read-only audits of `550a628` (MMVQ/router, MoE experts and CPU misses, pipeline/DFlash2, prefill/HC/GDN/QSA/build). Everything below comes from **reading code**. No build or GPU run backs these findings yet. Treat each as unconfirmed static analysis until it is A/B tested on the rig.
+
+### 9.1 Flags that do nothing on this gfx906 build
+- `STRATA_PF_FUSED=1`: the gfx906 `dev_info()` returns before setting `ok`, so `native_supported()` declines the IQ layers (`moe_fused_iq.cu`). Prefill already uses the grouped INT8 expert kernels (`native_expert_i8`).
+- `STRATA_ROCBLAS_TUNING`: CMake leaves the rocBLAS solution-table hook and `tune_rocblas` out of the gfx906 compatibility build (`strata_gpu_engine.cmake`).
+- `STRATA_GDN_CHUNKED=1`: the HIP chunked recurrence needs gfx11/gfx12 WMMA.
+- `STRATA_GFX906_ATTN_QUERY_SWIZZLE` / `STRATA_GFX906_ATTN_REDUCE12`: both need KV mode 1 (INT8 K and V). The main model runs `k8v4` (mode 3), so they only reach an INT8 drafter pool.
+- `STRATA_Q8_PACKED=1`: the feature is on, but no Q8_0 matrix in this model passes its size rule (`ssm_out`/`attn_output` are `6144 → 2560`, input above 4096; shared experts are 640 wide).
+- `STRATA_TOPK_REG_MIN_BLOCKS`: only affects calls that pass an active block count. Ordinary decode calls do not.
+- Forcing `STRATA_QIL=1` on HIP can call an interleave producer stub that throws.
+
+### 9.2 Other findings
+- **`chain late = 0` does not prove DFlash2 is hidden.** The counter only counts MTP chains (`chain_kind == 1`). DFlash2 uses `df2_kind`/`df2_live`. Trace draft-ready time against the verdict instead.
+- **Batch slots run a 7-output draft head** but `STRATA_PIPED_MTP=3` checks at most 3 proposals. The Q4_0 drafter GEMMs on gfx906 (variant 17) compute 8 columns even for 1.
+- **Empty PCIe branch at `--pcie-frac 0`.** The partial-resident graph still waits on B and launches Mode 7 PCIe CTAs that exit at their group guard.
+- **Mode 7 IQ gate/up spends 16 dot ops per 32 values.** Half are sign corrections. The grid magnitudes are strictly positive (IQ3_XXS 4–62, IQ3_S 1–15, IQ2_S 8–43), so `(grid ^ mask) + (mask & 0x01010101)` makes the signed bytes exactly and cuts it to 8 dots.
+- **Q5_K gate/up runs the CUDA-layout `native_gu_kernel<13>`** by default on HIP. `STRATA_KQ_SPLIT=1` selects the grouped `Split<13>` path.
+- **Hot dots are already signed `sdot4`.** Porting the unsigned `__dp4a` overload to `udot4` is correct but saves about 0 ms on these kernels. This corrects item 4 of section 8.
+- **The interleaved MMVQ path is compiled out on HIP.** A port should reuse the `Q81Il` layout but keep the gfx906 wave64 sum tree. `kIlRows*` and `STRATA_MMVQ_IL_*` have no effect today. This refines item 3 of section 8.
+- **Router at T=1:** the single-token top-10 launches 256 threads, returns all but one logical half-wave, and still hits `__syncthreads()`. `route_multi` uses a wave barrier.
+- **Hyper-connections:** the split down kernel's LDS tile is `T × 2,048 × 4` bytes, 64 KiB at T=8, so one block per CU. HC moves 13.19 MB per read (0.67/0.57 ms per window at full HBM speed) against 3.58/2.86 ms measured at T=1. `HC_PERSIST` rejects `warpSize != 32`.
+- **`STRATA_DF2_STAGE=first` crash:** first suspect is the reverse-direction `cudaMemcpy2DAsync` in the prefill tap callback, done across devices while holding `dland.mu` with P2P off.
+- **Penalized requests:** the `pl_pw >= 2` fallback checks `hist_n > 0`, so it also triggers for a nonzero window with neutral penalties.
+
+### 9.3 Projected roadmap (estimates from the measured profile)
+Model: each kernel step cuts a share of one bucket of the section 5 profile. Pipelined throughput follows the slower GPU (weight 0.7 solo code, 0.5 prose, 0.9 batch), and 80–85% of wall time is taken as GPU-bound. On GPU 1, half of each kernel saving is assumed to turn into longer CPU wait, scaled by the wait still left. Steps 3 and 10 use direct ranges from the pipeline audit. Values are the middle estimate. Ranges come from the audit low/high bounds. Baselines are the measured `c9d1824` numbers (prose uses the 40.3 midpoint).
+
+| Step (cumulative tok/s after it, GPU 1 shared as measured) | Solo prose | Solo code | 3× batch prose | 4× batch code |
+|---|---:|---:|---:|---:|
+| Today (measured) | 38.5–42.1 | 60.8 | 61.3 | 82.2 |
+| 1. Flag-only A/B round (`CPU_IQ_ALL_EXACT1`, `KQ_SPLIT`, `FUSE_HITS`, `BATCH_SLOT_RUNS`, `--pool-tasks`, `PIPE_ADAPT_EVERY`) | 40.7 | 61.4 | 62.3 | 83.5 |
+| 2. Cut GPU 1 CPU-expert wait (zero-share PCIe graph, O(n) host plan, residency by wait saved per MiB) | 41.8 | 63.3 | 65.4 | 87.7 |
+| 3. Lighter DFlash2 drafting (batch head 7→3, Q4_0 widths 1–4) | 42.8 | 64.9 | 68.6 | 93.4 |
+| 4. Faster Q6_K LM head | 43.3 | 65.8 | 70.5 | 95.8 |
+| 5. Wide dense GEMVs (activation reuse) | 44.4 | 67.9 | 73.0 | 99.3 |
+| 6. Router top-10 + BF16 tiles | 44.6 | 68.2 | 73.6 | 100.2 |
+| 7. MoE hit kernels (signed bytes, decode reuse, wave64) | 45.5 | 69.4 | 74.9 | 101.9 |
+| 8. Hyper-connection rework (LDS tiles, exact-T, wave64 Q8) | 46.7 | 71.1 | 76.5 | 104.1 |
+| 9. Batch GDN, QSA + leftovers | 47.4 | 72.0 | 77.7 | 105.7 |
+| 10. Smarter split + batch scheduling | **50.0** | **77.8** | **81.6** | **110.4** |
+| Range of the total | 44.9–56.0 | 68.9–88.5 | 71.3–94.5 | 96.5–127.9 |
+| With GPU 1 dedicated (drop `--vram-reserve-later-mib 10400`): that step alone | 43.3 | 65.8 | 69.4 | 93.0 |
+| With GPU 1 dedicated: total | **54.6** (48.8–61.2) | **86.4** (76.0–98.6) | **93.0** (81.1–107.1) | **125.9** (109.8–144.9) |
+
+While GPU 1 still waits on CPU misses, faster GPU 1 kernels mostly turn into more wait: in the shared case GPU 1 stays the slower stage (about 30.1 vs 25.5 ms per batch window after step 10). With GPU 1 dedicated the two stages end near balance (24.4 vs 25.5 ms).
+
+Prefill (assumed shares of prefill time, pending `STRATA_PREFILL_TIMING`): P1 INT8 tile sweep and device-built group records (~45%) → 559 fresh / 856 long; P2 rocBLAS tuning enabled for gfx906 (~18%) → 579 / 887; P3 GDN prompt recurrence (~12%) → 598 / 915; P4 QSA mode-3 FP16-pair attention (~8%) → 614 / 939; P5 chunk and copy scheduling (2–5%) → **636 fresh (590–688) / 973 long (903–1,053)** from 509 / 761–797.
+
+Not counted: pipelining for penalized requests (same-cache `pw=2` gave +27% prose and +21% code), a ROCm 7.x rebuild (no controlled MI50 run), and moving the drafter to GPU 0 or split 27/28 (GPU 0 has 862 MiB beyond vision; the drafters need about 1.3 GiB and a layer about 953 MiB of experts).
