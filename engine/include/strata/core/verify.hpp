@@ -437,6 +437,8 @@ public:
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    /// (STRATA_PCIE_NEVER: the caller also sets strata::core::set_pcie_never, so the pool cannot plan one.)
+    void set_no_pcie(bool on) { no_pcie_ = on; }
 
     /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
     /// each step's GPU work (the plan's arrival, the PCIe part's start, the wait for the CPU's rows; GPU clock), the host
@@ -601,6 +603,7 @@ private:
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+    bool no_pcie_ = false;                ///< set_no_pcie: no wait for the PCIe share and no PCIe launches
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device

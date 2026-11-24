@@ -13150,6 +13150,20 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        // STRATA_PCIE_NEVER=1 (opt-in) with --pcie-frac 0: no verifier waits for or launches the PCIe share (empty at that share, but its wait and its
+        // grouped launches still ran in every partial-resident layer), and the pool is told never to plan one, so a request's own pcie_frac cannot either.
+        if (const char* pn = std::getenv("STRATA_PCIE_NEVER"); pn != nullptr && pn[0] != '\0' && pn[0] != '0') {
+            if (o.pcie_frac == 0.0 && !o.pcie_frac_auto && !pcie_balance()) {
+                strata::core::set_pcie_never(true);
+                ver.set_no_pcie(true);
+                for (int st = 1; st < n_stages; ++st) stage_ver(st).set_no_pcie(true);
+                if (pipe)
+                    for (int st = 0; st < n_stages; ++st) stage_ver_p(st, 1).set_no_pcie(true);
+                std::fprintf(stderr, "strata serve: STRATA_PCIE_NEVER: no PCIe share in the verify windows (every miss is the CPU's)\n");
+            } else {
+                std::fprintf(stderr, "strata serve: STRATA_PCIE_NEVER is off: it needs --pcie-frac 0, no automatic share and no STRATA_PCIE_BALANCE\n");
+            }
+        }
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it

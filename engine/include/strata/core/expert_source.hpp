@@ -716,6 +716,11 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
 
+/// STRATA_PCIE_NEVER: the verifiers skip the PCIe share's wait and launches (Verifier::set_no_pcie), so the pool never plans one -
+/// every miss is the CPU's, whatever --pcie-frac or a request says.  Process-wide; set before the first window.
+void set_pcie_never(bool on);
+bool pcie_never();
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
 

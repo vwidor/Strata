@@ -5107,6 +5107,12 @@ bool FileExpertSource::pcie_layer(int64_t layer) const {
 
 // ================================ THE ADAPTER ================================
 
+namespace {
+std::atomic<bool> g_pcie_never{false};
+}
+void set_pcie_never(bool on) { g_pcie_never.store(on, std::memory_order_relaxed); }
+bool pcie_never() { return g_pcie_never.load(std::memory_order_relaxed); }
+
 bool ExpertDispatch::fetch_can(int64_t layer) const {
     return fetch_admit > 0 && res_mut != nullptr && !usage.empty() && plan != nullptr && plan->pcie_mode == 2 &&
            plan->dst2 != nullptr && peer == nullptr && remote_count == 0 && fs == nullptr && pcie_num > 0 &&
@@ -5406,7 +5412,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             std::fputc(10, route_dump);
         }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
-        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
+        const bool pcie_ok = !pcie_never() && (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
         int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
         // decode step; with >= 2 misses give it at least one (the last in routing order).  It only flies if its blob is
