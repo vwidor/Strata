@@ -13057,10 +13057,19 @@ int main(int argc, char** argv) {
             return df2.landing();
         };
         if (batch_df2 && use_df2) {   // the slot drafters bind to the solo drafter's head and embedding and capture their graphs on their own landing
+            int slot_drafts = (o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec) - 1;
+            // STRATA_BATCH_DF2_CAP=1 (opt-in): the pipelined groups check at most STRATA_PIPED_MTP proposals a slot, so the slot drafters' head, top-k
+            // and selector walk run for that many rows, not --spec - 1 (set_max_drafts: the first rows are bitwise the same).  The block still runs 8 rows.
+            if (const char* cap = std::getenv("STRATA_BATCH_DF2_CAP"); cap != nullptr && cap[0] != '\0' && cap[0] != '0' && piped_mtp && pm_drafts > 0 &&
+                                                                       pm_drafts < slot_drafts) {
+                std::fprintf(stderr, "strata serve: STRATA_BATCH_DF2_CAP: the slot drafters make %d draft%s a window, not %d\n", pm_drafts,
+                             pm_drafts == 1 ? "" : "s", slot_drafts);
+                slot_drafts = pm_drafts;
+            }
             for (size_t b = 0; b < slot_df2.size(); ++b) {
                 auto& d = *slot_df2[b];
                 if (!d.clone_bind(df2, err)) { std::fprintf(stderr, "strata serve: STRATA_BATCH_DF2: slot %zu: %s\n", b, err.c_str()); return 1; }
-                d.set_max_drafts((o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec) - 1);
+                d.set_max_drafts(slot_drafts);
                 if (!d.prepare(d.landing(), err)) { std::fprintf(stderr, "strata serve: STRATA_BATCH_DF2: slot %zu: %s\n", b, err.c_str()); return 1; }
             }
             std::fprintf(stderr, "strata serve: STRATA_BATCH_DF2: %zu slot drafters ready (batch windows carry each slot's token and its spare-row drafts)\n", slot_df2.size());
@@ -16383,6 +16392,9 @@ int main(int argc, char** argv) {
                     want = std::min<int>(want, (int) std::max<int64_t>(0, strata::core::slot_cap(q.max_new, q.hold) - q.produced - 1));
                     want = std::min<int>(want, (int) std::max<int64_t>(0, (int64_t) o.max_context - q.p - 2));
                     want = std::min(want, df2_cap);
+#if defined(STRATA_HAVE_DFLASH2)
+                    want = std::min(want, slot_df2[(size_t) act_ids[k]]->max_drafts());   // a capped drafter (STRATA_BATCH_DF2_CAP) makes no more
+#endif
                     if (q.draft_ready && df2_conf > 0.0) {   // a draft row is worth its cost where the chain so far is likely: the product of the selector's probabilities
                         double chain = 1.0;
                         int keep_n = 0;

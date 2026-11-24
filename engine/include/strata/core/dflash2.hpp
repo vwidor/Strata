@@ -149,6 +149,7 @@ public:
     /// many rows only: the first `n` drafts and probabilities are bitwise the ones a full block makes (every row is its own column, the walk goes left to right);
     /// draft() returns token 0 with probability 0 for the rest.  Before prepare() / the first draft(); a later change drops the captured graphs.
     void set_max_drafts(int n);
+    int max_drafts() const { return ndraft_; }
 
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
