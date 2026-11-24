@@ -890,6 +890,35 @@ bool Verifier::gather_taps(float* landing, int landing_device, int row0, int row
     return true;
 }
 
+bool Verifier::gather_stage_taps(float* landing, int landing_device, int row0, int rows, int dst_row0, cudaStream_t wait_stream, std::string& err) {
+    if (tap_layers_.empty() || !tap_on_ || rows <= 0) return true;
+    const int64_t N = g_->n_embd;
+    const int nt_all = tap_total();
+    const OnDevice on_stage(device_);
+    if (wait_stream != nullptr && tap_ev_ == nullptr &&
+        cudaEventCreateWithFlags(&tap_ev_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "verify: the stage tap gather event could not be created";
+        return false;
+    }
+    int slot0 = 0;
+    for (int l : tap_req_) if (l >= 0 && l < g_->n_layers - 1 && l < lb_) ++slot0;
+    const int64_t nv = (int64_t) tap_layers_.size();
+    for (int r = 0; r < rows; ++r) {
+        const float* src = tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N);
+        float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
+        const cudaError_t ce = device_ == landing_device
+            ? cudaMemcpyAsync(dst, src, (size_t) (nv * N) * 4, cudaMemcpyDeviceToDevice, cs_)
+            : cudaMemcpyPeerAsync(dst, landing_device, src, device_, (size_t) (nv * N) * 4, cs_);
+        if (ce != cudaSuccess) { err = std::string("verify: the stage tap gather copy: ") + cudaGetErrorString(ce); return false; }
+    }
+    if (wait_stream != nullptr) {
+        if (cudaEventRecord(tap_ev_, cs_) != cudaSuccess) { err = "verify: the stage tap gather event"; return false; }
+        const OnDevice on_dst(landing_device);
+        if (cudaStreamWaitEvent(wait_stream, tap_ev_, 0) != cudaSuccess) { err = "verify: the drafter stream cannot wait on a stage's taps"; return false; }
+    }
+    return true;
+}
+
 // STRATA_TAP_FILE: one record per row of the window: int32 position, int32 input token, then n_taps x n_embd floats
 void Verifier::tap_write(int T, const int32_t* tokens, int64_t pos0) {
     if (tap_file_ == nullptr) return;

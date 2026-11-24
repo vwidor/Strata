@@ -7849,10 +7849,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: WARNING: STRATA_PIPED_MTP is off: %s\n", why);
             piped_mtp = false;
         } else {
-            std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d pipelined group%s of %d slot%s draft up to %d MTP "
+            std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d pipelined group%s of %d slot%s draft up to %d %s "
                                  "proposal%s per slot each window\n", o.batch_groups, o.batch_groups == 1 ? "" : "s",
                          o.batch / o.batch_groups, o.batch / o.batch_groups == 1 ? "" : "s", pm_drafts,
-                         pm_drafts > 1 ? "s" : "");
+                         batch_df2_wanted ? "DFlash2" : "MTP", pm_drafts > 1 ? "s" : "");
         }
     }
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
@@ -16807,6 +16807,7 @@ int main(int argc, char** argv) {
         std::vector<char> pm_drafting(bs.size(), 0);
         std::vector<int> pm_all_kept(bs.size(), 0);   // (STRATA_SLOT_READ_AHEAD: a forced window's rows per slot, for its commits)
         std::vector<cudaEvent_t> pm_copied(pmtp ? bs.size() : 0, nullptr);
+        std::vector<cudaEvent_t> pm_s0_ev(pmtp && batch_df2 ? bs.size() : 0, nullptr);
         if (pmtp) {
             const strata::core::OnDevice on_last(stage_verifier(n_pipe - 1).device());
             for (cudaEvent_t& e : pm_copied)
@@ -16814,10 +16815,51 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP: event creation failed\n");
                     return 1;
                 }
+            if (batch_df2) {
+                const strata::core::OnDevice on_first(stage_verifier(0).device());
+                for (cudaEvent_t& e : pm_s0_ev)
+                    if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP (DFlash2): stage-0 event creation failed\n");
+                        return 1;
+                    }
+            }
         }
         // the chain of slot b has landed: its proposals are the slot's next drafts (1), still drafting (0), or an error (-1)
         auto pmtp_poll_draft = [&](int b, bool wait) -> int {
             if (!pm_drafting[(size_t) b]) return 1;
+#if defined(STRATA_HAVE_DFLASH2)
+            if (batch_df2) {
+                strata::core::Dflash2Drafter& d = *slot_df2[(size_t) b];
+                const strata::core::OnDevice on_d(d.device());
+                if (!wait) {
+                    const cudaError_t q = cudaStreamQuery(d.stream());
+                    if (q == cudaErrorNotReady) return 0;
+                    if (q != cudaSuccess) { std::printf("ERR batch DFlash2 slot %d: %s\n", b, cudaGetErrorString(q)); return -1; }
+                }
+                if (pm_drafting[(size_t) b] == 2) {
+                    if (!d.context_wait(err)) { std::printf("ERR batch DFlash2 slot %d context: %s\n", b, err.c_str()); return -1; }
+                    pm_drafting[(size_t) b] = 0;
+                    return 1;
+                }
+                int32_t dd[strata::core::Dflash2Drafter::kDrafts];
+                float pp[strata::core::Dflash2Drafter::kDrafts];
+                if (!d.draft_finish(dd, pp, err)) { std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str()); return -1; }
+                pm_drafting[(size_t) b] = 0;
+                BSlot& sl = bs[(size_t) b];
+                int nd = 0;
+                double chain = 1.0;
+                const int cap = std::min(pm_drafts, (int) strata::core::Dflash2Drafter::kDrafts);
+                for (int j = 0; j < cap && j < (int) sl.draft.size(); ++j) {
+                    sl.draft[(size_t) j] = dd[j];
+                    sl.dprob[(size_t) j] = pp[j];
+                    if (df2_conf <= 0.0 || (chain *= (double) pp[j]) >= df2_conf) nd = j + 1;
+                    else break;
+                }
+                sl.n_drafts = nd;
+                sl.draft_ready = true;
+                return 1;
+            }
+#endif
             for (;;) {
                 const int r = slot_mtp[(size_t) b]->chain_poll(err);
                 if (r < 0) { std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); return -1; }
@@ -17016,6 +17058,21 @@ int main(int argc, char** argv) {
                 // (a lookup window may have started before the chain behind the window before it had landed; it has by
                 // now, and it is collected before the rows it read are written again)
                 if (pmtp_poll_draft(blk.b, true) < 0) return false;
+#if defined(STRATA_HAVE_DFLASH2)
+                if (batch_df2) {
+                    strata::core::Dflash2Drafter& d = *slot_df2[(size_t) blk.b];
+                    if (!vk.gather_stage_taps(d.landing(), d.device(), blk.f, blk.keep, 0, nullptr, err)) {
+                        std::printf("ERR batch DFlash2 slot %d last-stage taps: %s\n", blk.b, err.c_str());
+                        return false;
+                    }
+                    const strata::core::OnDevice on_last(vk.device());
+                    if (cudaEventRecord(pm_copied[(size_t) blk.b], vk.stream()) != cudaSuccess) {
+                        std::printf("ERR batch DFlash2 slot %d last-stage event\n", blk.b);
+                        return false;
+                    }
+                    continue;
+                }
+#endif
                 const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) blk.b]->device());
                 const float* src = vk.final_R_all() + (size_t) blk.f * stride;
                 if (cudaMemcpyAsync(slot_mtp_rows[(size_t) blk.b].get(), src, (size_t) blk.n * stride * sizeof(float),
@@ -17139,6 +17196,36 @@ int main(int argc, char** argv) {
             // the lookup drafts that window); the chain waits for the copy of its rows (above).
             for (const Blk& blk : blks) {
                 BSlot& sl = bs[(size_t) blk.b];
+#if defined(STRATA_HAVE_DFLASH2)
+                if (batch_df2) {
+                    strata::core::Dflash2Drafter& d = *slot_df2[(size_t) blk.b];
+                    d.note_rows(G.tok + blk.f, blk.keep, G.pos[blk.f]);
+                    const bool want_draft = sl.active && !sl.rd_on;
+                    const bool want_ctx = !want_draft && (sl.active || (blk.ended && G.pos[blk.f] + blk.keep <= o.max_context));
+                    if (!want_draft && !want_ctx) continue;
+                    const strata::core::OnDevice on_d(d.device());
+                    if (cudaStreamWaitEvent(d.stream(), pm_s0_ev[(size_t) blk.b], 0) != cudaSuccess ||
+                        cudaStreamWaitEvent(d.stream(), pm_copied[(size_t) blk.b], 0) != cudaSuccess) {
+                        std::printf("ERR batch DFlash2 slot %d wait event\n", blk.b);
+                        return false;
+                    }
+                    sl.draft_ready = false;
+                    if (want_draft) {
+                        if (!d.draft_launch(d.landing(), blk.keep, G.pos[blk.f], outb[blk.f + blk.keep - 1], err)) {
+                            std::printf("ERR batch DFlash2 slot %d: %s\n", blk.b, err.c_str());
+                            return false;
+                        }
+                        pm_drafting[(size_t) blk.b] = 1;
+                    } else {
+                        if (!d.context_async(d.landing(), blk.keep, G.pos[blk.f], err)) {
+                            std::printf("ERR batch DFlash2 slot %d context: %s\n", blk.b, err.c_str());
+                            return false;
+                        }
+                        pm_drafting[(size_t) blk.b] = 2;
+                    }
+                    continue;
+                }
+#endif
                 // (it ended: no more drafts for it.  STRATA_SLOT_READ: its drafter still catches up on the rows this
                 // window kept, so the conversation's next turn - read in this slot - finds every cell of the draft
                 // layer's K/V; not at the context's end, where the chain's step would have no cell)
@@ -17248,7 +17335,33 @@ int main(int argc, char** argv) {
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
-                if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
+                if (k + 1 < n_pipe) {
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (pmtp && batch_df2) {
+                        for (int f = 0; f < G.S;) {
+                            const int b = G.rows[f];
+                            int n = 1;
+                            while (f + n < G.S && G.rows[f + n] == b) ++n;
+                            strata::core::Dflash2Drafter& d = *slot_df2[(size_t) b];
+                            if (!vk.gather_stage_taps(d.landing(), d.device(), f, n, 0, nullptr, err)) {
+                                std::printf("ERR batch DFlash2 slot %d stage %d taps: %s\n", b, k, err.c_str());
+                                return false;
+                            }
+                            if (k == 0) {
+                                const strata::core::OnDevice on_s0(vk.device());
+                                if (cudaEventRecord(pm_s0_ev[(size_t) b], vk.stream()) != cudaSuccess) {
+                                    std::printf("ERR batch DFlash2 slot %d stage 0 event\n", b);
+                                    return false;
+                                }
+                            }
+                            f += n;
+                        }
+                    }
+#endif
+                    G.stage = k + 1;
+                    G.since = pipe_tick;
+                    continue;
+                }
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
                 if (pmtp && !pmtp_verdict(G, vk, outb)) return false;
@@ -19354,7 +19467,7 @@ int main(int argc, char** argv) {
             }();
             int pl_df2_half = [] {
                 const char* v = std::getenv("STRATA_DF2_PW_HALF");
-                return v && v[0] ? std::max(2, std::min(5, std::atoi(v))) : 3;
+                return v && v[0] ? std::max(2, std::min(6, std::atoi(v))) : 4;
             }();
             // The drafter's chain behind a window runs the steps the outputs before them call for (chain_extend), not
             // every step it has graphs for.  STRATA_PIPELINE_LAZY_CHAIN=1 (opt-in): that; unset, the whole chain at once.
@@ -20892,6 +21005,7 @@ int main(int argc, char** argv) {
             // and a window row computes what it would in any other window, so every emitted token is the serial loop's
             // (with STRATA_IQ_MT_MIN=1 bit for bit; sampled requests with the same Philox draw per position).
             bool pl_ran = false;
+            int pl_last_par = 0;
 #if defined(STRATA_HAVE_DFLASH2)
             const bool pl_df2 = use_df2 && req_df2;
 #else
@@ -21599,6 +21713,7 @@ int main(int argc, char** argv) {
                             continue;
                         }
                     }
+                    pl_last_par = A.seq & 1;
                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
 #if defined(STRATA_HAVE_DFLASH2)
@@ -22874,12 +22989,22 @@ int main(int argc, char** argv) {
                         strata::core::Dflash2Drafter& d = *slot_df2[(size_t) admit_slot];
                         int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                         float pp[strata::core::Dflash2Drafter::kDrafts];
-                        if (!ver.gather_taps(d.landing(), d.device(), 0, 1, 0, d.stream(), err) ||
+                        strata::core::Verifier& tv = (pipe && pl_last_par != 0) ? ver_b : ver;
+                        if (!tv.gather_taps(d.landing(), d.device(), 0, 1, 0, d.stream(), err) ||
                             !d.draft(d.landing(), 1, sl.p - 1, sl.x, dd, pp, err)) {
                             std::fprintf(stderr, "strata batch: DFlash2 admission for slot %d failed: %s\n", admit_slot, err.c_str());
                             return 1;
                         }
-                        for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
+                        int nd = 0;
+                        double chain = 1.0;
+                        const int cap = piped_mtp ? std::min(pm_drafts, (int) strata::core::Dflash2Drafter::kDrafts)
+                                                  : (int) strata::core::Dflash2Drafter::kDrafts;
+                        for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) {
+                            sl.draft[(size_t) j] = dd[j];
+                            sl.dprob[(size_t) j] = pp[j];
+                            if (j < cap && (df2_conf <= 0.0 || (chain *= (double) pp[j]) >= df2_conf)) nd = j + 1;
+                        }
+                        sl.n_drafts = nd;
                         sl.draft_ready = true;
                     } else
 #endif
