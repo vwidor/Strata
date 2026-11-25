@@ -285,15 +285,8 @@ New opt-in switches. The default path is unchanged, and none of them has a measu
 | `STRATA_PCIE_NEVER=1` | 2 | With `--pcie-frac 0`, verify windows skip the PCIe flag wait and the empty PCIe grouped launches, and the pool is told never to plan a PCIe share (a request's own `pcie_frac` included). | Unchanged: the share was always empty. |
 | (always on) | 2 | The host expert plan uses an id table and per-expert entry chains instead of O(n²) scans. | Identical groups and order (checked on 200,000 random windows). |
 
-`terminal/tools/decode_ab.py` runs the A/B: one profile, arms that differ by binary, environment or engine arguments, medians of fresh prefill, solo prose and code decode, and 3- and 4-request bursts, plus the engine's own batch rows/s. Planned rounds, each against a `base` arm of the same build with the switches off and, in round A, the production binary:
-- **A:** `STRATA_BATCH_DF2_CAP`, `STRATA_DF2_Q4_NARROW`, `STRATA_PCIE_NEVER`, and all three together.
-- **B:** `STRATA_CPU_IQ_ALL_EXACT1`, `STRATA_KQ_SPLIT`, `STRATA_FUSE_HITS`, `STRATA_BATCH_SLOT_RUNS`, `STRATA_PIPE_ADAPT_EVERY=0`, `STRATA_SH_STREAM`, one at a time.
-- **C:** `STRATA_EXP_MODE=8`, `STRATA_BATCH_GDN_GROUPS`, `STRATA_POOL_DEP=0`, `--pool-tasks 12` and `24`.
-
-Run the engine under the same user, groups and `LimitMEMLOCK=infinity` as the production service (for example with `systemd-run`), with the build configured exactly as production's (`STRATA_PORTABLE=ON`; a default configure gives a native-CPU build that differs).
-
 ### 9.5 Measured: round A (2026-11-25)
-Dual MI50, the production profile (`layer_split` 26, `--pipeline-windows 2`, `--batch 4`, `STRATA_BATCH_DF2=1`, `STRATA_PIPED_MTP=3`, `--vram-reserve-later-mib 16500`: GPU 1 keeps 16.5 GB free for a second model), the second model stopped. `terminal/tools/decode_ab.py`, 3 runs per arm, each arm freshly loaded (a cold expert cache: 80-92% hits, against 94% in long production use), 256-token answers, thinking off. tok/s are medians; "paired" is the median ratio of the same prompt in the same run against `base` (the new build, switches off), with the share of pairs that were faster.
+Dual MI50, the production profile (`layer_split` 26, `--pipeline-windows 2`, `--batch 4`, `STRATA_BATCH_DF2=1`, `STRATA_PIPED_MTP=3`, `--vram-reserve-later-mib 16500`: GPU 1 keeps 16.5 GB free for a second model), the second model stopped. 3 runs per arm, each arm freshly loaded (a cold expert cache: 80-92% hits, against 94% in long production use), 256-token answers, thinking off. tok/s are medians; "paired" is the median ratio of the same prompt in the same run against `base` (the new build, switches off), with the share of pairs that were faster.
 
 | Arm | Solo prose | Solo code | 3x prose | 3x code | 4x prose | 4x code | Paired vs base |
 |---|---|---|---|---|---|---|---|

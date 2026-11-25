@@ -2,6 +2,8 @@
 
 **Git workflow:** This is our public fork. Always commit and push your changes after completing work unless explicitly told not to. Document measured findings, tuning results, profiles, and rejected experiments (e.g. in `docs/MI50_TUNING.md`) so future sessions do not repeat work. **Always anonymize** all committed docs, configs, and commit messages — never include private hostnames, domains, LAN IPs, usernames, internal VM/service IDs, or private client names.
 
+**Benchmarking rule:** Use **fast verification runs** (targeted kernel micro-benchmarks or short single-pass checks of ~30–60 s directly against the running server). Do **not** run slow multi-round full-reload A/B sweeps across many arms.
+
 Version 0.2.17, engine 0.1.63. The public model families are
 Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and
 source-backed claims. Articles and videos should use **[docs/MEDIA_KIT.md](docs/MEDIA_KIT.md)**.
