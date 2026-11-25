@@ -118,122 +118,19 @@ Measured at `layer_split=26`, `--pcie-frac 0`:
 
 ## 7. Recommended Dual-MI50 Production Profile (Anonymized)
 
-Note: if using a custom `model_name` not matched by `drafting.py:supported_model()`, set `"split_engine_note": true` in the JSON profile so the launcher does not strip `--draft dflash2`.
+Copy [the four-slot run config](mi50-four-slot.example.json) and replace the placeholder paths with your local
+gfx906 binaries and model files. Use the Phase 4 engine and the matching
+[rocBLAS tuning table](../terminal/tools/hip/gfx906-rocblas-2.47.0.txt). Set `cwd` to the checkout's
+`terminal` directory so the engine can find `data/expert-profile.bin`.
 
-```json
-{
-  "exe": "/path/to/build-906/strata",
-  "backend": "hip",
-  "gpu": [0, 1],
-  "gpu_order": "as_given",
-  "layer_split": "28",
-  "parallel": 4,
-  "drafting": "dflash2",
-  "mtp": false,
-  "remote_expert_opt": false,
-  "split_skip_if_fits": false,
-  "host": "127.0.0.1",
-  "port": 11433,
-  "env": {
-    "STRATA_SPLIT_OVERLAP": "0",
-    "STRATA_ROUTE_TAIL_SKIP": "0",
-    "STRATA_BATCH_YIELD_CHUNKS": "1",
-    "STRATA_HIP_PROMPT_F16": "1",
-    "STRATA_PW_WITH_BATCH": "1",
-    "STRATA_GFX906_ATTN_QUERY_SWIZZLE": "1",
-    "STRATA_GFX906_ATTN_REDUCE12": "1",
-    "STRATA_GR_SPLIT": "3",
-    "STRATA_WAVE_MMVQ_V2": "1",
-    "STRATA_EXP_MODE": "11",
-    "STRATA_MMVF_WAVE": "1",
-    "STRATA_HIP_ROUTER_WAVE_FAST": "1",
-    "STRATA_HANDOFF_PIPE": "4",
-    "STRATA_SLOT_COPY_DIRECT": "1",
-    "STRATA_SLOT_COPY_BATCHSYNC": "1",
-    "STRATA_QSA_SLOTS": "1",
-    "STRATA_CKPT_POOL": "1",
-    "STRATA_CKPT_THREADS": "1",
-    "STRATA_PIPE_BYIELD_NODRAIN": "1",
-    "STRATA_HIP_SWIGLU_FUSED": "1",
-    "STRATA_SELECT_SIMT": "2",
-    "STRATA_TOPK_REG_MIN_BLOCKS": "4096",
-    "STRATA_GDN_HEAD": "1",
-    "STRATA_GDN_PP": "2",
-    "STRATA_GDN_CONVL2": "1",
-    "STRATA_GDN_NOY": "1",
-    "STRATA_FUSE_DECODE": "1",
-    "STRATA_FUSE_HEAD_GR": "1",
-    "STRATA_Q8_PACKED": "1",
-    "STRATA_SMALL_UNR": "3",
-    "STRATA_CVEC_FUSE": "1",
-    "STRATA_PF_FUSED": "1",
-    "STRATA_SLOT_READ": "1",
-    "STRATA_SLOT_READ_WIDE": "1",
-    "STRATA_SLOT_READ_AHEAD": "1",
-    "STRATA_PIPE_ADAPT_EVERY": "auto",
-    "STRATA_CRASH_BT": "1",
-    "STRATA_BATCH_DF2": "1",
-    "STRATA_PIPED_MTP": "3",
-    "STRATA_BATCH_DF2_CAP": "1",
-    "STRATA_DF2_Q4_NARROW": "1",
-    "STRATA_PCIE_NEVER": "1",
-    "STRATA_CPU_IQ_ALL_EXACT1": "1",
-    "STRATA_SPLIT_OWN_BUFFERS": "0",
-    "STRATA_PF_W16_CACHE_MIB": "0",
-    "STRATA_DF2_HEAD": "indexed",
-    "STRATA_TRIM_VERIFY_SCRATCH": "1",
-    "STRATA_LEAN_SLOTS": "1",
-    "STRATA_SHARED_KV_CELLS": "131072",
-    "STRATA_PW_PENALTY": "1",
-    "STRATA_PW_FORK_B": "1",
-    "STRATA_DF2_PW_DYN": "1",
-    "STRATA_BATCH_DYN_GROUPS": "1",
-    "STRATA_BATCH_SLOT_RUNS": "1",
-    "STRATA_FUSE_HITS": "1",
-    "STRATA_ROCBLAS_TUNING": "/path/to/gfx906-rocblas-2.47.0.txt",
-    "STRATA_I8_TM": "7",
-    "STRATA_QSA_PA_GFX906": "1",
-    "STRATA_PF_I8_GPU_PLAN": "1",
-    "STRATA_ATTN_MERGE_V2": "1"
-  },
-  "args": [
-    "--pack", "/path/to/pack-iq3s",
-    "--native", "/path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
-    "--ple-gguf", "/path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
-    "--expert-profile", "data/expert-profile.bin",
-    "--expert-cache", "auto",
-    "--prefill", "2048",
-    "--prefill-pipe", "1",
-    "--ple-io", "ram",
-    "--pcie-frac", "0",
-    "--trim-stage-weights",
-    "--spec", "8",
-    "--lookup-max-t", "8",
-    "--pipeline-windows", "2",
-    "--max-context", "102400",
-    "--kv", "k8v4",
-    "--vram-reserve-mib", "1024",
-    "--batch-groups", "2",
-    "--conversation-cache-mib", "16384",
-    "--conversation-cache-slots", "16",
-    "--conversation-cache-min-tokens", "4096",
-    "--conversation-cache-park-gain", "512",
-    "--shared-expert-arena", "/dev/shm/strata-iq3s.arena",
-    "--draft", "dflash2",
-    "--draft-model", "/path/to/dflash2-original-q4.pack",
-    "--draft-fallback", "none",
-    "--mtp-draft-vocab", "/path/to/draft_vocab.bin",
-    "--draft-conf", "0.35"
-  ],
-  "vision": {
-    "gpu": true,
-    "cuda_device": 0,
-    "elastic": true,
-    "max_tokens": 1024
-  },
-  "split_engine_note": true
-}
+```sh
+cp docs/mi50-four-slot.example.json mi50-four-slot.json
+python3 terminal/serve/server.py --config mi50-four-slot.json --host 127.0.0.1 --port 11433
 ```
+
+The example listens on loopback at port 11433. Check `/props` for four slots and image support.
+Four slots in two groups share a 131,072-cell KV pool. Each request has a 102,400-token context limit.
+The profile reserves 12,000 MiB on GPU 1 for a second workload and sets the watchdog to 900 seconds.
 
 ---
 

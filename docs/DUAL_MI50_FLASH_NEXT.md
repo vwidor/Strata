@@ -7,6 +7,12 @@ Bildkonfiguration aus der Basisdatei. Die neue Konfiguration bindet auf
 Loopback. Die beiden Ein-Slot-Vergleichsprofile sind ebenfalls verfügbar.
 [Build für gfx906](AMD_HIP.md#gfx906-instinct-mi50--mi60-radeon-vii-wave64-built-from-source)
 
+## Vier Slots mit IQ3_S und DFlash2
+
+Die [Vier-Slot-JSON-Vorlage](mi50-four-slot.example.json) enthält das
+aktuelle Profil mit DFlash2. Lokale Pfade und Startbefehl stehen in der
+[Profilanleitung](MI50_TUNING.md#7-recommended-dual-mi50-production-profile-anonymized).
+
 ## Drei Slots mit IQ3_S
 
 Getestet mit Strata 0.2.17, SC117 Qwen3.8-Flash-Next IQ3_S, einem
