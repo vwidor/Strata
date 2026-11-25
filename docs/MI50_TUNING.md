@@ -142,7 +142,11 @@ Note: if using a custom `model_name` not matched by `drafting.py:supported_model
     "STRATA_PW_WITH_BATCH": "1",
     "STRATA_GFX906_ATTN_QUERY_SWIZZLE": "1",
     "STRATA_GFX906_ATTN_REDUCE12": "1",
-    "STRATA_GR_SPLIT": "1",
+    "STRATA_GR_SPLIT": "3",
+    "STRATA_WAVE_MMVQ_V2": "1",
+    "STRATA_EXP_MODE": "11",
+    "STRATA_MMVF_WAVE": "1",
+    "STRATA_HIP_ROUTER_WAVE_FAST": "1",
     "STRATA_HANDOFF_PIPE": "4",
     "STRATA_SLOT_COPY_DIRECT": "1",
     "STRATA_SLOT_COPY_BATCHSYNC": "1",
@@ -335,6 +339,25 @@ The round was stopped here to bring production back; `STRATA_PIPE_ADAPT_EVERY=0`
 - **Fix (config only, zero changes to the co-resident model):** Set `STRATA_SPLIT_OWN_BUFFERS=0`, `STRATA_PF_W16_CACHE_MIB=0`, and lower `--vram-reserve-later-mib` from `16500` to `12000`.
 - **Measured result:** GPU 1 post-prompt VRAM drop fell from **`-2,730 MiB` → `-174 MiB`**. GPU 1 expert cache grew from **`4,396` (39.0%, `8.82 GiB`) → `6,591 / 11,264` (58.5%, `13.21 GiB`, `+2,195` experts)** while leaving **`1,953 MiB` free** alongside the co-resident model (`~9.8–10.1 GiB` VRAM). On live 27k–35k-token requests, decode expert hit rate rose from `89–93%` to **`95.8–97.6%`** and live decode rose from `25–34 tok/s` to **`38–80 tok/s`**.
 - **Rejected:** Shrinking the co-resident model's `--ubatch-size` (`16384 → 1024`) freed `~4 GiB` idle VRAM, but the model uses non-causal attention requiring `n_ubatch >= n_tokens` and aborts on real prompts up to `16k` tokens.
+
+### 9.9 Phase 1: `gfx906` Wave64 Decode Kernel Rewrites (measured, 2026-11-25)
+Opt-in `gfx906` wave64 rewrites of the four hot decode kernel families (`~86%` of batch GPU compute), compiled with `0 B` scratch spill across all hot paths. Default paths remain byte-identical when flags are unset.
+
+| Opt-in Switch | Kernel Family & Mechanism | Parity / Accuracy | Measured MI50 Micro-Benchmark (`180 W`) |
+|---|---|---|---|
+| `STRATA_WAVE_MMVQ_V2=1` | Dense GEMVs & `Q6_K` LM head (`native_mmvq.cu`): unpack-once wave64 auto-dispatch (1-shot whole-X LDS with pre-converted `float d8` for small `X`, L1/L2 multi-row reuse for wide `X`, `__mul24`, `sched_barrier`) | **Bitwise exact** (`0` diffs across 18 shapes × 6 widths & `mmvq_multi_parity` 148,480 outputs) | `head Q6_K`: `T=1: 1.271→1.052 ms (-17.2%)`, `T=3: -16.1%`, `T=8: 5.492→4.701 ms (-14.4%)`; `gdn qkv/gate Q6_K`: `-11%` to `-46%`; `gdn out Q8_0`: `T=4: -40.7%`, `T=5: -37.9%`; `gdn out IQ4_XS`: `T=1: -25.8%` |
+| `STRATA_EXP_MODE=11` *(or `=10`)* | Routed MoE experts (`iq_kernels.cu`): exact signed-byte `(g^m)+b` (`16→8` `sdot4`/32w), `__mul24`, 16-lane sub-warp fused gate/up+SwiGLU+Q8_1 with split even/odd tree (`0%` idle lanes at `n_embd=2560`, `55–65` VGPRs, `0 B` spill) + `LDS_DOWN_NT=4` down (`62–66` VGPRs) | **Bitwise exact** vs Mode 7 (`0` diffs across all 5 model quant pairs × `T=1,4,8` & `native_grouped_parity` 0 failures) | `iq3_s/iq4_nl`: `T=1: 201.4→178.2 µs (-11.5%)`, `T=4: 411.5→284.0 µs (-31.0%, gu -41.6%)`, `T=8: 793.6→558.4 µs (-29.6%, gu -40.8%)`; `iq3_xxs/iq4_nl`: `T=4/8: -28.3%/-26.3%`; `iq2_s/iq4_nl`: `T=4/8: -23.0%/-21.3%`; `iq4_xs/iq4_nl`: `T=4/8: -23.8%/-20.5%` |
+| `STRATA_GR_SPLIT=3` *(`=2` exact FP32, `=4` hybrid)* | Hyper-connections (`fused_gr.cu`): 10-slice LDS down (`40 KiB` vs `64 KiB`) + wave64 FP16 `v_dot2_f32_f16` down & up (`61–63` VGPRs, `0 B` spill) | `=2`: exact FP32 (`rel RMS 4.5e-8`); `=3`: FP16 `mixed` rel RMS **`3.0–3.3e-5`**, `R` `0.00` exact | `COLD 8 sets` vs `=1`: `T=1: 47.1→37.8 µs (-19.7%)`, `T=2: -23.3%`, `T=4: 71.9→53.0 µs (-26.3%)`, `T=6: 96.3→63.7 µs (-33.9%)`, `T=8: 114.0→81.8 µs (-28.2%)` (`up` `-46.4%`) |
+| `STRATA_MMVF_WAVE=1` + `STRATA_HIP_ROUTER_WAVE_FAST=1` | Router BF16 projection (`native_bf16.cu`) + wave64 top-10 (`router_top10.cu`); `STRATA_NATIVE_ROUTER_SPREAD=1` in `native_router.cu` measured neutral (`~11.9 µs`) | **Bitwise exact** (`0 / 65,536` top-10 diffs; `route_window_parity` 0 failures) | Top-10 (`512/k10`): `55.4→15.2 µs` (`3.63×` at `T=1..8`); BF16 `n_out=512`: `T=1: 45.0→9.9 µs (4.56×)`, `T=8 mmvf: 48.8→25.5 µs (-47.7%)`, `T=8 mmvf+route: 61.6→37.6 µs (-39.0%)` |
+
+**Live End-to-End Dual-MI50 A/B (`layer_split=26`, `--vram-reserve-later-mib 12000`, `19,903` resident experts, warm cache `96–100%` hit, `256` tokens, `temp=0.0`, thinking off):**
+
+| Workload | Baseline (`5f43512`) *(e2e / pure)* | **Phase 1 (5 flags)** *(e2e / pure)* | **Gain** |
+|---|---:|---:|---:|
+| **Solo Prose** | `43.3` / `47.5 tok/s` *(98.1% hit)* | **`49.7` / `54.3 tok/s`** *(98.5% hit)* | **`+14.8%`** e2e / **`+14.3%`** pure |
+| **Solo Code** | `58.5` / `69.8 tok/s` *(96.1% hit)* | **`63.1` / `73.2 tok/s`** *(97.2% hit)* | **`+7.9%`** e2e / **`+4.9%`** pure *(cold warmup `+10.1%`)* |
+| **3× Batch Prose** *(total)* | `63.0` / `71.3 tok/s` *(99.5–100% hit)* | **`72.2` / `81.4 tok/s`** *(100.0% hit)* | **`+14.6%`** e2e / **`+14.2%`** pure |
+| **4× Batch Code** *(total / engine rows/s)* | `83.3` / `101.1` / `88.9 rows/s` *(92.7–97.3% hit)* | **`92.4` / `111.1` / `97.6 rows/s`** *(93.6–98.2% hit)* | **`+10.9%`** e2e / **`+9.9%`** pure / **`+9.8%`** rows/s |
 
 ## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
 The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.

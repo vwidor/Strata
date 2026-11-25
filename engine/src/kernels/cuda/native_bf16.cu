@@ -382,6 +382,111 @@ int mmvf_block_size(int64_t n_in) {
     return best;
 }
 
+#if defined(STRATA_HIP_GFX906)
+// ---- gfx906 wave64 K-tiled BF16 GEMV (opt-in STRATA_MMVF_WAVE=1/2/4):
+// Eliminates the 512-CTA 8-warp LDS reduction & 2 barriers of bf16_f32_mmvf_multi_kernel (which hit 45-48 us on MI50
+// at T=1, 2, 8). Four wave64s per block (256 threads), each wave computes R output rows using 128-bit coalesced uint4
+// weight loads (8 BF16s unpacked once across all NT tokens) against a 512-float K-tile staged in LDS (2 KiB * NT = 16
+// KiB at T=8). Same wave64 reduction across T=1..8 -> every multi-token column is bitwise equal to a single-token call.
+template <int NT, int R>
+__launch_bounds__(256)
+__global__ void bf16_f32_mmvf_wave_kernel(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
+                                          float* __restrict__ y, int64_t ldy, int n_in, int n_out) {
+    __shared__ __align__(16) float xs[NT][512];
+    const int tid = int(threadIdx.x);
+    const int lane = tid & 63;
+    const int wave = tid >> 6;
+    const int row0 = (int(blockIdx.x) * 4 + wave) * R;
+    float acc[R][NT];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int k = 0; k < NT; ++k) acc[r][k] = 0.0f;
+    for (int k0 = 0; k0 < n_in; k0 += 512) {
+        // 256 float2 loads per token -> all 256 threads active even at NT=1, and only 8-byte alignment needed (ldx % 2 == 0).
+        for (int idx = tid; idx < NT * 256; idx += 256) {
+            const int tk = idx >> 8;
+            const int q = idx & 255;
+            reinterpret_cast<float2*>(xs[tk])[q] =
+                __ldg(reinterpret_cast<const float2*>(x + (size_t) tk * ldx + k0) + q);
+        }
+        __syncthreads();
+        if (row0 < n_out) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (row0 + r >= n_out) break;
+                const uint4 wv = __ldg(reinterpret_cast<const uint4*>(w + (size_t) (row0 + r) * n_in + k0) + lane);
+                const float w0 = __uint_as_float(wv.x << 16), w1 = __uint_as_float(wv.x & 0xffff0000u);
+                const float w2 = __uint_as_float(wv.y << 16), w3 = __uint_as_float(wv.y & 0xffff0000u);
+                const float w4 = __uint_as_float(wv.z << 16), w5 = __uint_as_float(wv.z & 0xffff0000u);
+                const float w6 = __uint_as_float(wv.w << 16), w7 = __uint_as_float(wv.w & 0xffff0000u);
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    const float4 x0 = reinterpret_cast<const float4*>(xs[k])[lane * 2 + 0];
+                    const float4 x1 = reinterpret_cast<const float4*>(xs[k])[lane * 2 + 1];
+                    float a = acc[r][k];
+                    a = __fmaf_rn(w0, x0.x, a); a = __fmaf_rn(w1, x0.y, a);
+                    a = __fmaf_rn(w2, x0.z, a); a = __fmaf_rn(w3, x0.w, a);
+                    a = __fmaf_rn(w4, x1.x, a); a = __fmaf_rn(w5, x1.y, a);
+                    a = __fmaf_rn(w6, x1.z, a); a = __fmaf_rn(w7, x1.w, a);
+                    acc[r][k] = a;
+                    if constexpr (R >= 2) __builtin_amdgcn_sched_barrier(0);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row0 >= n_out) return;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r >= n_out) break;
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            float v = acc[r][k];
+#pragma unroll
+            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            if (lane == 0) y[(size_t) k * ldy + row0 + r] = v;
+        }
+    }
+}
+
+int mmvf_wave_mode() {
+    static const int m = [] { const char* v = std::getenv("STRATA_MMVF_WAVE"); return v ? std::atoi(v) : 0; }();
+    return m;
+}
+
+template <int NT>
+void launch_mmvf_wave_t(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out,
+                        int /*r_mode*/, cudaStream_t st) {
+    // R=1 (21-41 VGPRs, 0 spills, 6-10 waves/SIMD) beats R=2/R=4 at every T=1..8 on MI50.
+    const unsigned nb = unsigned(((size_t) n_out + 3u) / 4u);
+    bf16_f32_mmvf_wave_kernel<NT, 1><<<nb, 256, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out);
+}
+
+bool try_launch_mmvf_wave(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int64_t n_in,
+                          int64_t n_out, int n_tok, cudaStream_t st) {
+    const int wm = mmvf_wave_mode();
+    if (wm <= 0 || n_out < 512 || n_tok < 1 || n_tok > 8 || (n_in & 511) != 0 || (ldx & 1) != 0 ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w) & 15u) != 0)
+        return false;
+    const int ni = (int) n_in, no = (int) n_out;
+    switch (n_tok) {
+        case 1: launch_mmvf_wave_t<1>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+        case 2: launch_mmvf_wave_t<2>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+        case 3: launch_mmvf_wave_t<3>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+        case 4: launch_mmvf_wave_t<4>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+        case 5: launch_mmvf_wave_t<5>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+        case 6: launch_mmvf_wave_t<6>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+        case 7: launch_mmvf_wave_t<7>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+        default: launch_mmvf_wave_t<8>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+    }
+    const cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess)
+        throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_wave launch: ") + cudaGetErrorString(result));
+    return true;
+}
+#endif  // STRATA_HIP_GFX906
+
 }  // namespace
 
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
@@ -412,6 +517,11 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    if (n_tok >= 1 && n_tok <= 8 && x != nullptr && w != nullptr && y != nullptr && n_in > 0 && n_out > 0 &&
+        try_launch_mmvf_wave(x, ldx, w, y, ldy, n_in, n_out, n_tok, (cudaStream_t) stream))
+        return;
+#endif
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
     if (n_tok < 1 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 ||
         x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
@@ -486,6 +596,9 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
         (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     const cudaStream_t st = (cudaStream_t) stream;
+#if defined(STRATA_HIP_GFX906)
+    if (try_launch_mmvf_wave(x, n_in, w, y, n_out, n_in, n_out, 1, st)) return;
+#endif
 #define STRATA_MMVF_CASE(N) case N: \
     bf16_f32_mmvf_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in, mmvf_fast()); break
     switch (mmvf_block_size(n_in)) {

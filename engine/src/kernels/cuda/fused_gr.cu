@@ -1985,6 +1985,284 @@ __global__ void gr_down_finish_kernel(GrMulti m) {
     }
 }
 
+// ---- gfx906 STRATA_GR_SPLIT=2 (exact FP32) and =3 (FP16 v_dot2_f32_f16 down):
+// Halves K-slice from 2048 -> 1024 (10 slices, 32 KiB LDS at T=8 -> 2 blocks/CU instead of 1; 16 KiB in F16 mode -> 4 blocks/CU),
+// templates both down and up on exact T = 1..8, and hoists BF16 unpack8() outside the token loop (up to 8x fewer unpacks).
+constexpr int GS2_SL = 1024;
+constexpr int GS2_S = D / GS2_SL;   // 10 slices
+static_assert(D % GS2_SL == 0 && GS2_SL == 64 * 8 * 2, "a wave64 lane takes 2 chunks of 8 per 1024-slice");
+__device__ float g_gr_part2[GS2_S * kFusedGrMaxT * GS_ROWS];
+
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__)
+typedef _Float16 strata_gr_f16x2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ strata_gr_f16x2 gr_f2h2(float a, float b) {
+    return strata_gr_f16x2{(_Float16) a, (_Float16) b};
+}
+__device__ __forceinline__ float gr_fdot2(strata_gr_f16x2 a, strata_gr_f16x2 b, float c) {
+    return __builtin_amdgcn_fdot2(a, b, c, false);
+}
+#endif
+
+template <int T, bool F16>
+__global__ void __launch_bounds__(GS_WAVES * 64) gr_down_split2_kernel(GrMulti m) {
+    float* part = g_gr_part2;
+    extern __shared__ __align__(16) unsigned char tile_raw[];
+    const int t = threadIdx.x, lane = t & 63, wave = t >> 6;
+    const int sl = blockIdx.y;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? wave : blockIdx.x * GS_WAVES + wave;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || wave >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow) + sl * (GS2_SL / 8);
+    uint4 wv[2];
+    if (active) {
+        wv[0] = __ldg(w4 + lane);
+        wv[1] = __ldg(w4 + lane + 64);
+    }
+    const float4* src4 = reinterpret_cast<const float4*>(m.xn);
+    if constexpr (F16) {
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__)
+        strata_gr_f16x2* tile2 = reinterpret_cast<strata_gr_f16x2*>(tile_raw);
+        for (int i = t; i < T * (GS2_SL / 4); i += GS_WAVES * 64) {
+            const int k = i / (GS2_SL / 4), off = i - k * (GS2_SL / 4);
+            const float4 v = src4[((size_t) k * D + (size_t) sl * GS2_SL) / 4 + off];
+            tile2[2 * i + 0] = gr_f2h2(v.x, v.y);
+            tile2[2 * i + 1] = gr_f2h2(v.z, v.w);
+        }
+        __syncthreads();
+        if (!active) return;
+        float acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const Bf16x8 wu = unpack8(wv[q]);
+            const strata_gr_f16x2 w0 = gr_f2h2(wu.a.x, wu.a.y), w1 = gr_f2h2(wu.a.z, wu.a.w);
+            const strata_gr_f16x2 w2 = gr_f2h2(wu.b.x, wu.b.y), w3 = gr_f2h2(wu.b.z, wu.b.w);
+            const int j = lane + 64 * q;
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                const strata_gr_f16x2* x2 = tile2 + k * (GS2_SL / 2) + j * 4;
+                float a = gr_fdot2(w0, x2[0], 0.0f);
+                a = gr_fdot2(w1, x2[1], a);
+                a = gr_fdot2(w2, x2[2], a);
+                a = gr_fdot2(w3, x2[3], a);
+                acc[k] += a;
+                if constexpr (T >= 6) __builtin_amdgcn_sched_barrier(0);
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float v = acc[k];
+#pragma unroll
+            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            if (lane == 0) part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + (inject_block ? LR + row : row)] = v;
+        }
+#endif
+    } else {
+        float* tile = reinterpret_cast<float*>(tile_raw);
+        float4* tile4 = reinterpret_cast<float4*>(tile_raw);
+        for (int i = t; i < T * (GS2_SL / 4); i += GS_WAVES * 64) {
+            const int k = i / (GS2_SL / 4), off = i - k * (GS2_SL / 4);
+            tile4[i] = src4[((size_t) k * D + (size_t) sl * GS2_SL) / 4 + off];
+        }
+        __syncthreads();
+        if (!active) return;
+        float acc[T];
+#pragma unroll
+        for (int k = 0; k < T; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const Bf16x8 wu = unpack8(wv[q]);
+            const int j = lane + 64 * q;
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                acc[k] += dot8u_ptr(wu, tile + k * GS2_SL + j * 8);
+                __builtin_amdgcn_sched_barrier(0);
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float v = acc[k];
+#pragma unroll
+            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            if (lane == 0) part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + (inject_block ? LR + row : row)] = v;
+        }
+    }
+}
+
+template <int T>
+__global__ void gr_down_finish2_kernel(GrMulti m) {
+    const float* part = g_gr_part2;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int k = i / GS_ROWS, r = i - k * GS_ROWS;
+    if (k >= T) return;
+    const bool inject = r >= LR;
+    if (inject && m.a[0].w_inject == nullptr) return;
+    float s = 0.0f;
+#pragma unroll
+    for (int sl = 0; sl < GS2_S; ++sl) s += part[((size_t) sl * kFusedGrMaxT + k) * GS_ROWS + r];
+    if (inject) {
+        m.a[k].inject_out[r - LR] = s;
+    } else {
+        const float x = s / (float) HC;
+        m.a[k].lo[r] = x / (1.0f + __expf(-x));
+    }
+}
+
+// Exact-T, unpack-once version of gr_up_fast_kernel: unpacks each weight chunk ONCE across all T tokens
+// while preserving the exact addition tree ((d0 + d4) + d2) + (d1 + d3) -> xor8: bitwise identical to gr_up_fast_kernel.
+// Loads p=0 weights before __syncthreads() and p=1 weights after p=0 finishes so only 1 pass's weights (20 VGPRs)
+// are live at once -> 0B scratch spills and <= 64 VGPRs!
+template <int T, bool F16 = false>
+__global__ void __launch_bounds__(THREADS) gr_up_fast2_kernel(GrMulti m) {
+    __shared__ __align__(16) float lo[F16 ? 1 : T][F16 ? 1 : LR];
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__)
+    __shared__ __align__(16) strata_gr_f16x2 lo16[F16 ? T : 1][F16 ? LR / 2 : 1];
+#endif
+    __shared__ float g[T][HC][UPM_COLS];
+    const int t = threadIdx.x, j = t & 7, grp = t >> 3;
+    const int d0 = blockIdx.x * UPM_COLS;
+    static_assert(LR % 64 == 0 && LR >= 256 && LR <= 512 && HC * UPM_COLS == 64 && THREADS == 256, "geometry");
+    constexpr int TM = (LR / 8 - 32) / 8;
+    const bool apply = j < T && m.a[j < T ? j : 0].apply;
+    // Prefetch pass 0 weights to overlap with LDS staging of lo
+    uint4 wq[4 + TM + (TM == 0)];
+    {
+        const int r = grp, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) wq[q] = __ldg(w4 + j + 8 * q);
+#pragma unroll
+        for (int mm = 0; mm < TM; ++mm) wq[4 + mm] = __ldg(w4 + 32 + j + 8 * mm);
+    }
+    if constexpr (F16) {
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__)
+        for (int i = t; i < T * (LR / 2); i += THREADS) {
+            const int tk = i / (LR / 2), col2 = i - tk * (LR / 2);
+            const float2 lv = reinterpret_cast<const float2*>(m.a[tk].lo)[col2];
+            lo16[tk][col2] = gr_f2h2(lv.x, lv.y);
+        }
+#endif
+    } else {
+        for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        if (p == 1) {
+            const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) wq[q] = __ldg(w4 + j + 8 * q);
+#pragma unroll
+            for (int mm = 0; mm < TM; ++mm) wq[4 + mm] = __ldg(w4 + 32 + j + 8 * mm);
+        }
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        if (j < T) {
+            const FusedGrArgs& a = m.a[j];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float p02[T], p13[T];
+        if constexpr (F16) {
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__)
+            auto dot8_h = [&](uint4 wv, int off_el, float (&dst)[T], bool add) {
+                const Bf16x8 wu = unpack8(wv);
+                const strata_gr_f16x2 w0 = gr_f2h2(wu.a.x, wu.a.y), w1 = gr_f2h2(wu.a.z, wu.a.w);
+                const strata_gr_f16x2 w2 = gr_f2h2(wu.b.x, wu.b.y), w3 = gr_f2h2(wu.b.z, wu.b.w);
+                const int h2_off = off_el >> 1;
+#pragma unroll
+                for (int k = 0; k < T; ++k) {
+                    const strata_gr_f16x2* x2 = lo16[k] + h2_off;
+                    float a = gr_fdot2(w0, x2[0], 0.0f);
+                    a = gr_fdot2(w1, x2[1], a);
+                    a = gr_fdot2(w2, x2[2], a);
+                    a = gr_fdot2(w3, x2[3], a);
+                    dst[k] = add ? dst[k] + a : a;
+                    if constexpr (T >= 2) __builtin_amdgcn_sched_barrier(0);
+                }
+            };
+            dot8_h(wq[0], j * 8, p02, false);
+            if constexpr (TM >= 1) dot8_h(wq[4], (32 + j) * 8, p02, true);
+            dot8_h(wq[2], (j + 16) * 8, p02, true);
+            dot8_h(wq[1], (j + 8) * 8, p13, false);
+            if constexpr (TM >= 2) dot8_h(wq[5], (40 + j) * 8, p13, true);
+            dot8_h(wq[3], (j + 24) * 8, p13, true);
+#endif
+        } else if constexpr (TM == 1) {
+            auto dot8_f = [&](uint4 wv, int off_el, float (&dst)[T], bool add) {
+                const Bf16x8 u = unpack8(wv);
+#pragma unroll
+                for (int k = 0; k < T; ++k) {
+                    const float a = dot8u_ptr(u, lo[k] + off_el);
+                    dst[k] = add ? dst[k] + a : a;
+                    if constexpr (T >= 2) __builtin_amdgcn_sched_barrier(0);
+                }
+            };
+            dot8_f(wq[0], j * 8, p02, false);
+            dot8_f(wq[4], (32 + j) * 8, p02, true);
+            dot8_f(wq[2], (j + 16) * 8, p02, true);
+            dot8_f(wq[1], (j + 8) * 8, p13, false);
+            dot8_f(wq[3], (j + 24) * 8, p13, true);
+        } else {
+            float pq[4][T];
+#pragma unroll
+            for (int mm = 0; mm < 4; ++mm) {
+                { const Bf16x8 u = unpack8(wq[mm]);
+#pragma unroll
+                  for (int k = 0; k < T; ++k) { pq[mm][k] = dot8u_ptr(u, lo[k] + (j + 8 * mm) * 8); __builtin_amdgcn_sched_barrier(0); } }
+                if (mm < TM) {
+                    const Bf16x8 u = unpack8(wq[4 + mm]);
+#pragma unroll
+                    for (int k = 0; k < T; ++k) { pq[mm][k] += dot8u_ptr(u, lo[k] + (32 + j + 8 * mm) * 8); __builtin_amdgcn_sched_barrier(0); }
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < T; ++k) { p02[k] = pq[0][k] + pq[2][k]; p13[k] = pq[1][k] + pq[3][k]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            const float s = xor8(p02[k] + p13[k]);
+            if (j == k) mine = s;
+        }
+        if (j < T) {
+            float x0 = rv;
+            if (apply) {
+                x0 = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), x0);
+                m.a[j].R_out[i] = x0;
+            }
+            const float x = x0 * wn * rsc;
+            g[j][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);
+}
+
+template <int T, bool F16_DOWN, bool F16_UP>
+void launch_gr_split2_t(const GrMulti& m, bool fast, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+    if (fast) gr_norm_fast_kernel<<<T, THREADS, 0, st>>>(m);
+    else gr_norm_multi_kernel<<<T, THREADS, 0, st>>>(m);
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, st);
+    const size_t sm = (size_t) T * GS2_SL * (F16_DOWN ? sizeof(uint16_t) : sizeof(float));
+    gr_down_split2_kernel<T, F16_DOWN><<<dim3(DOWN_BLOCKS + 1, GS2_S), GS_WAVES * 64, sm, st>>>(m);
+    gr_down_finish2_kernel<T><<<(unsigned) ((T * GS_ROWS + 255) / 256), 256, 0, st>>>(m);
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, st);
+    if (fast) gr_up_fast2_kernel<T, F16_UP><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    else gr_up_multi_kernel<T, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+}
+
 #endif
 
 // ================================ S23 experiment (STRATA_HC_Q8=1): the read with the GGUF's Q8_0 projections ======
@@ -2960,12 +3238,40 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
         return false;   // the v3 read: no q8_1 (the caller quantizes)
     }
 #if defined(STRATA_HIP_GFX906)
-    // gfx906, opt-in STRATA_GR_SPLIT=1: the latency-hidden norm/up (STRATA_GR_FAST) with the K-split down (~3% faster
-    // per verify window).  Its fixed-order finish sums the K slices in another order than the single-token
-    // fused_gr_read, so the multi-token read is then no longer bitwise equal to T single-token calls (gr_parity's
-    // contract); off by default for that reason.
-    static const bool split_on = std::getenv("STRATA_GR_SPLIT") && std::string(std::getenv("STRATA_GR_SPLIT")) == "1";
-    if (split_on && a[0].s_down == nullptr) {   // its K-split down reads bf16 rows (not STRATA_HC_REQ8)
+    // gfx906, opt-in STRATA_GR_SPLIT=1 (5 slices), =2 (10 slices exact FP32), =3 (10 slices FP16 dot2 down+up),
+    // =4 (10 slices FP16 dot2 down + exact FP32 up).
+    static const int split_mode = [] { const char* v = std::getenv("STRATA_GR_SPLIT"); return v ? std::atoi(v) : 0; }();
+    if (split_mode >= 2 && a[0].s_down == nullptr) {
+        const bool fast = gr_fast();
+        const bool f16_d = (split_mode >= 3);
+        const bool f16_u = (split_mode == 3);
+#define STRATA_GR_S2_CASE(K) case K: \
+        if (f16_d && f16_u) launch_gr_split2_t<K, true, true>(m, fast, st, stamp_buf, stamp_i0); \
+        else if (f16_d) launch_gr_split2_t<K, true, false>(m, fast, st, stamp_buf, stamp_i0); \
+        else launch_gr_split2_t<K, false, false>(m, fast, st, stamp_buf, stamp_i0); break
+        switch (n_tok) {
+            STRATA_GR_S2_CASE(1); STRATA_GR_S2_CASE(2); STRATA_GR_S2_CASE(3); STRATA_GR_S2_CASE(4);
+            STRATA_GR_S2_CASE(5); STRATA_GR_S2_CASE(6);
+            case 7: if constexpr (kFusedGrMaxT >= 7) {
+                if (f16_d && f16_u) launch_gr_split2_t<7, true, true>(m, fast, st, stamp_buf, stamp_i0);
+                else if (f16_d) launch_gr_split2_t<7, true, false>(m, fast, st, stamp_buf, stamp_i0);
+                else launch_gr_split2_t<7, false, false>(m, fast, st, stamp_buf, stamp_i0);
+            } break;
+            default: if constexpr (kFusedGrMaxT >= 8) {
+                if (f16_d && f16_u) launch_gr_split2_t<8, true, true>(m, fast, st, stamp_buf, stamp_i0);
+                else if (f16_d) launch_gr_split2_t<8, true, false>(m, fast, st, stamp_buf, stamp_i0);
+                else launch_gr_split2_t<8, false, false>(m, fast, st, stamp_buf, stamp_i0);
+            } break;
+        }
+#undef STRATA_GR_S2_CASE
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "fused_gr_read_multi (split %d): %s\n", split_mode, cudaGetErrorString(e));
+            std::exit(1);
+        }
+        return q8;
+    }
+    if (split_mode == 1 && a[0].s_down == nullptr) {   // its K-split down reads bf16 rows (not STRATA_HC_REQ8)
         const bool fast = gr_fast();
         if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
         else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);

@@ -653,6 +653,10 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
     }
     return d * sumf;
 }
+// P2: __vsubss4(x, 0x20202020) for bytes of x in [0, 63] (Q6_K's codes, so nothing saturates): x | 0x80 is x + 0x80 per
+// byte, minus 0x20 never borrows (0x60..0x9f), and the xor takes the 0x80 back: the same int8 bytes, 2 instructions
+// instead of emulated saturating byte subtract on gfx906 / sm_80+.
+__device__ __forceinline__ int sub32_bytes(int x) { return (x + 0x60606060) ^ 0x80808080; }
 #if !defined(__HIPCC__)   // CUDA only: the native_mmvq_il_pf_kernel family below (itself CUDA only) is the only user
 // q6_q8_dot_impl with the two scales already in registers (the interleaved kernels' hoisted loads, P1): the same
 // expression in the same order
@@ -693,10 +697,6 @@ __device__ __forceinline__ const void* madw(const void* base, int k, int stride)
 // conversion's, +0 included
 __device__ __forceinline__ float i2f_small(int p_plus_magic) { return __int_as_float(p_plus_magic) - 12582912.0f; }
 constexpr int kI2fMagic = 0x4B400000;
-// P2: __vsubss4(x, 0x20202020) for bytes of x in [0, 63] (Q6_K's codes, so nothing saturates): x | 0x80 is x + 0x80 per
-// byte, minus 0x20 never borrows (0x60..0x9f), and the xor takes the 0x80 back: the same int8 bytes, 2 instructions
-// instead of ptxas's 8 for the saturating subtract sm_80 lacks
-__device__ __forceinline__ int sub32_bytes(int x) { return (x + 0x60606060) ^ 0x80808080; }
 // q6_q8_dot_sc with P2's integer forms: the dp4a inputs are the same 32-bit values, (dp * sc) the same int, and
 // i2f_small its exact float (|dp * sc| <= 4 * 32 * 127 * 128 = 2.1M < 2^22), so every FFMA sees the bits q6_q8_dot_impl's does
 __device__ __forceinline__ float q6_q8_dot_fast(int vl, int vh, const int* __restrict__ u, int sc0, int sc1, float d,
@@ -2373,6 +2373,392 @@ void launch_check() {
 // 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..8, so a
 // column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
 bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
+
+// ---- gfx906 wave64 tiled / unpack-once traits (opt-in via STRATA_WAVE_MMVQ_V2 or native_mmvq_set_b6_rows):
+// Every format pre-unpacks its weight codes, scales, and fp16 factors ONCE per (row, block) and reuses each
+// token's Q8_1 activation fragment (and Q4_K / Q5_K dot2) across R rows per wavefront.  Same 64-lane block stride
+// and 64-lane XOR butterfly as native_mmvq_wave_kernel -> 100% bitwise identical outputs across T = 1..8.
+template<typename F> struct WaveOpt { static constexpr bool ok = false; };
+
+template<> struct WaveOpt<Q6KTraits> {
+    static constexpr bool ok = true;
+    static constexpr bool kD8Only = true;
+    struct W { int vi0, vi1; int sc0, sc1; float d; };
+    struct X { int u0, u1; float d8_0, d8_1; };
+    __device__ static __forceinline__ W wload(const Q6KBlock* __restrict__ w, int iqs) {
+        const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+        const int vh_shift = 2 * ((iqs % 16) / 8);
+        const int vl = load_int_b2(w->ql, iqs);
+        const int vh = load_int_b2(w->qh, 8 * (iqs / 16) + (iqs & 7)) >> vh_shift;
+        W r;
+        r.vi0 = sub32_bytes((vl & 0x0f0f0f0f) | ((vh << 4) & 0x30303030));
+        r.vi1 = sub32_bytes(((vl >> 4) & 0x0f0f0f0f) | (vh & 0x30303030));
+        r.sc0 = w->scales[scale_offset];
+        r.sc1 = w->scales[scale_offset + 4];
+        r.d = w->d;
+        return r;
+    }
+    template<bool PRE_F32>
+    __device__ static __forceinline__ X xload(const Q81Block* __restrict__ x, int iqs) {
+        const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+        const int q = iqs & 7;
+        X r;
+        r.u0 = reinterpret_cast<const int*>(x[bq8_offset].qs)[q];
+        r.d8_0 = PRE_F32 ? *reinterpret_cast<const float*>(&x[bq8_offset].ds) : __low2float(x[bq8_offset].ds);
+        r.u1 = reinterpret_cast<const int*>(x[bq8_offset + 2].qs)[q];
+        r.d8_1 = PRE_F32 ? *reinterpret_cast<const float*>(&x[bq8_offset + 2].ds) : __low2float(x[bq8_offset + 2].ds);
+        return r;
+    }
+    __device__ static __forceinline__ float dot(const W& w, const X& x) {
+        float sumf = 0.0f;
+        sumf += x.d8_0 * __mul24(STRATA_DP4A(w.vi0, x.u0, 0), w.sc0);
+        sumf += x.d8_1 * __mul24(STRATA_DP4A(w.vi1, x.u1, 0), w.sc1);
+        return w.d * sumf;
+    }
+};
+
+template<> struct WaveOpt<Q4KTraits> {
+    static constexpr bool ok = true;
+    static constexpr bool kD8Only = true;
+    struct W { int v00, v10, v01, v11; int sc0, sc1, m0, m1; float d, m; };
+    struct X { int u0, u1, u2, u3; int dot2_0, dot2_1; float d8_0, d8_1; };
+    __device__ static __forceinline__ W wload(const Q4KBlock* __restrict__ bq4, int iqs) {
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+        const int* ql = reinterpret_cast<const int*>(bq4->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        const int v0 = ql[0], v1 = ql[4];
+        const uint16_t* scales = reinterpret_cast<const uint16_t*>(bq4->scales);
+        const int j = bq8_offset / 2, jm = j & 1;
+        const uint32_t s0 = scales[jm], s2 = scales[jm + 2], s4 = scales[jm + 4];
+        const uint32_t hi = uint32_t(-int32_t(j >= 2));
+        const uint16_t a0 = uint16_t(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+        const uint16_t a1 = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+        const float2 dmf = __half22float2(bq4->dm);
+        W r;
+        r.v00 = v0 & 0x0f0f0f0f;
+        r.v10 = v1 & 0x0f0f0f0f;
+        r.v01 = (v0 >> 4) & 0x0f0f0f0f;
+        r.v11 = (v1 >> 4) & 0x0f0f0f0f;
+        r.sc0 = int(a0 & 0xffu);
+        r.sc1 = int(a0 >> 8);
+        r.m0 = int(a1 & 0xffu);
+        r.m1 = int(a1 >> 8);
+        r.d = dmf.x;
+        r.m = dmf.y;
+        return r;
+    }
+    template<bool PRE_F32>
+    __device__ static __forceinline__ X xload(const Q81Block* __restrict__ bq8, int iqs) {
+        const int off = 2 * ((iqs / 2) / 4);
+        const int q = (iqs / 2) % 4;
+        const Q81Block* b0 = bq8 + off;
+        const Q81Block* b1 = bq8 + off + 1;
+        const int* q0 = reinterpret_cast<const int*>(b0->qs) + q;
+        const int* q1 = reinterpret_cast<const int*>(b1->qs) + q;
+        X r;
+        r.u0 = q0[0]; r.u1 = q0[4];
+        r.d8_0 = PRE_F32 ? *reinterpret_cast<const float*>(&b0->ds) : __low2float(b0->ds);
+        r.u2 = q1[0]; r.u3 = q1[4];
+        r.d8_1 = PRE_F32 ? *reinterpret_cast<const float*>(&b1->ds) : __low2float(b1->ds);
+        r.dot2_0 = STRATA_DP4A(0x01010101, r.u1, STRATA_DP4A(0x01010101, r.u0, 0));
+        r.dot2_1 = STRATA_DP4A(0x01010101, r.u3, STRATA_DP4A(0x01010101, r.u2, 0));
+        return r;
+    }
+    __device__ static __forceinline__ float dot(const W& w, const X& x) {
+        const int dot1_0 = STRATA_DP4A(w.v10, x.u1, STRATA_DP4A(w.v00, x.u0, 0));
+        const int dot1_1 = STRATA_DP4A(w.v11, x.u3, STRATA_DP4A(w.v01, x.u2, 0));
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+        sumf_d += x.d8_0 * __mul24(dot1_0, w.sc0);
+        sumf_m += x.d8_0 * __mul24(x.dot2_0, w.m0);
+        sumf_d += x.d8_1 * __mul24(dot1_1, w.sc1);
+        sumf_m += x.d8_1 * __mul24(x.dot2_1, w.m1);
+        return w.d * sumf_d - w.m * sumf_m;
+    }
+};
+
+template<> struct WaveOpt<Q5KTraits> {
+    static constexpr bool ok = true;
+    static constexpr bool kD8Only = true;
+    struct W { int v00, v10, v01, v11; int sc0, sc1, m0, m1; float d, m; };
+    struct X { int u0, u1, u2, u3; int dot2_0, dot2_1; float d8_0, d8_1; };
+    __device__ static __forceinline__ W wload(const Q5KBlock* __restrict__ bq5, int iqs) {
+        const int bq8_offset = 2 * ((iqs / 2) / 4);
+        const int* ql = reinterpret_cast<const int*>(bq5->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        const int* qh = reinterpret_cast<const int*>(bq5->qh + 4 * ((iqs / 2) % 4));
+        const int vl0 = ql[0], vl1 = ql[4];
+        const int vh0 = qh[0] >> bq8_offset, vh1 = qh[4] >> bq8_offset;
+        const uint16_t* scales = reinterpret_cast<const uint16_t*>(bq5->scales);
+        const int j = bq8_offset / 2, jm = j & 1;
+        const uint32_t s0 = scales[jm], s2 = scales[jm + 2], s4 = scales[jm + 4];
+        const uint32_t hi = uint32_t(-int32_t(j >= 2));
+        const uint16_t a0 = uint16_t(((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+        const uint16_t a1 = uint16_t(((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+        const float2 dmf = __half22float2(bq5->dm);
+        W r;
+        r.v00 = (vl0 & 0x0f0f0f0f) | ((vh0 << 4) & 0x10101010);
+        r.v10 = (vl1 & 0x0f0f0f0f) | ((vh1 << 4) & 0x10101010);
+        r.v01 = ((vl0 >> 4) & 0x0f0f0f0f) | (((vh0 >> 1) << 4) & 0x10101010);
+        r.v11 = ((vl1 >> 4) & 0x0f0f0f0f) | (((vh1 >> 1) << 4) & 0x10101010);
+        r.sc0 = int(a0 & 0xffu);
+        r.sc1 = int(a0 >> 8);
+        r.m0 = int(a1 & 0xffu);
+        r.m1 = int(a1 >> 8);
+        r.d = dmf.x;
+        r.m = dmf.y;
+        return r;
+    }
+    template<bool PRE_F32>
+    __device__ static __forceinline__ X xload(const Q81Block* __restrict__ bq8, int iqs) {
+        const int off = 2 * ((iqs / 2) / 4);
+        const int q = (iqs / 2) % 4;
+        const Q81Block* b0 = bq8 + off;
+        const Q81Block* b1 = bq8 + off + 1;
+        const int* q0 = reinterpret_cast<const int*>(b0->qs) + q;
+        const int* q1 = reinterpret_cast<const int*>(b1->qs) + q;
+        X r;
+        r.u0 = q0[0]; r.u1 = q0[4];
+        r.d8_0 = PRE_F32 ? *reinterpret_cast<const float*>(&b0->ds) : __low2float(b0->ds);
+        r.u2 = q1[0]; r.u3 = q1[4];
+        r.d8_1 = PRE_F32 ? *reinterpret_cast<const float*>(&b1->ds) : __low2float(b1->ds);
+        r.dot2_0 = STRATA_DP4A(0x01010101, r.u0, STRATA_DP4A(0x01010101, r.u1, 0));
+        r.dot2_1 = STRATA_DP4A(0x01010101, r.u2, STRATA_DP4A(0x01010101, r.u3, 0));
+        return r;
+    }
+    __device__ static __forceinline__ float dot(const W& w, const X& x) {
+        const int dot1_0 = STRATA_DP4A(w.v00, x.u0, STRATA_DP4A(w.v10, x.u1, 0));
+        const int dot1_1 = STRATA_DP4A(w.v01, x.u2, STRATA_DP4A(w.v11, x.u3, 0));
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+        sumf_d += x.d8_0 * __mul24(dot1_0, w.sc0);
+        sumf_m += x.d8_0 * __mul24(x.dot2_0, w.m0);
+        sumf_d += x.d8_1 * __mul24(dot1_1, w.sc1);
+        sumf_m += x.d8_1 * __mul24(x.dot2_1, w.m1);
+        return w.d * sumf_d - w.m * sumf_m;
+    }
+};
+
+template<> struct WaveOpt<IQ4XSTraits> {
+    static constexpr bool ok = true;
+    static constexpr bool kD8Only = true;
+    struct W { int2 v[4]; int ls_m32; float dw; };
+    struct X { int u0[4], u1[4]; float d8; };
+    __device__ static __forceinline__ W wload(const IQ4XSBlock* __restrict__ w, int iqs) {
+        W r;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) r.v[j] = iq4_table_lookup(reinterpret_cast<const int*>(w->qs)[iqs + j]);
+        const int ls = ((w->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0f) | (((w->scales_h >> (iqs / 2)) & 0x03) << 4);
+        r.ls_m32 = ls - 32;
+        r.dw = __half2float(w->d);
+        return r;
+    }
+    template<bool PRE_F32>
+    __device__ static __forceinline__ X xload(const Q81Block* __restrict__ x, int iqs) {
+        const Q81Block& bx = x[iqs / 4];
+        const int* q = reinterpret_cast<const int*>(bx.qs);
+        X r;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { r.u0[j] = q[j]; r.u1[j] = q[j + 4]; }
+        r.d8 = PRE_F32 ? *reinterpret_cast<const float*>(&bx.ds) : __low2float(bx.ds);
+        return r;
+    }
+    __device__ static __forceinline__ float dot(const W& w, const X& x) {
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            sumi = STRATA_DP4A(w.v[j].x, x.u0[j], sumi);
+            sumi = STRATA_DP4A(w.v[j].y, x.u1[j], sumi);
+        }
+        sumi = __mul24(sumi, w.ls_m32);
+        const float d = w.dw * x.d8;
+        return d * sumi;
+    }
+};
+
+template<> struct WaveOpt<SmallTraits<Q80Block, 8>> {
+    static constexpr bool ok = true;
+    static constexpr bool kD8Only = true;
+    struct W { int v0, v1; float d0; };
+    struct X { int u0, u1; float d1; };
+    __device__ static __forceinline__ W wload(const Q80Block* __restrict__ w, int iqs) {
+        W r;
+        r.v0 = load_int_b2(w->qs, iqs);
+        r.v1 = load_int_b2(w->qs, iqs + 1);
+        r.d0 = w->d;
+        return r;
+    }
+    template<bool PRE_F32>
+    __device__ static __forceinline__ X xload(const Q81Block* __restrict__ x, int iqs) {
+        const int* q = reinterpret_cast<const int*>(x->qs) + iqs;
+        return {q[0], q[1], PRE_F32 ? *reinterpret_cast<const float*>(&x->ds) : __low2float(x->ds)};
+    }
+    __device__ static __forceinline__ float dot(const W& w, const X& x) {
+        int sumi = 0;
+        sumi = STRATA_DP4A(w.v0, x.u0, sumi);
+        sumi = STRATA_DP4A(w.v1, x.u1, sumi);
+        return w.d0 * x.d1 * float(sumi);
+    }
+};
+
+template<> struct WaveOpt<SmallTraits<IQ4NLBlock, 4>> {
+    static constexpr bool ok = true;
+    static constexpr bool kD8Only = true;
+    struct W { int2 v0, v1; float dw; };
+    struct X { int u0, u1, u4, u5; float d8; };
+    __device__ static __forceinline__ W wload(const IQ4NLBlock* __restrict__ w, int iqs) {
+        W r;
+        r.v0 = iq4_table_lookup(load_int_b2(w->qs, iqs));
+        r.v1 = iq4_table_lookup(load_int_b2(w->qs, iqs + 1));
+        r.dw = __half2float(w->d);
+        return r;
+    }
+    template<bool PRE_F32>
+    __device__ static __forceinline__ X xload(const Q81Block* __restrict__ x, int iqs) {
+        const int* q8 = reinterpret_cast<const int*>(x->qs) + iqs;
+        return {q8[0], q8[1], q8[4], q8[5], PRE_F32 ? *reinterpret_cast<const float*>(&x->ds) : __low2float(x->ds)};
+    }
+    __device__ static __forceinline__ float dot(const W& w, const X& x) {
+        int sumi = 0;
+        sumi = STRATA_DP4A(w.v0.x, x.u0, sumi);
+        sumi = STRATA_DP4A(w.v0.y, x.u4, sumi);
+        sumi = STRATA_DP4A(w.v1.x, x.u1, sumi);
+        sumi = STRATA_DP4A(w.v1.y, x.u5, sumi);
+        const float d = w.dw * x.d8;
+        return d * sumi;
+    }
+};
+
+template<> struct WaveOpt<SmallTraits<Q40Block, 4>> {
+    static constexpr bool ok = true;
+    static constexpr bool kD8Only = false;
+    struct W { int vi0[2], vi1[2]; float d; };
+    struct X { int u0, u1, u4, u5; float2 ds; };
+    __device__ static __forceinline__ W wload(const Q40Block* __restrict__ w, int iqs) {
+        W r;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int v = load_int_b2(w->qs, iqs + i);
+            r.vi0[i] = (v >> 0) & 0x0f0f0f0f;
+            r.vi1[i] = (v >> 4) & 0x0f0f0f0f;
+        }
+        r.d = w->d;
+        return r;
+    }
+    template<bool PRE_F32>
+    __device__ static __forceinline__ X xload(const Q81Block* __restrict__ x, int iqs) {
+        const int* q = reinterpret_cast<const int*>(x->qs) + iqs;
+        return {q[0], q[1], q[4], q[5], __half22float2(x->ds)};
+    }
+    __device__ static __forceinline__ float dot(const W& w, const X& x) {
+        int sumi = 0;
+        sumi = STRATA_DP4A(w.vi0[0], x.u0, sumi);
+        sumi = STRATA_DP4A(w.vi1[0], x.u4, sumi);
+        sumi = STRATA_DP4A(w.vi0[1], x.u1, sumi);
+        sumi = STRATA_DP4A(w.vi1[1], x.u5, sumi);
+        return w.d * (sumi * x.ds.x - 4 * x.ds.y);
+    }
+};
+
+// Wave64 unpack-once / whole-X LDS kernel:
+// USE_LDS=true stages the entire [NCOLS][x_stride] Q8_1 tensor ONCE in LDS (zero div/mod, single __syncthreads() per
+// kernel, pre-converts half2 ds -> float d8 for d8-only formats) and processes one row's decoded W at a time (outer i,
+// inner j) with sched_barrier so tmp[NCOLS][R] stays 100% in VGPRs (0B spill) and peak VGPRs stay low.
+// USE_LDS=false reads x directly through L1/L2 with zero barriers and shares each token's decoded X across R rows.
+template<typename F, int NCOLS, int R, bool USE_LDS>
+__launch_bounds__(256)
+__global__ void native_mmvq_wave_tiled_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                              float* __restrict__ y, int n_in, int n_out) {
+    using WO = WaveOpt<F>;
+    constexpr int BPIW = 64 / F::T;
+    constexpr bool PRE_F32 = USE_LDS && WO::kD8Only;
+    static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
+    extern __shared__ int sx_raw[];
+    const int tid = int(threadIdx.x);
+    const int lane = tid & 63;
+    const int row0 = (int(blockIdx.x) * 4 + (tid >> 6)) * R;
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;
+    const int kqs = F::kqs(lane);
+    const int sub_blk = lane / F::T;
+    float tmp[NCOLS][R] = {};
+    if constexpr (USE_LDS) {
+        Q81Block* sx = reinterpret_cast<Q81Block*>(sx_raw);
+        const int total_blocks = NCOLS * x_stride;
+        const int total_ints = total_blocks * 9;
+        const int* x_raw = reinterpret_cast<const int*>(x);
+        for (int idx = tid; idx < total_ints; idx += 256) sx_raw[idx] = x_raw[idx];
+        __syncthreads();
+        if constexpr (PRE_F32) {
+            for (int b = tid; b < total_blocks; b += 256) {
+                const float d8 = __low2float(sx[b].ds);
+                *reinterpret_cast<float*>(&sx[b].ds) = d8;
+            }
+            __syncthreads();
+        }
+        if (row0 >= n_out) return;
+        for (int kbx = sub_blk; kbx < blocks_per_row; kbx += BPIW) {
+            const int kby = kbx * F::KBY;
+            if constexpr (R == 1) {
+                const typename WO::W wv = WO::wload(w + std::size_t(row0) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    tmp[j][0] += WO::dot(wv, WO::template xload<PRE_F32>(sx + j * x_stride + kby, kqs));
+                    if constexpr (NCOLS >= 4) __builtin_amdgcn_sched_barrier(0);
+                }
+            } else {
+                // Process one row's W at a time (reading x from 1-cycle LDS) with unrolled i/j -> 0B spill, low VGPRs!
+#pragma unroll
+                for (int i = 0; i < R; ++i) {
+                    if (row0 + i < n_out) {
+                        const typename WO::W wv = WO::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                        for (int j = 0; j < NCOLS; ++j) {
+                            tmp[j][i] += WO::dot(wv, WO::template xload<PRE_F32>(sx + j * x_stride + kby, kqs));
+                            if constexpr (NCOLS >= 3) __builtin_amdgcn_sched_barrier(0);
+                        }
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                }
+            }
+        }
+    } else {
+        if (row0 >= n_out) return;
+        for (int kbx = sub_blk; kbx < blocks_per_row; kbx += BPIW) {
+            const int kby = kbx * F::KBY;
+            if constexpr (R == 1) {
+                const typename WO::W wv = WO::wload(w + std::size_t(row0) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    tmp[j][0] += WO::dot(wv, WO::template xload<false>(x + std::size_t(j) * x_stride + kby, kqs));
+                    if constexpr (NCOLS >= 4) __builtin_amdgcn_sched_barrier(0);
+                }
+            } else {
+                typename WO::W wv[R];
+#pragma unroll
+                for (int i = 0; i < R; ++i) {
+                    if (row0 + i < n_out) wv[i] = WO::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                }
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    const typename WO::X xv = WO::template xload<false>(x + std::size_t(j) * x_stride + kby, kqs);
+#pragma unroll
+                    for (int i = 0; i < R; ++i) {
+                        if (row0 + i < n_out) tmp[j][i] += WO::dot(wv[i], xv);
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+            }
+        }
+    }
+    if (row0 >= n_out) return;
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            float v = tmp[j][i];
+#pragma unroll
+            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
+        }
+}
+
 template<typename F, int NCOLS, int R>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
@@ -2407,10 +2793,110 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
             if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
         }
 }
+
+int wave_opt_mode() {
+    if (b6_rows_mode() > 0) return b6_rows_mode();
+    static const int env = [] { const char* v = std::getenv("STRATA_WAVE_MMVQ_V2"); return v ? std::atoi(v) : 0; }();
+    return env;
+}
+
 template<typename F, int NCOLS>
 void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if constexpr (WaveOpt<F>::ok) {
+        const int mode = wave_opt_mode();
+        if (mode > 0) {
+            // Opt-in STRATA_WAVE_MMVQ_V2=1: MI50 auto-dispatch picking the measured fastest (R, USE_LDS) per (format, NCOLS, xbytes).
+            // All variants use the exact 64-lane stride + XOR butterfly -> 0 bitwise diffs against baseline across T=1..8.
+            const std::size_t xbytes = std::size_t(NCOLS) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
+            constexpr bool is_q6k = std::is_same_v<F, Q6KTraits>;
+            constexpr bool is_q4k = std::is_same_v<F, Q4KTraits>;
+            constexpr bool is_q5k = std::is_same_v<F, Q5KTraits>;
+            constexpr bool is_iq4xs = std::is_same_v<F, IQ4XSTraits>;
+            constexpr bool is_q80 = std::is_same_v<F, SmallTraits<Q80Block, 8>>;
+            constexpr bool is_iq4nl = std::is_same_v<F, SmallTraits<IQ4NLBlock, 4>>;
+            auto go_r1 = [&](bool lds) {
+                const unsigned nb = unsigned((std::size_t(n_out) + 3u) / 4u);
+                if (lds) native_mmvq_wave_tiled_kernel<F, NCOLS, 1, true><<<nb, 256, xbytes, s>>>(w, x, y, n_in, n_out);
+                else native_mmvq_wave_tiled_kernel<F, NCOLS, 1, false><<<nb, 256, 0, s>>>(w, x, y, n_in, n_out);
+            };
+            if (mode == 1) {
+                if constexpr (is_q6k) {
+                    if constexpr (NCOLS == 2) {
+                        if (xbytes <= 16384u) {
+                            const unsigned nb = unsigned((std::size_t(n_out) + 7u) / 8u);
+                            native_mmvq_wave_tiled_kernel<F, NCOLS, 2, true><<<nb, 256, xbytes, s>>>(w, x, y, n_in, n_out);
+                            return;
+                        }
+                    } else if constexpr (NCOLS == 3) {
+                        if (xbytes <= 10240u) { go_r1(true); return; }
+                        const unsigned nb = unsigned((std::size_t(n_out) + 7u) / 8u);
+                        native_mmvq_wave_tiled_kernel<F, NCOLS, 2, false><<<nb, 256, 0, s>>>(w, x, y, n_in, n_out);
+                        return;
+                    } else if constexpr (NCOLS == 1) {
+                        if (xbytes <= 10240u) { go_r1(true); return; }
+                    }
+                    go_r1(false);
+                    return;
+                } else if constexpr (is_q80) {
+                    if (xbytes <= 8192u) {
+                        if constexpr (NCOLS >= 3) { go_r1(true); return; }
+                        go_r1(false);
+                        return;
+                    }
+                    if constexpr (NCOLS >= 1 && NCOLS <= 3) {
+                        const unsigned nb = unsigned((std::size_t(n_out) + 7u) / 8u);
+                        native_mmvq_wave_tiled_kernel<F, NCOLS, 2, false><<<nb, 256, 0, s>>>(w, x, y, n_in, n_out);
+                        return;
+                    } else if constexpr (NCOLS >= 4 && NCOLS <= 6) {
+                        const unsigned nb = unsigned((std::size_t(n_out) + 15u) / 16u);
+                        native_mmvq_wave_tiled_kernel<F, NCOLS, 4, false><<<nb, 256, 0, s>>>(w, x, y, n_in, n_out);
+                        return;
+                    }
+                    // NCOLS >= 7 on wide n_in: fall through to native_mmvq_wave_kernel (0.115 ms at T=8)
+                } else if constexpr (is_q4k) {
+                    if constexpr (NCOLS == 2) {
+                        if (xbytes <= 8192u) { go_r1(true); return; }
+                    }
+                    go_r1(false);
+                    return;
+                } else if constexpr (is_q5k) {
+                    if constexpr (NCOLS == 2 || NCOLS == 3) {
+                        if (xbytes <= 10240u) { go_r1(true); return; }
+                    }
+                    go_r1(false);
+                    return;
+                } else if constexpr (is_iq4xs) {
+                    if constexpr (NCOLS == 1 || NCOLS == 2) {
+                        if (n_in > 3072 || NCOLS == 2) {
+                            const unsigned nb = unsigned((std::size_t(n_out) + 7u) / 8u);
+                            native_mmvq_wave_tiled_kernel<F, NCOLS, 2, false><<<nb, 256, 0, s>>>(w, x, y, n_in, n_out);
+                            return;
+                        }
+                    } else if constexpr (NCOLS == 3 || NCOLS == 4) {
+                        if (xbytes <= 12288u) { go_r1(true); return; }
+                    }
+                    go_r1(false);
+                    return;
+                } else if constexpr (is_iq4nl) {
+                    if constexpr (NCOLS >= 3) {
+                        if (xbytes <= 8192u) { go_r1(true); return; }
+                    }
+                    go_r1(false);
+                    return;
+                } else {
+                    // Q4_0 and other WaveOpt formats: R=1 no-LDS
+                    go_r1(false);
+                    return;
+                }
+            } else {
+                // Explicit override modes for diagnostics: 3 = R=1 LDS, 6 = R=1 no-LDS
+                go_r1(mode == 3 && xbytes <= 24576u);
+                return;
+            }
+        }
+    }
     constexpr int R = 1;
     const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
     native_mmvq_wave_kernel<F, NCOLS, R><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);

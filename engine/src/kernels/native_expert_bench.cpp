@@ -45,13 +45,26 @@ int nibble_main(int argc, char** argv);
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::strcmp(argv[1], "--nibble") == 0) return nibble_main(argc, argv);
+    const bool synth = argc >= 2 && std::strcmp(argv[1], "--synth") == 0;
     if (argc < 7) {
-        std::fprintf(stderr, "usage: native_expert_bench <shard1.gguf> <layer[,layer]> <groups> <tokens> <ref mode> <mode> [iters]\n");
+        std::fprintf(stderr, "usage: native_expert_bench <shard1.gguf> <layer[,layer]> <groups> <tokens> <ref mode> <mode> [iters]\n"
+                             "       native_expert_bench --synth <gu:down[,gu:down]> <groups> <tokens> <ref mode> <mode> [iters]\n");
         return 2;
     }
-    strata::GgufFile gguf(argv[1]);
+    std::unique_ptr<strata::GgufFile> gguf;
     std::vector<int> layers;
-    {
+    std::vector<std::pair<int, int>> spairs;
+    if (synth) {
+        std::stringstream ss(argv[2]);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            const size_t c = item.find(':');
+            if (c == std::string::npos) { std::fprintf(stderr, "bad pair '%s' (want gu:down)\n", item.c_str()); return 2; }
+            spairs.emplace_back(std::atoi(item.substr(0, c).c_str()), std::atoi(item.substr(c + 1).c_str()));
+            layers.push_back((int) spairs.size() - 1);
+        }
+    } else {
+        gguf = std::make_unique<strata::GgufFile>(argv[1]);
         std::stringstream ss(argv[2]);
         std::string t;
         while (std::getline(ss, t, ',')) layers.push_back(std::atoi(t.c_str()));
@@ -68,31 +81,59 @@ int main(int argc, char** argv) {
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
     for (int l : layers) {
-        const strata::TensorInfo* t[3] = {};
-        const char* roles[3] = {"gate", "up", "down"};
-        for (const auto& ti : gguf.tensors())
-            for (int r = 0; r < 3; ++r)
-                if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
-        if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
         cpu::NativeFmt f;
         std::string err;
-        if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
-            std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
-        }
-        cpu::NativeFmt ff;    // the full expert's geometry, for strides into the GGUF
-        if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF_FULL, ff, err)) {
-            std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
-        }
-        const size_t dsz = f.bytes - f.down_off, dsz_full = ff.bytes - ff.down_off;
-        const size_t drow = dsz / H, drow_full = dsz_full / H;
-        std::vector<uint8_t> blobs((size_t) G * f.bytes);
-        for (int g = 0; g < G; ++g) {
-            const size_t E = (size_t) ((g * 37 + 5) % 256);
-            uint8_t* b = blobs.data() + (size_t) g * f.bytes;
-            std::memcpy(b, gguf.tensor_data(*t[0]) + E * ff.up_off, f.up_off);
-            std::memcpy(b + f.up_off, gguf.tensor_data(*t[1]) + E * ff.up_off, f.up_off);
-            for (int64_t r = 0; r < H; ++r)
-                std::memcpy(b + f.down_off + r * drow, gguf.tensor_data(*t[2]) + E * dsz_full + r * drow_full, drow);
+        size_t dsz = 0;
+        std::vector<uint8_t> blobs;
+        if (synth) {
+            const int gu_t = spairs[(size_t) l].first, d_t = spairs[(size_t) l].second;
+            if (!cpu::native_fmt(gu_t, d_t, H, FF, f, err)) {
+                std::printf("pair %d:%d: %s\n", gu_t, d_t, err.c_str()); ++failures; continue;
+            }
+            dsz = f.bytes - f.down_off;
+            blobs.resize((size_t) G * f.bytes);
+            std::mt19937 wrng(9001u + (unsigned) gu_t * 131u + (unsigned) d_t * 17u);
+            auto fill_fmt = [&](uint8_t* dst, int tt, size_t nbytes) {
+                const int bv = (tt == 20 || tt == 7 || tt == 8 || tt == 6 || tt == 2) ? 32 : (tt == 42 ? 64 : 256);
+                const size_t bs = K::iq_row_bytes(tt, bv);
+                for (size_t i = 0; i < nbytes; ++i) dst[i] = (uint8_t) (wrng() & 0xffu);
+                for (size_t o = 0; o < nbytes; o += bs) {
+                    const uint32_t r = wrng();
+                    const uint16_t h = (uint16_t) (((r >> 31) << 15) | ((2u + ((r >> 10) % 6u)) << 10) | (r & 0x3ffu));
+                    std::memcpy(dst + o, &h, 2);
+                }
+            };
+            for (int g = 0; g < G; ++g) {
+                uint8_t* b = blobs.data() + (size_t) g * f.bytes;
+                fill_fmt(b, gu_t, f.down_off);
+                fill_fmt(b + f.down_off, d_t, dsz);
+            }
+        } else {
+            const strata::TensorInfo* t[3] = {};
+            const char* roles[3] = {"gate", "up", "down"};
+            for (const auto& ti : gguf->tensors())
+                for (int r = 0; r < 3; ++r)
+                    if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
+            if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
+            if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
+                std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
+            }
+            cpu::NativeFmt ff;    // the full expert's geometry, for strides into the GGUF
+            if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF_FULL, ff, err)) {
+                std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
+            }
+            dsz = f.bytes - f.down_off;
+            const size_t dsz_full = ff.bytes - ff.down_off;
+            const size_t drow = dsz / H, drow_full = dsz_full / H;
+            blobs.resize((size_t) G * f.bytes);
+            for (int g = 0; g < G; ++g) {
+                const size_t E = (size_t) ((g * 37 + 5) % 256);
+                uint8_t* b = blobs.data() + (size_t) g * f.bytes;
+                std::memcpy(b, gguf->tensor_data(*t[0]) + E * ff.up_off, f.up_off);
+                std::memcpy(b + f.up_off, gguf->tensor_data(*t[1]) + E * ff.up_off, f.up_off);
+                for (int64_t r = 0; r < H; ++r)
+                    std::memcpy(b + f.down_off + r * drow, gguf->tensor_data(*t[2]) + E * dsz_full + r * drow_full, drow);
+            }
         }
         std::mt19937 rng(17 + l);
         std::normal_distribution<float> nd(0.f, 1.f);

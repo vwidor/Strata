@@ -36,29 +36,37 @@ static int compare(int n_expert, int topk, int rows, unsigned seed) {
         lg[i] = x;
     }
     const size_t out = (size_t) rows * topk;
-    float *d_l = nullptr, *d_w[3] = {};
-    int* d_i[3] = {};
+    float *d_l = nullptr;
     CHECK(hipMalloc(&d_l, lg.size() * 4));
     CHECK(hipMemcpy(d_l, lg.data(), lg.size() * 4, hipMemcpyHostToDevice));
-    std::vector<int> ids[3];
-    std::vector<float> w[3];
-    for (int v = 0; v < 3; ++v) {
-        CHECK(hipMalloc(&d_w[v], out * 4));
-        CHECK(hipMalloc(&d_i[v], out * 4));
-        CHECK(hipMemset(d_w[v], 0x3c, out * 4));   // what an unwritten rank keeps (NaN rows)
-        CHECK(hipMemset(d_i[v], 0x11, out * 4));
-        if (!k::router_top10_variant(d_l, rows, n_expert, topk, d_i[v], d_w[v], nullptr, v)) {
+    float* d_w_all[5] = {};
+    int* d_i_all[5] = {};
+    CHECK(hipMalloc(&d_w_all[0], out * 4));
+    CHECK(hipMalloc(&d_i_all[0], out * 4));
+    const int nv = k::router_top10_variant(d_l, 1, n_expert, topk, d_i_all[0], d_w_all[0], nullptr, 3) ? 5 : 3;
+    CHECK(hipDeviceSynchronize());
+    std::vector<int> ids[5];
+    std::vector<float> w[5];
+    for (int v = 0; v < nv; ++v) {
+        if (v > 0) {
+            CHECK(hipMalloc(&d_w_all[v], out * 4));
+            CHECK(hipMalloc(&d_i_all[v], out * 4));
+        }
+        CHECK(hipMemset(d_w_all[v], 0x3c, out * 4));   // what an unwritten rank keeps (NaN rows)
+        CHECK(hipMemset(d_i_all[v], 0x11, out * 4));
+        if (!k::router_top10_variant(d_l, rows, n_expert, topk, d_i_all[v], d_w_all[v], nullptr, v)) {
             std::fprintf(stderr, "router_top10_variant %d refused\n", v);
             return 2;
         }
         CHECK(hipDeviceSynchronize());
         ids[v].resize(out);
         w[v].resize(out);
-        CHECK(hipMemcpy(ids[v].data(), d_i[v], out * 4, hipMemcpyDeviceToHost));
-        CHECK(hipMemcpy(w[v].data(), d_w[v], out * 4, hipMemcpyDeviceToHost));
+        CHECK(hipMemcpy(ids[v].data(), d_i_all[v], out * 4, hipMemcpyDeviceToHost));
+        CHECK(hipMemcpy(w[v].data(), d_w_all[v], out * 4, hipMemcpyDeviceToHost));
     }
+    const char* vnames[5] = {"portable", "fast kernel", "fast kernel, serial path", "wave64 fast", "wave64 serial path"};
     int fails = 0;
-    for (int v = 1; v < 3; ++v) {
+    for (int v = 1; v < nv; ++v) {
         int bad = 0;
         for (int r = 0; r < rows; ++r)
             if (std::memcmp(&ids[0][(size_t) r * topk], &ids[v][(size_t) r * topk], topk * 4) ||
@@ -69,25 +77,28 @@ static int compare(int n_expert, int topk, int rows, unsigned seed) {
                 ++bad;
             }
         std::printf("%s %d experts, k %d, %d rows: %s vs the portable kernel: %d rows differ\n", bad ? "FAIL" : "PASS",
-                    n_expert, topk, rows, v == 1 ? "fast kernel" : "fast kernel, serial path", bad);
+                    n_expert, topk, rows, vnames[v], bad);
         fails += bad != 0;
     }
-    // time: single-token calls back to back
+    // time: single-token and 8-token calls back to back
     hipEvent_t e0, e1;
     CHECK(hipEventCreate(&e0));
     CHECK(hipEventCreate(&e1));
-    for (int v = 0; v < 2; ++v) {
+    for (int v : {0, 1, 3}) {
+        if (v >= nv) continue;
         const int reps = 2000;
-        CHECK(hipEventRecord(e0));
-        for (int i = 0; i < reps; ++i)
-            k::router_top10_variant(d_l + (size_t) (i % 64) * n_expert, 1, n_expert, topk, d_i[v], d_w[v], nullptr, v);
-        CHECK(hipEventRecord(e1));
-        CHECK(hipEventSynchronize(e1));
-        float ms = 0;
-        CHECK(hipEventElapsedTime(&ms, e0, e1));
-        std::printf("  %s: %.2f us per single-token call\n", v ? "fast" : "portable", 1000.0f * ms / reps);
+        for (int nt : {1, 8}) {
+            CHECK(hipEventRecord(e0));
+            for (int i = 0; i < reps; ++i)
+                k::router_top10_variant(d_l + (size_t) (i % 64) * n_expert, nt, n_expert, topk, d_i_all[v], d_w_all[v], nullptr, v);
+            CHECK(hipEventRecord(e1));
+            CHECK(hipEventSynchronize(e1));
+            float ms = 0;
+            CHECK(hipEventElapsedTime(&ms, e0, e1));
+            std::printf("  %-12s T=%d: %.2f us per call\n", vnames[v], nt, 1000.0f * ms / reps);
+        }
     }
-    for (int v = 0; v < 3; ++v) { (void) hipFree(d_w[v]); (void) hipFree(d_i[v]); }
+    for (int v = 0; v < nv; ++v) { (void) hipFree(d_w_all[v]); (void) hipFree(d_i_all[v]); }
     (void) hipFree(d_l);
     return fails;
 }

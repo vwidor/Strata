@@ -261,6 +261,114 @@ __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __re
             weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
     }
 }
+
+// gfx906 wave64 register-only bracketed tree-sum router (opt-in STRATA_HIP_ROUTER_WAVE_FAST=1):
+// Keeps all RW_PER=8 exponentials in VGPRs, sums across the 64-lane wavefront via shfl_xor, and uses the exact
+// monotone bracket [tot*(1-2^-40), tot*(1+2^-40)] so >99.9% of rows avoid all LDS traffic, barriers, and the
+// 512-step serial lane-0 FP64 scan; falls back to LDS serial scan only when the bracket straddles a float midpoint
+// or sees NaN. Renormalizes selected weights in registers across lanes 0..k-1. Bit-identical to router_top10_kernel.
+template <bool FORCE_SERIAL>
+__global__ void __launch_bounds__(64) router_top10_wave_fast_kernel(const float* __restrict__ logits, int n_tokens,
+                                                                    int n_expert, int k, int* __restrict__ ids,
+                                                                    float* __restrict__ weights) {
+    __shared__ double s_ex[64 * RW_PER];
+    const int t = blockIdx.x;
+    if (t >= n_tokens) return;
+    const int lane = threadIdx.x;
+    const float* l = logits + (size_t) t * n_expert;
+    float lv[RW_PER];
+    float mx = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < RW_PER; ++j) {
+        const int e = lane + 64 * j;
+        lv[j] = e < n_expert ? l[e] : -INFINITY;
+        mx = fmaxf(mx, lv[j]);
+    }
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 64));
+    double ex[RW_PER];
+    double part = 0.0;
+#pragma unroll
+    for (int j = 0; j < RW_PER; ++j) {
+        const int e = lane + 64 * j;
+        if (e < n_expert) {
+            const double v = exp((double) lv[j] - (double) mx);
+            ex[j] = v;
+            part += v;
+        } else {
+            ex[j] = 0.0;
+        }
+    }
+    double tot = part;
+#pragma unroll
+    for (int off = 32; off > 0; off >>= 1) tot += __shfl_xor(tot, off, 64);
+    const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
+    const float f_lo = (float) (1.0 / hi), f_hi = (float) (1.0 / lo);
+    float inv;
+    if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
+        inv = f_lo;
+    } else {
+#pragma unroll
+        for (int j = 0; j < RW_PER; ++j) {
+            const int e = lane + 64 * j;
+            if (e < n_expert) s_ex[e] = ex[j];
+        }
+        __syncthreads();
+        float inv0 = 0.0f;
+        if (lane == 0) {
+            double sum = 0.0;
+            for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
+            inv0 = (float) (1.0 / sum);
+        }
+        inv = __shfl(inv0, 0, 64);
+    }
+    float p[RW_PER];
+    unsigned live = 0;
+#pragma unroll
+    for (int j = 0; j < RW_PER; ++j) {
+        const int e = lane + 64 * j;
+        if (e < n_expert) { p[j] = (float) (ex[j] * inv); live |= 1u << j; }
+        else p[j] = -INFINITY;
+    }
+    float my_w = 0.0f;
+    int my_id = 0, nsel = 0;
+    for (int i = 0; i < k; ++i) {
+        float bv = -INFINITY;
+        int bi = n_expert;
+#pragma unroll
+        for (int j = 0; j < RW_PER; ++j)
+            if (((live >> j) & 1u) && p[j] > bv) { bv = p[j]; bi = lane + 64 * j; }
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) {
+            const float ov = __shfl_xor(bv, off, 64);
+            const int oi = __shfl_xor(bi, off, 64);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (bi >= n_expert) break;
+        if ((bi & 63) == lane) live &= ~(1u << (bi >> 6));
+        if (lane == i) { my_w = bv; my_id = bi; }
+        nsel = i + 1;
+    }
+    if (nsel == k) {
+        double s = 0.0;
+        for (int i = 0; i < k; ++i) s += (double) __shfl(my_w, i, 64);
+        const double sc = fmax(s, 6.103515625e-05);
+        if (lane < k) {
+            ids[(size_t) t * k + lane] = my_id;
+            weights[(size_t) t * k + lane] = (float) ((double) my_w / sc);
+        }
+    } else {
+        if (lane < nsel) { ids[(size_t) t * k + lane] = my_id; weights[(size_t) t * k + lane] = my_w; }
+        __threadfence();
+        if (lane == 0) {
+            double s = 0.0;
+            for (int i = 0; i < k; ++i) s += (double) weights[(size_t) t * k + i];
+            const double sc = fmax(s, 6.103515625e-05);
+            for (int i = 0; i < k; ++i)
+                weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
+        }
+    }
+}
 #endif  // STRATA_HIP_GFX906
 
 #if defined(__HIPCC__)
@@ -409,6 +517,18 @@ bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k
                           void* stream, int variant) {
 #if defined(__HIPCC__)
     if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32) return false;
+#if defined(STRATA_HIP_GFX906)
+    if (variant == 3) {
+        router_top10_wave_fast_kernel<false><<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(
+            logits, n_tokens, n_expert, k, ids, weights);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    if (variant == 4) {
+        router_top10_wave_fast_kernel<true><<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(
+            logits, n_tokens, n_expert, k, ids, weights);
+        return cudaGetLastError() == cudaSuccess;
+    }
+#endif
     if (variant < 0 || variant > 2) return false;
     launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, variant);
     return cudaGetLastError() == cudaSuccess;
@@ -460,8 +580,17 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     }
 #if defined(STRATA_HIP_GFX906)
     if (n_expert <= 64 * RW_PER && !std::getenv("STRATA_ROUTER_BLOCK")) {
-        router_top10_wave_kernel<<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(logits, n_tokens, n_expert, k,
-                                                                                       ids, weights);
+        static const bool wave_fast = [] {
+            const char* v = std::getenv("STRATA_HIP_ROUTER_WAVE_FAST");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (wave_fast && k <= 64) {
+            router_top10_wave_fast_kernel<false><<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(
+                logits, n_tokens, n_expert, k, ids, weights);
+        } else {
+            router_top10_wave_kernel<<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(
+                logits, n_tokens, n_expert, k, ids, weights);
+        }
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
