@@ -313,6 +313,24 @@ What it means:
 - The narrow Q4_0 drafter kernels matched the 8-column kernel bit for bit for 1, 2, 3 and 4 columns on GPU 1 (`dflash2_gemm_bench`).
 - Greedy answers are not repeatable here even within one arm (0 of 4 repeats of the same essay identical): which experts the CPU or the GPU computes changes near-ties. Answer identity is therefore no check between arms on this rig; the kernel and plan checks above are.
 
+### 9.6 Measured: round B, stopped early (2026-11-25)
+The same setup as round A, with the watchdog fix in the build. Round B's `base` matched round A's within 0.5% (solo code 44.3 against 44.5, 4 requests of code 45.3 against 45.3). Paired against `base`:
+
+| Arm | Solo prose | Solo code | 3x prose | 3x code | 4x prose | 4x code | Verdict |
+|---|---|---|---|---|---|---|---|
+| `STRATA_CPU_IQ_ALL_EXACT1=1` | +2.7% | +0.2% | +3.7% (3 of 3) | +7.6% | -0.3% | +5.3% (3 of 3) | small batch gain: kept |
+| `STRATA_KQ_SPLIT=1` | +0.8% | -3.7% | -0.1% | +0.7% | +0.2% | -5.0% (0 of 3) | rejected |
+| `STRATA_FUSE_HITS=1` | -1.4% | -11.2% (0 of 6) | -10.7% | -3.7% | -1.6% | -6.4% | rejected: slower |
+| `STRATA_BATCH_SLOT_RUNS=1` | one run only: solo -3% to -11%, bursts -1% to -8% | | | | | | rejected (provisional) |
+
+The round was stopped here to bring production back; `STRATA_PIPE_ADAPT_EVERY=0`, `STRATA_SH_STREAM=1` and round C (`STRATA_EXP_MODE=8`, `STRATA_BATCH_GDN_GROUPS`, `STRATA_POOL_DEP=0`, `--pool-tasks 12`/`24`) are not measured.
+
+### 9.7 Production config from rounds A and B (2026-11-25)
+- The new build (this branch: the watchdog fix, the plan map and the opt-in switches), installed beside the old binary, which stays for a rollback.
+- Added to `env`: `STRATA_BATCH_DF2_CAP=1`, `STRATA_DF2_Q4_NARROW=1`, `STRATA_PCIE_NEVER=1` (measured together: batch +3% to +6%), `STRATA_CPU_IQ_ALL_EXACT1=1` (batch +4% to +5%), `STRATA_WATCHDOG_S=900` (section 10). The four speed switches were measured one round at a time, not all together.
+- Unchanged: the second model and its 16.5 GB reserve on GPU 1. Dropping the reserve is the largest gain measured (round A, `ded`), but it needs the second model moved or stopped.
+- Checked after the start on the production service: the engine log names `STRATA_BATCH_DF2_CAP` and `STRATA_PCIE_NEVER`; a 12,033-token prompt read at 799 tok/s; 4 code requests at once gave 22.6, 43.9, then 66.3 tok/s in all as the cache warmed; solo code 40, then 56 tok/s.
+
 ## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
 The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.
 
