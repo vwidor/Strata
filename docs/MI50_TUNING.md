@@ -183,7 +183,13 @@ Note: if using a custom `model_name` not matched by `drafting.py:supported_model
     "STRATA_DF2_HEAD": "indexed",
     "STRATA_TRIM_VERIFY_SCRATCH": "1",
     "STRATA_LEAN_SLOTS": "1",
-    "STRATA_SHARED_KV_CELLS": "131072"
+    "STRATA_SHARED_KV_CELLS": "131072",
+    "STRATA_PW_PENALTY": "1",
+    "STRATA_PW_FORK_B": "1",
+    "STRATA_DF2_PW_DYN": "1",
+    "STRATA_BATCH_DYN_GROUPS": "1",
+    "STRATA_BATCH_SLOT_RUNS": "1",
+    "STRATA_FUSE_HITS": "1"
   },
   "args": [
     "--pack", "/path/to/pack-iq3s",
@@ -384,6 +390,28 @@ Four opt-in lossless VRAM optimizations free `~2.5 GiB` on GPU 0 and `~2.1 GiB` 
 | **4× Batch Code** *(total e2e / engine rows/s)* | `83.3` / `88.9 rows/s` | `92.4` / `97.6 rows/s` | **`106.3` / `112.8 rows/s`** | **`+15.0%`** / **`+15.6%`** | **`+27.6%`** / **`+26.9%`** |
 | **Resident Experts** *(total / GPU 1)* | `19,903 (81.0%)` / `58.5%` | `19,903 (81.0%)` / `58.5%` | **`22,054 (90.0%)` / `75.4%`** | **`+2,151`** experts | **`+16.9 pp`** GPU 1 |
 | **Warm Decode Hit Rate** | `95.8–97.6%` | `96.0–99.5%` | **`99.0–99.6%`** | — | — |
+
+### 9.11 Phase 3: SpecDecode & Pipeline Upgrades (measured, 2026-11-25)
+Four opt-in spec-decode/pipeline upgrades in `generate.cpp`, paired with the verified HIP batch fusion flags (`STRATA_BATCH_SLOT_RUNS=1`, `STRATA_FUSE_HITS=1`). Default behavior is unchanged when flags are unset.
+
+| Opt-in Switch | Mechanism | Parity / Verification |
+|---|---|---|
+| `STRATA_PW_PENALTY=1` *(+ neutral-penalty skip)* | Enables solo `pl_pw >= 2` for requests with `penalty_last_n > 0` by staging `penalty_rows` to `d_hist` before strictly in-order Stage 1 `V1(A).pl_launch`; neutral penalties (`repeat=1, freq=0, present=0`) skip `d_hist` entirely | Exact token-for-token output match vs serial `pw=0` (`frequency_penalty=0.25, presence_penalty=0.2`); `+12–18%` on penalized solo decode |
+| `STRATA_PW_FORK_B=1` | Bonus-fork speculative window `B` in solo `pw=2`: when re-drafting (`df2_kind == 1`) disagrees with `A.tok[m+1]` at first mismatch `m`, speculatively commits `A`'s first `m+1` rows on Stage 0 and launches `B` starting at `dd[m]` while `A` verifies on Stage 1 (turning forced-chain disagreements into on-path hits; exact snapshot rollback on miss) | Exact greedy output match; forced-chain disagreements dropped to `0–1`, solo code speculative on-path rate rose to `57%` (`26.1 ms` / `3.08 tok` = `118 tok/s` per speculative window) |
+| `STRATA_DF2_PW_DYN=1` | Dynamic `A`/`B` split sizing for fresh DFlash2 blocks (`df2_kind == 2`): chooses split point `t_a ∈ [2..5]` (or unsplit) maximizing expected committed tokens per stage-cost unit from `pp[0..6]` instead of fixed `half=4` | Exact greedy output match |
+| `STRATA_BATCH_DYN_GROUPS=1` | Dynamic carrier balancing for `STRATA_PIPED_MTP`: keeps home-affine static groups at `3×`/`4×` (zero extra HIP graph captures), and splits active slots `1+1` across carriers whenever a static group would otherwise go empty (e.g., `2×` batch or staggered-finish tails) | Eliminates `50%` 2-GPU pipeline bubble on same-group pairs (`batch2_code`: `89.2 → 96.2 tok/s`) |
+| `STRATA_BATCH_SLOT_RUNS=1` + `STRATA_FUSE_HITS=1` | Existing HIP fusion switches verified on `gfx906`: fuses contiguous per-slot QSA rows in `batch_launch_rows` and folds `moe_hit_add` into MoE combine (`-48` launches/window) | Zero NaNs, identical openings; `+4–10%` additional batch throughput |
+
+**Live End-to-End Dual-MI50 Progression (`--vram-reserve-later-mib 12000`, `180 W`, warm cache, `256` tokens, `temp=0.0`, thinking off):**
+
+| Workload | Phase 0 (`5f43512`) | Phase 1 (`10c8655`) | Phase 2 (`1450115`) | **Phase 3 (fresh / warm)** | **Cumulative vs Phase 0** |
+|---|---:|---:|---:|---:|---:|
+| **Solo Prose** *(e2e / pure)* | `43.3` / `47.5 tok/s` | `49.7` / `54.3 tok/s` | `52.3` / `57.1 tok/s` | **`56.9` / `62.6 tok/s`** | **`+31.4%`** / **`+31.8%`** |
+| **Solo Code** *(e2e / pure)* | `58.5` / `69.8 tok/s` | `63.1` / `73.2 tok/s` | `65.3` / `77.8 tok/s` | **`73.7` / `87.5 tok/s`** | **`+26.0%`** / **`+25.4%`** |
+| **Solo Penalized Prose** *(e2e / pure)* | — | — | `46.2` / `51.5 tok/s` | **`51.8–54.4` / `55.6–58.7 tok/s`** | **`+12–18%`** vs Phase 2 |
+| **2× Batch Code** *(total / engine rows/s)* | — | — | `89.2` / `98.1 rows/s` | **`96.2` / `106.0 rows/s`** | **`+7.8%`** vs Phase 2 |
+| **3× Batch Prose** *(total / engine rows/s)* | `63.0 tok/s` | `72.2 tok/s` | `78.4` / `82.6 rows/s` | **`84.6` / `89.4 rows/s`** | **`+34.3%`** |
+| **4× Batch Code** *(total / engine rows/s)* | `83.3` / `88.9 rows/s` | `92.4` / `97.6 rows/s` | `106.3` / `112.8 rows/s` | **`110.9–120.0` / `118.6–129.1 rows/s`** | **`+33.1–44.1%`** e2e / **`+33.4–45.2%`** rows/s |
 
 ## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
 The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.

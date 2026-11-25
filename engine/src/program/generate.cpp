@@ -17010,6 +17010,18 @@ int main(int argc, char** argv) {
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
+        size_t dyn_rr = 0;
+        const bool dyn_groups = pmtp && pg.size() >= 2 && [] {
+            const char* v = std::getenv("STRATA_BATCH_DYN_GROUPS");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        auto slot_inflight = [&](int b) {
+            for (const PGroup& x : pg) {
+                if (!x.inflight) continue;
+                for (int t = 0; t < x.S; ++t) if (x.rows[t] == b) return true;
+            }
+            return false;
+        };
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
@@ -17656,6 +17668,43 @@ int main(int argc, char** argv) {
                     // STRATA_PIPE_ADAPT_EVERY: a round is due, the pipeline empties first; STRATA_SLOT_READ: so it does for
                     // a slot's turn checkpoint
                     if (!may_start || pa_due() || rd_ck_pending > 0) continue;
+                    std::vector<int> dyn_chosen;
+                    bool use_dyn_now = false;
+                    if (dyn_groups) {
+                        int total_active = 0, active_static_groups = 0;
+                        for (int gi = 0; gi < (int) pg.size(); ++gi) {
+                            int ga = 0;
+                            for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) ++ga;
+                            total_active += ga;
+                            if (ga > 0) ++active_static_groups;
+                        }
+                        // Only rebalance dynamically when static grouping leaves a pipeline carrier empty
+                        // (e.g. 2 active slots both in {0,1} or {2,3}), avoiding extra graph captures at 3x/4x.
+                        use_dyn_now = (active_static_groups < (int) pg.size() && total_active >= 2);
+                    }
+                    if (use_dyn_now) {
+                        int free_carrier = -1;
+                        for (int j = 0; j < (int) pg.size() && free_carrier < 0; ++j) {
+                            const int gi = (int) ((rr + j) % (int64_t) pg.size());
+                            if (!pg[(size_t) gi].inflight) free_carrier = gi;
+                        }
+                        if (free_carrier >= 0) {
+                            std::vector<int> ready_slots;
+                            const size_t nb = bs.size();
+                            for (size_t off = 0; off < nb; ++off) {
+                                const int b = (int) ((dyn_rr + off) % nb);
+                                if (!bs[(size_t) b].active || slot_inflight(b)) continue;
+                                const int dr = pmtp_plan(b);
+                                if (dr < 0) return false;
+                                if (dr == 1) ready_slots.push_back(b);
+                            }
+                            if (!ready_slots.empty()) {
+                                dyn_chosen.push_back(ready_slots[0]);
+                                dyn_rr = (size_t) (ready_slots[0] + 1) % nb;
+                                pick = free_carrier;
+                            }
+                        }
+                    } else
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
                         if (pg[(size_t) gi].inflight || !group_active(gi)) continue;
@@ -17728,17 +17777,22 @@ int main(int argc, char** argv) {
                         int wide_b = -1;
                         if (slot_read_wide && ahead_b < 0) {
                             int n_active = 0, last = -1;
-                            for (int t = 0; t < GS; ++t)
-                                if (bs[(size_t) (pick * GS + t)].active) {
-                                    ++n_active;
-                                    last = pick * GS + t;
-                                }
+                            if (use_dyn_now) {
+                                for (int b : dyn_chosen) if (bs[(size_t) b].active) { ++n_active; last = b; }
+                            } else {
+                                for (int t = 0; t < GS; ++t)
+                                    if (bs[(size_t) (pick * GS + t)].active) {
+                                        ++n_active;
+                                        last = pick * GS + t;
+                                    }
+                            }
                             if (n_active == 1 && bs[(size_t) last].rd_on &&
                                 1 + bs[(size_t) last].w_rd + bs[(size_t) last].w_rd_x == pmtp_group_cap)
                                 wide_b = last;
                         }
-                        for (int t = 0; t < GS && ahead_b < 0; ++t) {
-                            const int b = pick * GS + t;
+                        const int slot_n = use_dyn_now ? (int) dyn_chosen.size() : GS;
+                        for (int t = 0; t < slot_n && ahead_b < 0; ++t) {
+                            const int b = use_dyn_now ? dyn_chosen[(size_t) t] : (pick * GS + t);
                             const BSlot& sl = bs[(size_t) b];
                             if (!sl.active) continue;   // an idle slot carries no row (its state is left untouched)
                             ++G.active;
@@ -20897,7 +20951,8 @@ int main(int argc, char** argv) {
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
-            const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
+            const bool pen_active = req_sp.penalty_repeat != 1.0f || req_sp.penalty_freq != 0.0f || req_sp.penalty_present != 0.0f;
+            const int hist_n = pen_active ? std::min(req_sp.penalty_last_n, kPenaltyWindowCap) : 0;
             // #4590: the repeat / frequency / presence penalties count the tokens this reply has written, not the prompt's last
             // tokens (the prompt's own numbers and quoted answers were penalised, and a conversation whose last turn asks for
             // something new could get its previous answer back).  Earlier assistant turns inside the prompt are not counted
@@ -21266,8 +21321,12 @@ int main(int argc, char** argv) {
             const bool pl_df2 = false;
 #endif
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok && (use_mtp || pl_df2);
+            static const bool pl_penalty = [] {
+                const char* v = std::getenv("STRATA_PW_PENALTY");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
             const char* pl_serial = !pl_want ? nullptr
-                                  : hist_n > 0 ? "repetition penalties (penalty_last_n)"
+                                  : (hist_n > 0 && !pl_penalty) ? "repetition penalties (penalty_last_n)"
                                   : (use_mtp && !pl_df2 && mtp.coupled()) ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
@@ -21283,6 +21342,7 @@ int main(int argc, char** argv) {
                 }
                 struct PW {
                     int T = 0, seq = 0;
+                    int fork_keep = 0;     // STRATA_PW_FORK_B: rows of predecessor A committed for this B (0 = full A.T)
                     int64_t p = 0;
                     int32_t tok[8] = {};
                     float prob[8] = {};    // prob[i]: the drafter's probability of tok[i + 1]
@@ -21690,13 +21750,24 @@ int main(int argc, char** argv) {
                                 }
                                 return T;
                             };
-                            auto df2_make_b = [&](int base, float pa) {
+                            static const bool pl_fork_b = [] {
+                                const char* v = std::getenv("STRATA_PW_FORK_B");
+                                return v != nullptr && v[0] != '\0' && v[0] != '0';
+                            }();
+                            static const bool pl_df2_dyn = [] {
+                                const char* v = std::getenv("STRATA_DF2_PW_DYN");
+                                return v != nullptr && v[0] != '\0' && v[0] != '0';
+                            }();
+                            auto df2_make_b = [&](int base, float pa, int fork_keep = 0) {
                                 B = PW{};
                                 if (base >= nd) return;
+                                const int keep_rows = fork_keep > 0 ? fork_keep : A.T;
                                 B.seq = A.seq + 1;
-                                B.p = A.p + A.T;
+                                B.fork_keep = keep_rows;
+                                B.p = A.p + keep_rows;
                                 B.tok[0] = dd[base];
-                                B.T = df2_t_rule(base + 1, std::min(half, nd - base));
+                                const int max_b = pl_df2_dyn ? std::min(5, S_mtp) : half;
+                                B.T = df2_t_rule(base + 1, std::min(max_b, nd - base));
                                 for (int i = 1; i < B.T; ++i) {
                                     B.tok[i] = dd[base + i];
                                     B.prob[i - 1] = pp[base + i];
@@ -21709,16 +21780,48 @@ int main(int argc, char** argv) {
                                 B.made = true;
                                 if (B.ready && B.go && pl_prestage && !VF(0, B).in_flight() && !doomed) {
                                     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-                                    for (int i = 0; i < A.T; ++i) { prev[0] = prev[1]; prev[1] = A.tok[i]; }
+                                    for (int i = 0; i < keep_rows; ++i) { prev[0] = prev[1]; prev[1] = A.tok[i]; }
                                     if (!VF(0, B).prestage(B.T, B.tok, B.p, prev, err)) { B.ready = false; }
                                 }
                             };
                             if (df2_kind == 2) {
-                                const int t_half = df2_t_rule(0, half);
-                                float pa_half = 1.0f;
-                                for (int i = 0; i + 1 < t_half; ++i) pa_half *= pp[i];
-                                const bool can_split = (t_half - 1 < nd) && (t_half < S_mtp) && gate_pass(pa_half * pp[t_half - 1], false);
-                                A.T = can_split ? t_half : df2_t_rule(0, S_mtp);
+                                int chosen_ta = 0;
+                                float chosen_pa = 1.0f;
+                                bool can_split = false;
+                                if (pl_df2_dyn) {
+                                    float P[8] = {1.0f};
+                                    for (int i = 0; i < nd && i < 7; ++i) P[i + 1] = P[i] * pp[i];
+                                    auto scost = [](int T) { return 1.0f + 0.14f * (float) (T - 1); };
+                                    const int t_full = df2_t_rule(0, S_mtp);
+                                    float e_full = 0.0f;
+                                    for (int k = 0; k < t_full; ++k) e_full += P[k];
+                                    float best_rate = e_full / (2.0f * scost(t_full));
+                                    const int max_ta = std::min({5, t_full, nd, S_mtp - 1});
+                                    for (int ta = 2; ta <= max_ta; ++ta) {
+                                        const float p_on = P[ta];
+                                        if (!gate_pass(p_on, false)) continue;
+                                        const int bt = df2_t_rule(ta, std::min(5, nd - (ta - 1)));
+                                        float e_ab = 0.0f;
+                                        for (int k = 0; k < ta + bt && k <= nd; ++k) e_ab += P[k];
+                                        const float cA = scost(ta), cB = scost(bt);
+                                        const float t_ab = cA + std::max(cA, cB) + p_on * 0.5f * cB + (1.0f - p_on) * 0.12f;
+                                        const float rate = e_ab / t_ab;
+                                        if (rate > best_rate) {
+                                            best_rate = rate;
+                                            chosen_ta = ta;
+                                            chosen_pa = P[ta - 1];
+                                            can_split = true;
+                                        }
+                                    }
+                                    A.T = can_split ? chosen_ta : t_full;
+                                } else {
+                                    const int t_half = df2_t_rule(0, half);
+                                    float pa_half = 1.0f;
+                                    for (int i = 0; i + 1 < t_half; ++i) pa_half *= pp[i];
+                                    can_split = (t_half - 1 < nd) && (t_half < S_mtp) && gate_pass(pa_half * pp[t_half - 1], false);
+                                    chosen_pa = pa_half;
+                                    A.T = can_split ? t_half : df2_t_rule(0, S_mtp);
+                                }
                                 for (int i = 1; i < A.T; ++i) {
                                     A.tok[i] = dd[i - 1];
                                     A.prob[i - 1] = pp[i - 1];
@@ -21728,7 +21831,7 @@ int main(int argc, char** argv) {
                                 early_used = true;
                                 if (!b_done && !A.sfx) {
                                     if (can_split) {
-                                        df2_make_b(A.T - 1, pa_half);
+                                        df2_make_b(A.T - 1, chosen_pa, A.T);
                                     } else {
                                         B = PW{};
                                         ++pl_gate;
@@ -21738,14 +21841,22 @@ int main(int argc, char** argv) {
                                 tre("CD", A.seq, 2, (int) (1000.0f * B.p_on));
                             } else if (df2_kind == 1 && !b_done && !A.sfx) {
                                 const int base = A.T - 1;
-                                bool agree = true;
+                                int m_bad = -1;
                                 float pa = 1.0f;
                                 for (int i = 0; i + 1 < A.T; ++i) {
-                                    if (i >= nd || dd[i] != A.tok[i + 1]) agree = false;
+                                    if (i >= nd || dd[i] != A.tok[i + 1]) { m_bad = i; break; }
                                     pa *= (pl_agree && i < nd) ? pp[i] : A.prob[i];
                                 }
-                                if (pl_agree && !agree) { pa = 0.0f; ++pl_disagree; }
-                                df2_make_b(base, pa);
+                                if (m_bad >= 0) {
+                                    if (pl_fork_b && m_bad < nd && gate_pass(pa * pp[m_bad], false)) {
+                                        df2_make_b(m_bad, pa, m_bad + 1);
+                                    } else {
+                                        if (pl_agree) { pa = 0.0f; ++pl_disagree; }
+                                        df2_make_b(base, pa, A.T);
+                                    }
+                                } else {
+                                    df2_make_b(base, pa, A.T);
+                                }
                                 b_done = true;
                                 tre("CD", A.seq, 1, (int) (1000.0f * B.p_on));
                             }
@@ -21900,7 +22011,8 @@ int main(int argc, char** argv) {
                                 undo_ple[0] = ss.ple_prev[0];
                                 undo_ple[1] = ss.ple_prev[1];
                             }
-                            if (!VF(st, A).pl_commit_async(A.T, err) || !snap_take(st, B.seq) ||
+                            const int spec_keep = B.fork_keep > 0 ? B.fork_keep : A.T;
+                            if (!VF(st, A).pl_commit_async(spec_keep, err) || !snap_take(st, B.seq) ||
                                 !VF(st, B).pl_launch(B.T, B.tok, B.p, err))
                                 return die(err.empty() ? std::string("the GDN snapshot failed") : err);
                             A.com |= 1u << st;
@@ -21920,6 +22032,13 @@ int main(int argc, char** argv) {
                     if (A.finished && !A.s1) {
                         if (chain_kind == 1 && !B.ready) ++pl_late;   // stage 0 idles until the chain has B
                         if (ajob) a_gap(1);   // --adapt-async: stage 1 is idle until this launch
+                        if (hist_n > 0) {
+                            strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0),
+                                                          A.tok, A.T, hist_n, hist_stage.data());
+                            const strata::core::OnDevice on_h(hist_dev);
+                            cudaMemcpy(d_hist, hist_stage.data(), (size_t) A.T * (size_t) hist_n * sizeof(int32_t),
+                                       cudaMemcpyHostToDevice);
+                        }
                         if (!V1(A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
                         A.s1 = true;
                         tre("L1", A.seq, A.T);
@@ -21998,9 +22117,10 @@ int main(int argc, char** argv) {
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
                     const bool last = nf || eos || produced_n >= cap_now() || stop_req.load();
-                    const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                    const int b_keep = B.fork_keep > 0 ? B.fork_keep : A.T;
+                    const bool on = !nf && B.launched && (a + 1 == b_keep) && B.tok[0] == outp[(size_t) a];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
-                        const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                        const bool would = (a + 1 == b_keep) && B.tok[0] == outp[(size_t) a];
                         const int bin = std::min(9, std::max(0, (int) (B.p_on * 10.0f)));
                         cal_n[bin] += 1;
                         cal_on[bin] += would ? 1 : 0;
@@ -22064,11 +22184,11 @@ int main(int argc, char** argv) {
                         if (nB.made) {
 #if defined(STRATA_HAVE_DFLASH2)
                             if (pl_df2) {
-                                const float* tp = pl_df2_taps(A, A.T, err);
-                                if (tp == nullptr || !df2.context(tp, A.T, A.p, err)) return die(err);
+                                const float* tp = pl_df2_taps(A, a + 1, err);
+                                if (tp == nullptr || !df2.context(tp, a + 1, A.p, err)) return die(err);
                             } else
 #endif
-                            if (!mtp.prefill(V1(A).final_R(0), outp.data(), A.T, A.p, err, false)) return die(err);
+                            if (!mtp.prefill(V1(A).final_R(0), outp.data(), a + 1, A.p, err, false)) return die(err);
                             chain_kind = 0;
                             b_done = true;
                             ++pl_runs;
@@ -22076,8 +22196,8 @@ int main(int argc, char** argv) {
                         } else {
 #if defined(STRATA_HAVE_DFLASH2)
                             if (pl_df2) {
-                                const float* tp = pl_df2_taps(A, A.T, err);
-                                if (tp == nullptr || !df2.draft_launch(tp, A.T, A.p, outp[(size_t) a], err)) return die(err);
+                                const float* tp = pl_df2_taps(A, a + 1, err);
+                                if (tp == nullptr || !df2.draft_launch(tp, a + 1, A.p, outp[(size_t) a], err)) return die(err);
                                 df2_live = true;
                                 df2_kind = 1;
                                 ++pl_chains;
@@ -22101,10 +22221,10 @@ int main(int argc, char** argv) {
                             }
                         }
                         early_used = false;
-                        // A accepted whole: its commit on the front stages B has not reached yet (B, now A, runs there
+                        // A accepted (full or bonus-fork): its commit on the front stages B has not reached yet (B, now A, runs there
                         // after it)
                         for (int st = 0; st < pl_nf; ++st)
-                            if ((A.com & (1u << st)) == 0 && !VF(st, A).pl_commit_async(A.T, err)) return die(err);
+                            if ((A.com & (1u << st)) == 0 && !VF(st, A).pl_commit_async(a + 1, err)) return die(err);
                         A = B;
                         B = nB;
                     } else {
