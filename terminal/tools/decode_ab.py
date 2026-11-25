@@ -6,7 +6,8 @@
 
 An arm is NAME, NAME:ENV=VALUE,ENV=VALUE or NAME@EXE:ENV=VALUE,...  (EXE replaces the profile's "exe"; ENV is added
 to the profile's "env", and ENV= with no value removes that variable).  An item --flag=value sets an engine argument
-instead: it replaces the flag's value in the profile's "args", or is appended.  For each arm the tool writes a copy of the
+instead: it replaces the flag's value in the profile's "args", or is appended.  An item @key=value sets a top-level profile
+key (for example @layer_split=25; a JSON value is parsed, anything else stays a string).  For each arm the tool writes a copy of the
 profile (its exe and env, its own engine log, no vision reader), starts the server with it, waits until the model is
 loaded, warms up, and measures:
 
@@ -100,14 +101,19 @@ def chat(base, key, model, text, max_tokens, timeout=900.0):
 def parse_arm(spec: str):
     name, _, envs = spec.partition(":")
     name, _, exe = name.partition("@")
-    env, args = {}, []
+    env, args, keys = {}, [], {}
     for kv in filter(None, envs.split(",")):
         k, _, v = kv.partition("=")
-        if k.strip().startswith("--"):
+        if k.strip().startswith("@"):
+            try:
+                keys[k.strip()[1:]] = json.loads(v.strip())
+            except ValueError:
+                keys[k.strip()[1:]] = v.strip()
+        elif k.strip().startswith("--"):
             args.append((k.strip(), v.strip()))
         else:
             env[k.strip()] = v.strip()
-    return {"name": name, "exe": exe or None, "env": env, "args": args}
+    return {"name": name, "exe": exe or None, "env": env, "args": args, "keys": keys}
 
 
 def med(xs):
@@ -119,6 +125,8 @@ def run_arm(arm, a, base_profile, out_dir: Path, log):
     prof = json.loads(json.dumps(base_profile))
     if arm["exe"]:
         prof["exe"] = arm["exe"]
+    for k, v in arm.get("keys", {}).items():
+        prof[k] = v if k != "layer_split" else str(v)
     env = dict(prof.get("env") or {})
     for k, v in arm["env"].items():
         if v == "":
