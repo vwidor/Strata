@@ -1,6 +1,6 @@
 # AGENTS.md
 
-**Git workflow:** This is our public fork. Always commit and push your changes after completing work unless explicitly told not to. Document measured findings, tuning results, profiles, and rejected experiments (e.g. in `docs/MI50_TUNING.md`) so future sessions do not repeat work. **Always anonymize** all committed docs, configs, and commit messages — never include private hostnames, domains, LAN IPs, usernames, internal VM/service IDs, or private client names.
+**Git workflow:** This is our public fork. Always commit and push your changes after completing work unless explicitly told not to. Document measured findings, tuning results, profiles, and rejected experiments (e.g. in `docs/MI50_TUNING.md`) so future sessions do not repeat work. Keep docs concise and current — never bloat docs with changelogs, meta-notes about removed files/tools, or unnecessary history. **Always anonymize** all committed docs, configs, and commit messages — never include private hostnames, domains, LAN IPs, usernames, internal VM/service IDs, or private client names.
 
 **Benchmarking rule:** Use **fast verification runs** (targeted kernel micro-benchmarks or short single-pass checks of ~30–60 s directly against the running server). Do **not** run slow multi-round full-reload A/B sweeps across many arms.
 
