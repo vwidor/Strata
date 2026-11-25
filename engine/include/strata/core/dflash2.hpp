@@ -54,6 +54,8 @@ public:
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err, int head_device = -1);
     /// STRATA_DF2_HEAD=native (CUDA / HIP): bind() ignores the vocabulary file and runs the draft head on the target's whole head (no pruned copy).
     static bool head_native() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'n'; }
+    /// STRATA_DF2_HEAD=indexed (opt-in): runs the draft head directly against the target's resident head indexed by dvocab_ (no 213 MiB pruned copy, bitwise exact).
+    static bool head_indexed() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'i'; }
     /// DF-05: before bind, the MTP drafter's gathered draft-head rows and vocabulary (device pointers it keeps owning) when they are the same bytes this
     /// drafter would gather; bind then uses them instead of a second copy (about 213 MiB on Flash-Next) and checks the vocabulary against the file.
     struct SharedHead { const uint8_t* rows = nullptr; const int32_t* vocab_dev = nullptr; const std::vector<int32_t>* vocab_host = nullptr; int64_t n = 0; int type = -1; };
@@ -121,6 +123,8 @@ public:
     /// A request moves between two drafters whose rings were copied on the device (solo <-> a --parallel slot): the host side goes with it. The lineage's log is
     /// shared copy-on-write, the tag shadow and the epoch are copied (the caller copies kring_/vring_/tag_ on the device).
     void copy_log_state_from(const Dflash2Drafter& src);
+    /// Preserve another drafter's live lineage (e.g. a batch slot before parking or overwrite) into this drafter's stash (copy-on-write chunks).
+    void stash_from(const Dflash2Drafter& src);
     uint64_t ring_log_bytes() const;     ///< host bytes of the live lineage's log
     uint64_t ring_stash_bytes() const;   ///< host bytes of the parked lineages
     uint64_t ring_scratch_bytes() const { return rb_bytes_; }   ///< VRAM of the rebuild scratch (0 until the first rebuild)
@@ -208,6 +212,7 @@ private:
     uint8_t* dhead_ = nullptr;      ///< the draft vocabulary's head rows (owned), or null with head_w_ the whole head
     SharedHead shared_;             ///< offered by the MTP drafter (DF-05)
     bool dhead_shared_ = false;     ///< dhead_ / dvocab_ are the MTP drafter's, not freed here
+    bool head_indexed_ = false;     ///< STRATA_DF2_HEAD=indexed: head_w_ is full target head indexed by dvocab_
     bool bound_ = false;
 
     // device buffers

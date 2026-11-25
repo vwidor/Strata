@@ -94,9 +94,13 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
 bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error) {
     if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
         st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
-        (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
+        (st.kv_mode == 0 && !st.kv_shared && st.n_slots < st.n_pages) ||
         l.pooled_rows > st.idx_pooled_rows || (st.kv_mode != 0 && !st.host.present())) {
         error = "conversation snapshot: invalid K/V extent or missing authoritative host pool";
+        return false;
+    }
+    if (st.kv_shared && (st.shared_chunks == nullptr || st.shared_chunk_pages <= 0)) {
+        error = "conversation snapshot: missing shared K/V chunk map";
         return false;
     }
     if (st.kv_mode == 1) {
@@ -112,6 +116,40 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
                                                     : !st.k_pool || !st.v_pool))) {
         error = "conversation snapshot: invalid draft ring";
         return false;
+    }
+    return true;
+}
+
+size_t kv_part_chunk_bytes(const QsaState& st, const Layout& l, size_t part) {
+    if (part >= 4 || !st.kv_shared || l.cells <= 0) return 0;
+    const size_t total = part == 0 ? l.data : part == 1 ? l.value_data : part == 2 ? l.scales : l.value_scales;
+    const size_t cell_bytes = total / size_t(l.cells);
+    return size_t(st.shared_chunk_pages) * size_t(l.page_size) * cell_bytes;
+}
+
+template<typename Fn>
+bool visit_shared_kv(const QsaState& st, const Layout& l, size_t part, const void* pool_base,
+                     size_t at, size_t n, std::string& error, Fn&& fn) {
+    if (n == 0) return true;
+    if (part == 4 || !st.kv_shared || st.shared_chunks == nullptr) {
+        return fn(pool_base ? static_cast<const uint8_t*>(pool_base) + at : nullptr, 0, n);
+    }
+    if (!pool_base) { error = "conversation snapshot: missing shared K/V pool"; return false; }
+    const size_t chunk_bytes = kv_part_chunk_bytes(st, l, part);
+    if (chunk_bytes == 0) return true;
+    size_t done = 0;
+    while (done < n) {
+        const size_t pos = at + done;
+        const size_t c = pos / chunk_bytes;
+        const size_t off = pos % chunk_bytes;
+        const size_t len = std::min(n - done, chunk_bytes - off);
+        if (c >= st.shared_chunks->size() || (*st.shared_chunks)[c] < 0) {
+            error = "conversation snapshot: unallocated shared K/V chunk";
+            return false;
+        }
+        const size_t phys_off = size_t((*st.shared_chunks)[c]) * chunk_bytes + off;
+        if (!fn(static_cast<const uint8_t*>(pool_base) + phys_off, done, len)) return false;
+        done += len;
     }
     return true;
 }
@@ -330,8 +368,13 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                                   (st.kv_mode == 0 || on_device(src[i]));   // (kv_mode 0: the pools are device memory)
                 if (fits) {
                     const size_t at0 = s.used;
-                    const cudaError_t e = conversation_detail::copy_nonblocking(static_cast<uint8_t*>(s.p) + at0, src[i], sizes[i], true);
-                    if (e != cudaSuccess) { error = std::string("conversation snapshot slot copy: ") + cudaGetErrorString(e); return false; }
+                    const bool ok_slot = visit_shared_kv(st, l, i, src[i], 0, sizes[i], error,
+                        [&](const uint8_t* sp, size_t off, size_t len) {
+                            const cudaError_t e = conversation_detail::copy_nonblocking(static_cast<uint8_t*>(s.p) + at0 + off, sp, len, true);
+                            if (e != cudaSuccess) { error = std::string("conversation snapshot slot copy: ") + cudaGetErrorString(e); return false; }
+                            return true;
+                        });
+                    if (!ok_slot) return false;
                     s.parts.push_back({image.dev_tag, i, at0, sizes[i]});
                     s.used += sizes[i];
                     dst[i]->resize_for_overwrite(sizes[i]);
@@ -342,7 +385,10 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                 } else {
                     dst[i]->resize(sizes[i]);
                     if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                            return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                            return visit_shared_kv(st, l, i, src[i], at, n, error,
+                                [&](const uint8_t* sp, size_t off, size_t len) {
+                                    return transfer(p + off, sp, len, error);
+                                });
                         })) return false;
                 }
                 if (reused_bytes) *reused_bytes += keep;
@@ -364,13 +410,15 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const auto t2 = tick();
         if (trace) kv_save_trace().resize_faults += conversation_trace::thread_minflt() - rf0;
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
-                if (!staged) return transfer(p, s, n, error);
-                const cudaError_t e = conversation_detail::copy_nonblocking(a.stage + a.used, s, n, true);
-                if (e != cudaSuccess) { error = std::string("conversation snapshot stage copy: ") + cudaGetErrorString(e); return false; }
-                a.items.push_back({p, n, a.used});
-                a.used += n;
-                return true;
+                return visit_shared_kv(st, l, i, src[i], at, n, error,
+                    [&](const uint8_t* sp, size_t off, size_t len) {
+                        if (!staged) return transfer(p + off, sp, len, error);
+                        const cudaError_t e = conversation_detail::copy_nonblocking(a.stage + a.used, sp, len, true);
+                        if (e != cudaSuccess) { error = std::string("conversation snapshot stage copy: ") + cudaGetErrorString(e); return false; }
+                        a.items.push_back({p + off, len, a.used});
+                        a.used += len;
+                        return true;
+                    });
             });
         if (trace) {
             auto ms = [](std::chrono::steady_clock::time_point x, std::chrono::steady_clock::time_point y) {
@@ -492,8 +540,34 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (!sizes[i]) continue;
         if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
-        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
-        if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+        if (i < 4 && (from.kv_shared || to.kv_shared)) {
+            const size_t cb = from.kv_shared ? kv_part_chunk_bytes(from, lf, i) : kv_part_chunk_bytes(to, lt, i);
+            for (size_t pos = 0; pos < sizes[i]; pos += cb) {
+                const size_t len = std::min(cb, sizes[i] - pos);
+                const size_t c = pos / cb;
+                size_t soff = pos, doff = pos;
+                if (from.kv_shared) {
+                    if (c >= from.shared_chunks->size() || (*from.shared_chunks)[c] < 0) {
+                        error = "conversation snapshot: unallocated source shared K/V chunk";
+                        return false;
+                    }
+                    soff = size_t((*from.shared_chunks)[c]) * cb;
+                }
+                if (to.kv_shared) {
+                    if (c >= to.shared_chunks->size() || (*to.shared_chunks)[c] < 0) {
+                        error = "conversation snapshot: unallocated target shared K/V chunk";
+                        return false;
+                    }
+                    doff = size_t((*to.shared_chunks)[c]) * cb;
+                }
+                const cudaError_t e = conversation_detail::copy_nonblocking(
+                    static_cast<uint8_t*>(dst[i]) + doff, static_cast<const uint8_t*>(src[i]) + soff, len, queued);
+                if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+            }
+        } else {
+            const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
+            if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+        }
     }
     if (queued && to.kv_mode != 0) {
         const cudaError_t e = conversation_detail::order_after_queued();
@@ -520,15 +594,23 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     const auto dst = pools(st);
     std::array<size_t,5> sizes{}, off{};
     for (size_t i = 0; i < src.size(); ++i) sizes[i] = src[i]->size();
+    Layout lr{};
+    if (!layout(st, g, upto, index, lr, error)) return false;
     if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; conversation_park_join(); }
     if (slot != nullptr) {
         for (size_t i = 0; i < src.size(); ++i)
-            if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
+            if (!visit_shared_kv(st, lr, i, dst[i], 0, sizes[i], error,
+                    [&](const uint8_t* dp, size_t d_off, size_t len) {
+                        return transfer(const_cast<uint8_t*>(dp), static_cast<const uint8_t*>(slot->p) + off[i] + d_off, len, error);
+                    })) return false;
         return refresh_residency(st, g, upto, error);
     }
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return visit_shared_kv(st, lr, i, dst[i], at, n, error,
+                    [&](const uint8_t* dp, size_t d_off, size_t len) {
+                        return transfer(const_cast<uint8_t*>(dp), p + d_off, len, error);
+                    });
             })) return false;
     return refresh_residency(st, g, upto, error);
 }
@@ -554,12 +636,18 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; conversation_park_join(); }
     if (slot != nullptr) {
         for (size_t i = 0; i < src.size(); ++i)
-            if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
+            if (!visit_shared_kv(st, l, i, dst[i], 0, sizes[i], error,
+                    [&](const uint8_t* dp, size_t d_off, size_t len) {
+                        return transfer(const_cast<uint8_t*>(dp), static_cast<const uint8_t*>(slot->p) + off[i] + d_off, len, error);
+                    })) return false;
         return refresh_residency(st, g, upto, error);
     }
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return visit_shared_kv(st, l, i, dst[i], at, n, error,
+                    [&](const uint8_t* dp, size_t d_off, size_t len) {
+                        return transfer(const_cast<uint8_t*>(dp), p + d_off, len, error);
+                    });
             })) return false;
     return refresh_residency(st, g, upto, error);
 }
@@ -582,10 +670,26 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const auto src = pools(st);
     const auto sizes = s.sizes;
+    const bool shared = st.kv_shared;
+    const auto chunks = (shared && st.shared_chunks) ? *st.shared_chunks : std::vector<int32_t>{};
+    std::array<size_t, 4> cbytes{};
+    for (size_t i = 0; i < 4; ++i) cbytes[i] = kv_part_chunk_bytes(st, l, i);
     auto why = std::make_shared<std::string>();
-    s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+    s.read = [src, sizes, shared, chunks, cbytes, why](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
-        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+        if (!shared || part == 4 || n == 0)
+            return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+        const size_t cb = cbytes[part];
+        size_t done = 0;
+        while (done < n) {
+            const size_t pos = offset + done;
+            const size_t c = pos / cb, off = pos % cb, len = std::min(n - done, cb - off);
+            if (c >= chunks.size() || chunks[c] < 0) { *why = "unallocated shared K/V chunk"; return false; }
+            if (!transfer(static_cast<uint8_t*>(dst) + done,
+                          static_cast<const uint8_t*>(src[part]) + size_t(chunks[c]) * cb + off, len, *why)) return false;
+            done += len;
+        }
+        return true;
     };
     s.error = [why] { return *why; };
     out = std::move(s);
@@ -596,6 +700,8 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
                             int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
     conversation_park_join();
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+    Layout lv{};
+    if (!layout(st, g, upto, index, lv, error)) return false;
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
     auto compare = [&](const void* device, const uint8_t* expected, size_t bytes, bool include_hash) {
@@ -615,7 +721,10 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     const auto authoritative = pools(st);
     for (size_t i = 0; i < saved.size(); ++i)
         if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
+                return visit_shared_kv(st, lv, i, authoritative[i], at, n, error,
+                    [&](const uint8_t* sp, size_t off, size_t len) {
+                        return compare(sp, p + off, len, true);
+                    });
             })) return false;
     if (st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);

@@ -326,8 +326,10 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
     };
     std::vector<int32_t> vocab;
     // STRATA_DF2_HEAD=native: the drafter runs its head on the target's own resident head (every vocabulary row, no 213 MiB pruned copy, no vocabulary file read)
+    // STRATA_DF2_HEAD=indexed: runs the pruned vocabulary directly against the target's resident head indexed by dvocab_ (no 213 MiB pruned copy, bitwise exact)
     // (a head on another card, a layer split's last stage, is not read in place: the pruned copy is gathered there and copied over, as before)
-    const bool head_native = Dflash2Drafter::head_native() && (head_device < 0 || head_device == device_);
+    const bool same_dev = head_device < 0 || head_device == device_;
+    const bool head_native = Dflash2Drafter::head_native() && same_dev;
     if (!vocab_file.empty() && !head_native) {
         if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
             std::fseek(vf, 0, SEEK_END);
@@ -340,10 +342,15 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
             std::fclose(vf);
         }
     }
+    const bool head_indexed = Dflash2Drafter::head_indexed() && !head_native && same_dev && !vocab.empty() &&
+                              kernels::native_mmvq_indexed_supported(head->type());
     const void* hw = head->weights();
     const int64_t row_bytes = (int64_t) head->row_bytes();
     int64_t head_rows = row_bytes > 0 ? (int64_t) (head->weight_bytes() / (uint64_t) row_bytes) : 0;
-    if (!vocab.empty() && shared_.rows != nullptr && !std::getenv("STRATA_DF2_SHARE_HEAD_OFF") && shared_.type == head->type() &&
+    if (head_indexed) {
+        head_indexed_ = true;
+        head_rows = (int64_t) vocab.size();
+    } else if (!vocab.empty() && shared_.rows != nullptr && !std::getenv("STRATA_DF2_SHARE_HEAD_OFF") && shared_.type == head->type() &&
         shared_.n == (int64_t) vocab.size() && shared_.vocab_host != nullptr && *shared_.vocab_host == vocab && shared_.vocab_dev != nullptr) {
         // DF-05: the MTP drafter gathered these very rows (same vocabulary ids in the same order, the main head's own layout and type): use them
         dhead_ = const_cast<uint8_t*>(shared_.rows);
@@ -395,7 +402,9 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
     }
     if (!bind_raw(embed, hw, head->type(), head_rows, vocab, err)) return false;
     std::fprintf(stderr, "strata dflash2: %lld-token draft head (%.1f MiB%s), drafter %.0f MiB of VRAM (%s weights)\n", (long long) n_dvocab_,
-                 (double) (n_dvocab_ * row_bytes) / 1048576.0, dhead_shared_ ? ", the MTP drafter's copy, no second one" : "", (double) vram_ / 1048576.0, q4_ ? "Q4_0" : "Q8_0");
+                 head_indexed_ ? 0.0 : (double) (n_dvocab_ * row_bytes) / 1048576.0,
+                 head_indexed_ ? ", indexed into target head" : (dhead_shared_ ? ", the MTP drafter's copy, no second one" : ""),
+                 (double) vram_ / 1048576.0, q4_ ? "Q4_0" : "Q8_0");
     // the pack's selector codebooks as Q4_0 rows (tools/dflash2_pack.py --q4_0-selector; strata_control/drafting.py reads this text from the program to know it can use that pack)
     if (find("candidate_selector.predecessor_codebook").dtype == "q4_0")
         std::fprintf(stderr, "strata dflash2: selector codebooks: Q4_0 rows (about 174 MiB less than bf16)\n");
@@ -522,7 +531,9 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         if (!skip_part("head")) {
             // the verify window's head kernel (interleaved activations, rows a warp by the card's table): bitwise native_mmvq's output, so the drafts are the same
             static const bool il_on = [] { const char* e = std::getenv("STRATA_DF2_HEAD_IL"); return !(e && e[0] == '0'); }();
-            if (il_on && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
+            if (head_indexed_ && dvocab_ != nullptr) {
+                native_mmvq_indexed(head_type_, head_w_, dvocab_, xq_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+            } else if (il_on && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
                 native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
                 native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
             } else
@@ -596,7 +607,7 @@ bool Dflash2Drafter::clone_bind(const Dflash2Drafter& parent, std::string& err) 
     if (!parent.bound_ || !blob_shared_) { err = "dflash2: the parent drafter is not bound"; return false; }
     const OnDevice on_device(device_);
     embed_ = parent.embed_; head_w_ = parent.head_w_; head_type_ = parent.head_type_; n_dvocab_ = parent.n_dvocab_;
-    dvocab_ = parent.dvocab_; dhead_ = parent.dhead_; dhead_shared_ = true;
+    dvocab_ = parent.dvocab_; dhead_ = parent.dhead_; dhead_shared_ = true; head_indexed_ = parent.head_indexed_;
     ndraft_ = parent.ndraft_;
     if (cudaMalloc((void**) &logits_, (size_t) kDrafts * (size_t) n_dvocab_ * 4) != cudaSuccess) { err = "dflash2: the slot drafter's draft logits do not fit"; return false; }
     vram_ += (uint64_t) kDrafts * (uint64_t) n_dvocab_ * 4;
@@ -768,12 +779,36 @@ void Dflash2Drafter::reset() {
 }
 
 void Dflash2Drafter::copy_log_state_from(const Dflash2Drafter& src) {
+    // Preserve outgoing solo lineage in the stash before replacing it with a returning batch slot's lineage.
+    if (log_on_ && stash_budget_ > 0 && cur_.hist.size() >= 128 && !cur_.chunks.empty() && cur_.hist != src.cur_.hist) {
+        stash_push(std::move(cur_));
+    }
     cur_.hist = src.cur_.hist;
     cur_.chunks = src.cur_.chunks;
     std::memcpy(slot_pos_, src.slot_pos_, sizeof(slot_pos_));
     epoch_ = src.epoch_;
     ring_hi_ = src.ring_hi_;
     have_ctx_ = src.have_ctx_;
+}
+
+void Dflash2Drafter::stash_from(const Dflash2Drafter& src) {
+    if (!log_on_ || stash_budget_ == 0 || src.cur_.hist.size() < 128 || src.cur_.chunks.empty()) return;
+    auto is_prefix = [](const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+        return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
+    };
+    if (is_prefix(src.cur_.hist, cur_.hist)) return;
+    for (size_t i = 0; i < stash_.size(); ++i) {
+        if (is_prefix(src.cur_.hist, stash_[i].hist)) return;
+        if (is_prefix(stash_[i].hist, src.cur_.hist)) {
+            stash_[i].hist = src.cur_.hist;
+            stash_[i].chunks = src.cur_.chunks;
+            return;
+        }
+    }
+    Lineage copy;
+    copy.hist = src.cur_.hist;
+    copy.chunks = src.cur_.chunks;
+    stash_push(std::move(copy));
 }
 
 void Dflash2Drafter::invalidate_ring() {

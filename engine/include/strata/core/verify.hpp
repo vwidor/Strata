@@ -794,6 +794,7 @@ private:
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
+    int64_t gdn_off_ = 0, gdn_cnt_ = 0, qsa_off_ = 0, qsa_cnt_ = 0;   // stage-local layer scratch bounds (STRATA_TRIM_VERIFY_SCRATCH)
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 

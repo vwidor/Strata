@@ -7626,6 +7626,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+#if defined(STRATA_HAVE_DFLASH2)
+            // Non-final stage DFlash2 prompt taps: deliver before `continue` skips the tail block below.
+            if (tap_rows > 0 && on_taps) {
+                if (hp == 0 && p2p_stage && !on_stage_chunk && cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                    err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (!on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
+            }
+#endif
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
             if (p2p_stage) {

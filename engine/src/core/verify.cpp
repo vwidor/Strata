@@ -343,6 +343,7 @@ const Clock::time_point g_proc_t0 = Clock::now();
 Clock::time_point probe_proc_t0() { return g_proc_t0; }
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
+inline bool trim_verify_scratch() { static const bool on = env_on("STRATA_TRIM_VERIFY_SCRATCH"); return on; }
 // STRATA_BATCH_SELF_COMMIT=1 (opt-in): a batch window whose rows are each another slot's one token keeps them itself,
 // as a one-token window does (record_window): the GDN conv histories and states advance inside the window graph, and
 // no commit graph runs after it.  Such a window's commit is unconditional (each slot keeps its one row), and the rest
@@ -1037,7 +1038,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
-    const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
+    int64_t g0 = 0, gn = 0, q0 = 0, qn = 0;
+    for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? q0 : g0) += 1;
+    for (int64_t l = lb_; l < le_; ++l) (is_qsa_layer(g, l) ? qn : gn) += 1;
+    const bool trim_scr = trim_verify_scratch();
+    gdn_off_ = trim_scr ? g0 : 0;
+    gdn_cnt_ = trim_scr ? std::max<int64_t>(gn, 1) : std::max<int64_t>(g.n_gdn_layers(), 1);
+    qsa_off_ = trim_scr ? q0 : 0;
+    qsa_cnt_ = trim_scr ? std::max<int64_t>(qn, 1) : std::max<int64_t>(g.n_qsa_layers(), 1);
+    const uint64_t nG = (uint64_t) gdn_cnt_, nQ = (uint64_t) qsa_cnt_;
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
@@ -1196,7 +1205,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const int qcols = (int) std::min<uint64_t>(T, (uint64_t) strata::kernels::kVerifyMaxT);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+        xil_ = trim_scr ? nullptr : b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));
+#else
         xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));   // 147-verify: 5-8 columns too
+#endif
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -1213,8 +1226,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
+        staging_ = (trim_scr && no_pcie_) ? nullptr
+                 : b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        const bool skip_s2_act = trim_scr && strata::kernels::cpu::expert_layout().native;
+        hit_xq_ = skip_s2_act ? nullptr : b.take<uint8_t>(T * (N / 32) * 34);
+        hit_xs_ = skip_s2_act ? nullptr : b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
@@ -1223,8 +1239,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
-        head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
-        arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
+        head_logits_ = (trim_scr && !last_stage()) ? nullptr : b.take<float>(T * (uint64_t) n_vocab_);
+        arg_scratch_ = (trim_scr && !last_stage()) ? nullptr : b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
@@ -1291,7 +1307,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         had_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_ff), (int) g.n_ff);
     }
     sink_.staging = (unsigned long long) staging_;
-    sink_.staging_cap = kStagingBlobs;
+    sink_.staging_cap = staging_ ? kStagingBlobs : 0;
     (void) TS;
     // STRATA_GRAPH_PRIO=1 (opt-in): the window's streams carry priorities that their captured kernel
     // nodes keep (the window graph is instantiated with cudaGraphInstantiateFlagUseNodePriority): the GDN gates / QSA
@@ -1854,12 +1870,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     !native_of(wout, v.name("ssm_out.weight"), err))
                     return false;
                 const int64_t gi = gdn_idx[(size_t) l];
+                const int64_t gil = gi - gdn_off_;
                 float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                float* qkv = qkv_L_ + (size_t) gi * MT * C;
-                float* hb = h_L_ + (size_t) gi * MT * C;
-                float* gate = gate_L_ + (size_t) gi * MT * HV;
-                float* beta = beta_L_ + (size_t) gi * MT * HV;
+                float* qkv = qkv_L_ + (size_t) gil * MT * C;
+                float* hb = h_L_ + (size_t) gil * MT * C;
+                float* gate = gate_L_ + (size_t) gil * MT * HV;
+                float* beta = beta_L_ + (size_t) gil * MT * HV;
                 if (sidem) {   // the gates (a few blocks, latency-bound) beside the projections, joined below
                     if (!branch(mfork_, cs, side_, "fork")) return false;
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -2008,7 +2025,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     norm_rope_on(data, norm, rows, cols, pos, cs);
                 };
-                float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
+                float* idx_raw = idx_raw_L_ + (size_t) (qi - qsa_off_) * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 // STRATA_DF_QB_Q4 (default on since 0.1.45; STRATA_DF_QB_Q4=0 gives the old token-by-token path): a Q4_0 KV cache
@@ -2059,13 +2076,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, ns);
                 };
                 auto idx_snap = [&](cudaStream_t ns) {
+                    const int64_t qil = qi - qsa_off_;
                     if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
                         for (int t = tb; t < te && !keep_rows; ++t)
                             if (t == tb || brow_[t] != brow_[t - 1])
-                                copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
+                                copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * qsa_cnt_ + qil) * TS,
                                                  slot_ss(t).qsa_states[qi].idx_tail, TS, ns);
                     } else
-                    if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
+                    if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qil * TS, st.idx_tail, TS, ns);
                 };
                 auto idx_append = [&](cudaStream_t ns) {
                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
@@ -3186,9 +3204,9 @@ bool Verifier::capture_commit(std::string& err) {
             else if (n_gdn > 0)
                 gdn_batched = gdn_commit_layers(
                     ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
-                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
-                    MT * C, h_L_ + (size_t) gdn_index * MT * C, MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
-                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
+                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) (gdn_index - gdn_off_) * MT * C,
+                    MT * C, h_L_ + (size_t) (gdn_index - gdn_off_) * MT * C, MT * C, gate_L_ + (size_t) (gdn_index - gdn_off_) * MT * HV,
+                    beta_L_ + (size_t) (gdn_index - gdn_off_) * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
                     (int) n_gdn, commit_, cs_);
         }
         // the QSA layers' tail restore + indexer append, one launch for all of them (one block per layer)
@@ -3206,14 +3224,14 @@ bool Verifier::capture_commit(std::string& err) {
                 if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) { fits = false; break; }
                 mc = st.max_cells;
                 il.gamma[nq] = (const float*) wikn->data;
-                il.tail_src[nq] = tail_snap_ + (size_t) qi * TS;
+                il.tail_src[nq] = tail_snap_ + (size_t) (qi - qsa_off_) * TS;
                 il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
                 il.block_pos[nq] = st.idx_block_pos;
                 ++nq;
                 ++qi;
             }
             if (ok && fits && nq > 0) {
-                native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
+                native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) (qsa_index - qsa_off_) * MT * ID, MT * ID, commit_ + 2, 1,
                                                        (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
                 qsa_batched = true;
             }
@@ -3235,10 +3253,11 @@ bool Verifier::capture_commit(std::string& err) {
                 if (!wnm) { ok = false; break; }
                 float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
+                const int64_t gil = gdn_index - gdn_off_;
+                const float* qkv = qkv_L_ + (size_t) gil * MT * C;
                 gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
-                gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
-                                    beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
+                gdn_step_norm_multi(state, h_L_ + (size_t) gil * MT * C, (int) C, gate_L_ + (size_t) gil * MT * HV,
+                                    beta_L_ + (size_t) gil * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
                                     (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_,
                                     (int) MT);   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
                 ++gdn_index;
@@ -3246,14 +3265,15 @@ bool Verifier::capture_commit(std::string& err) {
                 const QsaState& st = ss.qsa_states[qsa_index];
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn) { ok = false; break; }
-                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
+                const int64_t qil = qsa_index - qsa_off_;
+                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qil * TS, TS, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 if (!g_no_batch_kv) {
-                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qil * MT * ID, commit_ + 2, 1, (int) MT, 0,
                                                     (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
                 } else {
                     for (int64_t t = 0; t < MT; ++t)
-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qil * MT + t) * ID, commit_ + 2 + t, 0,
                                                   (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
                 }
@@ -4016,8 +4036,8 @@ void Verifier::set_plan_slot(int grp) {
     sink_.dst2 = (unsigned long long*) (base + dst2_off_);
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
-    sink_.staging_cap = per;
+    sink_.staging = staging_ ? (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob) : 0ull;
+    sink_.staging_cap = staging_ ? per : 0;
     const int tb = G == 2 && grp == 1 ? (last_t_ + 1) / 2 : 0;
     // STRATA_P2P_DECODE_SCATTER=1 (opt-in; #6023 had it always on): the decode peer writes its experts' outputs straight into this
     // buffer over P2P (expert_pool_dispatch_multi); unset, they come back through the host as before.
@@ -4285,7 +4305,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 #endif
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
-    const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
+    const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = qsa_cnt_;
     void* d = nullptr;
     if (!mapped((size_t) (S * CB * 4 + 16), (void**) &h_commitb_, (void**) &m_commitb_)) {
         err = "verify: the batch commit staging failed";
@@ -4360,7 +4380,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
-    const int64_t CB = 2 + MT, nQ = g.n_qsa_layers();
+    const int64_t CB = 2 + MT, nQ = qsa_cnt_;
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
@@ -4381,6 +4401,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
             if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
+                const int64_t gil = gdn_index - gdn_off_;
                 // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
                 // in one launch for all slots; the conv commits stay per slot
                 bool one_row = S <= 8;
@@ -4393,7 +4414,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
                     float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C,
+                    gdn_conv_commit(conv, qkv_L_ + (size_t) gil * MT * C + (size_t) first * C,
                                     (int) C, keep, cs_);
                     if (g_batch_gdn_groups && one_row) {
                         gg.state[gg.n] = state;
@@ -4403,32 +4424,33 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                         ++gg.n;
                         continue;
                     }
-                    gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, (int) C,
-                                        gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
-                                        beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
+                    gdn_step_norm_multi(state, h_L_ + (size_t) gil * MT * C + (size_t) first * C, (int) C,
+                                        gate_L_ + (size_t) gil * MT * HV + (size_t) first * HV,
+                                        beta_L_ + (size_t) gil * MT * HV + (size_t) first * HV,
                                         z_ + (size_t) first * ZV, (const float*) wnm->data, EPS,
                                         y_dummy_ + (size_t) first * ZV, (int) g.ssm_k_heads,
                                         (int) HV, t - first, keep, cs_,
                                         t - first > 1 ? t - first : 0);   // a 1-row group keeps the 0.1.39 kernel
                 }
                 if (gg.n > 0)
-                    gdn_step_norm_groups(gg, h_L_ + (size_t) gdn_index * MT * C, (int) C,
-                                         gate_L_ + (size_t) gdn_index * MT * HV, beta_L_ + (size_t) gdn_index * MT * HV,
+                    gdn_step_norm_groups(gg, h_L_ + (size_t) gil * MT * C, (int) C,
+                                         gate_L_ + (size_t) gil * MT * HV, beta_L_ + (size_t) gil * MT * HV,
                                          z_, (const float*) wnm->data, EPS, y_dummy_, (int) g.ssm_k_heads, (int) HV, true,
                                          cs_);
                 ++gdn_index;
             } else {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                 if (!wikn) { ok = false; break; }
+                const int64_t qil = qsa_index - qsa_off_;
                 for (int t = 0; t < S;) {
                     const int first = t;
                     while (t < S && rows[t] == rows[first]) ++t;
                     const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qsa_index];
-                    copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS,
+                    copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qil) * TS,
                                      TS, cs_);
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     for (int u = first; u < t; ++u)
-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qil * MT + u) * ID,
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
                                                   0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
@@ -4472,7 +4494,7 @@ bool Verifier::init_deferred_commit(int rows, std::string& err) {
     const ModelGeometry& g = *g_;
     const uint64_t R = (uint64_t) rows, C = (uint64_t) g.ssm_conv_channels, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t ID = (uint64_t) g.idx_key_dim;
-    const uint64_t nG = (uint64_t) std::max<int64_t>(g.n_gdn_layers(), 1), nQ = (uint64_t) std::max<int64_t>(g.n_qsa_layers(), 1);
+    const uint64_t nG = (uint64_t) std::max<int64_t>(gdn_cnt_, 1), nQ = (uint64_t) std::max<int64_t>(qsa_cnt_, 1);
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t CB = 2 + (uint64_t) max_t_, nS = (uint64_t) slots_.size();
     const uint64_t floats[6] = {nG * R * C, nG * R * C, nG * R * HV, nG * R * HV, nQ * R * ID, R * HS};
@@ -4509,7 +4531,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
-    const int64_t R = dc_rows_, CB = 2 + MT, nQ = g.n_qsa_layers();
+    const int64_t R = dc_rows_, CB = 2 + MT, nQ = qsa_cnt_;
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
@@ -4545,13 +4567,15 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
         };
         for (int64_t l = lb_; l < le_; ++l) {
             if (!is_qsa_layer(g, l)) {
-                copy(dc_qkv_ + (size_t) (gdn_index * R + hbase) * C, qkv_L_ + (size_t) gdn_index * MT * C, S * C);
-                copy(dc_h_ + (size_t) (gdn_index * R + hbase) * C, h_L_ + (size_t) gdn_index * MT * C, S * C);
-                copy(dc_gate_ + (size_t) (gdn_index * R + hbase) * HV, gate_L_ + (size_t) gdn_index * MT * HV, S * HV);
-                copy(dc_beta_ + (size_t) (gdn_index * R + hbase) * HV, beta_L_ + (size_t) gdn_index * MT * HV, S * HV);
+                const int64_t gil = gdn_index - gdn_off_;
+                copy(dc_qkv_ + (size_t) (gil * R + hbase) * C, qkv_L_ + (size_t) gil * MT * C, S * C);
+                copy(dc_h_ + (size_t) (gil * R + hbase) * C, h_L_ + (size_t) gil * MT * C, S * C);
+                copy(dc_gate_ + (size_t) (gil * R + hbase) * HV, gate_L_ + (size_t) gil * MT * HV, S * HV);
+                copy(dc_beta_ + (size_t) (gil * R + hbase) * HV, beta_L_ + (size_t) gil * MT * HV, S * HV);
                 ++gdn_index;
             } else {
-                copy(dc_idx_ + (size_t) (qsa_index * R + hbase) * ID, idx_raw_L_ + (size_t) qsa_index * MT * ID, S * ID);
+                const int64_t qil = qsa_index - qsa_off_;
+                copy(dc_idx_ + (size_t) (qil * R + hbase) * ID, idx_raw_L_ + (size_t) qil * MT * ID, S * ID);
                 ++qsa_index;
             }
         }
@@ -4579,6 +4603,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                 if (!is_qsa_layer(g, l)) {
                     const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                     if (!wnm) { ok = false; break; }
+                    const int64_t gil = gdn_index - gdn_off_;
                     for (int t = 0; t < S;) {
                         const int first = t;
                         while (t < S && rows[t] == rows[first]) ++t;
@@ -4586,7 +4611,7 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                         const int32_t* keep = commitd_ + (size_t) rows[first] * CB;
                         float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
                         float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                        const int64_t row = gdn_index * R + hbase + first;
+                        const int64_t row = gil * R + hbase + first;
                         gdn_conv_commit(conv, dc_qkv_ + (size_t) row * C, (int) C, keep, cs_);
                         // z only feeds the norm's output, which the commit discards (y_dummy_): the window scratch will do
                         gdn_step_norm_multi(state, dc_h_ + (size_t) row * C, (int) C, dc_gate_ + (size_t) row * HV,
@@ -4599,14 +4624,15 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
                 } else {
                     const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wikn) { ok = false; break; }
+                    const int64_t qil = qsa_index - qsa_off_;
                     for (int t = 0; t < S;) {
                         const int first = t;
                         while (t < S && rows[t] == rows[first]) ++t;
                         const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qsa_index];
-                        copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS, TS, cs_);
+                        copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qil) * TS, TS, cs_);
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         for (int u = first; u < t; ++u)
-                            native_qsa_indexer_append(dc_idx_ + (size_t) (qsa_index * R + hbase + u) * ID,
+                            native_qsa_indexer_append(dc_idx_ + (size_t) (qil * R + hbase + u) * ID,
                                                       commitd_ + (size_t) rows[first] * CB + 2 + (u - first), 0,
                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                       rope_scaling(), cs_);

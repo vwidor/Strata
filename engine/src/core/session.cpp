@@ -48,7 +48,8 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi,
+                       bool share_rope, bool slim_scratch, bool shared_kv) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
@@ -57,20 +58,24 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     const int64_t q_n = std::max<int64_t>(q_hi - q_lo, g.n_qsa_layers() > 0 ? 1 : 0);
     const int64_t gdn_n = std::max<int64_t>((layer_hi - layer_lo) - std::max<int64_t>(q_hi - q_lo, 0), 0);
     uint64_t n = 0;
-    n += gdn_buffers_bytes(g);
+    if (!slim_scratch) n += gdn_buffers_bytes(g);
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
-    n += qsa_buffers_bytes(g, max_cells);
-    n += moe_buffers_bytes(g, k);
-    n += block_buffers_bytes(g);
+        n += qsa_state_bytes(g, max_cells, !share_rope, 0, shared_kv) +
+             (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false, 0, shared_kv);
+    if (!slim_scratch) {
+        n += qsa_buffers_bytes(g, max_cells);
+        n += moe_buffers_bytes(g, k);
+        n += block_buffers_bytes(g);
+    }
     n += ple_hist_bytes();                       // the PLE's NG_HIST normalized history rows
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo, int64_t layer_hi) {
+                      int64_t layer_lo, int64_t layer_hi, const QsaState* share_rope, bool slim_scratch,
+                      SharedKvPool* shared_kv) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;
@@ -91,8 +96,16 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.qsa_alloc = std::max<int64_t>(q_n_range, g.n_qsa_layers() > 0 ? 1 : 0);
     s.gdn_ord0 = layer_lo - layer_lo / I;
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
+    s.shared_kv = shared_kv;
+    s.shared_alloc_chunks = 0;
+    if (shared_kv != nullptr) {
+        const int64_t chunk_cells = kSharedKvChunkPages * strata::kernels::qsa_real_shapes().page_size;
+        s.shared_chunks.assign((size_t) ((max_cells + chunk_cells - 1) / chunk_cells), -1);
+    } else {
+        s.shared_chunks.clear();
+    }
 
-    gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
+    if (!slim_scratch) gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
     s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
 
     // the QSA states are separate allocations carved from one arena, because `QsaState` is a struct of
@@ -100,24 +113,30 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
+    const bool skv = shared_kv != nullptr;
+    const uint64_t first = qsa_state_bytes(g, max_cells, share_rope == nullptr, 0, skv);
+    const uint64_t rest = qsa_state_bytes(g, max_cells, false, 0, skv);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
-    s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
+    if (!slim_scratch) s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
-    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+        const QsaState* rope_src = j == 0 ? share_rope : &s.qsa_states[s.qsa_ord0];
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j], rope_src, 0, shared_kv, j,
+                           skv ? &s.shared_chunks : nullptr) == 0)
             return 0;
-    qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
-
-    s.moe_arena = take(moe_buffers_bytes(g, k));
-    moe_buffers_init(g, k, s.moe_arena, s.moe);
-    s.block_arena = take(block_buffers_bytes(g));
-    block_buffers_init(g, s.block_arena, s.block);
+    }
+    if (!slim_scratch) {
+        qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
+        s.moe_arena = take(moe_buffers_bytes(g, k));
+        moe_buffers_init(g, k, s.moe_arena, s.moe);
+        s.block_arena = take(block_buffers_bytes(g));
+        block_buffers_init(g, s.block_arena, s.block);
+    }
     // THE PLE HISTORY: NG_HIST rows of hc_dim floats, row-fastest.  Sequence state, carved here and zeroed by
     // `session_zero`; it survives every token, which is the whole point of a conv history.
     s.ple_hist = (float*) take(ple_hist_bytes());
@@ -125,11 +144,79 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     return used;
 }
 
+bool session_shared_kv_ensure(SessionState& s, const ModelGeometry& g, int64_t need_cells, std::string& err) {
+    (void) g;
+    if (s.shared_kv == nullptr || need_cells <= 0) return true;
+    if (need_cells > s.max_cells) need_cells = s.max_cells;
+    const int64_t page_size = strata::kernels::qsa_real_shapes().page_size;
+    const int64_t chunk_cells = kSharedKvChunkPages * page_size;
+    const int64_t need_chunks = std::min<int64_t>((need_cells + chunk_cells - 1) / chunk_cells, (int64_t) s.shared_chunks.size());
+    if (need_chunks <= s.shared_alloc_chunks) return true;
+    const int64_t delta = need_chunks - s.shared_alloc_chunks;
+    if (shared_kv_pool_free_chunks(s.shared_kv) < delta) {
+        err = "shared KV pool exhausted";
+        return false;
+    }
+    int prev = 0;
+    (void) cudaGetDevice(&prev);
+    const int dev = shared_kv_pool_device(s.shared_kv);
+    if (dev != prev) (void) cudaSetDevice(dev);
+    int32_t tab[kSharedKvChunkPages];
+    for (int64_t c = s.shared_alloc_chunks; c < need_chunks; ++c) {
+        int32_t phys = -1;
+        if (!shared_kv_pool_alloc_chunk(s.shared_kv, phys)) {
+            if (dev != prev) (void) cudaSetDevice(prev);
+            err = "shared KV pool alloc failed";
+            return false;
+        }
+        s.shared_chunks[(size_t) c] = phys;
+        const int64_t p0 = c * kSharedKvChunkPages;
+        for (int64_t i = 0; i < kSharedKvChunkPages; ++i) tab[i] = (int32_t) (phys * kSharedKvChunkPages + i);
+        for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+            const QsaState& st = s.qsa_states[s.qsa_ord0 + j];
+            const int64_t cnt = std::min<int64_t>(kSharedKvChunkPages, st.n_pages - p0);
+            if (cnt > 0 && cudaMemcpy(st.page_table + p0, tab, (size_t) cnt * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                if (dev != prev) (void) cudaSetDevice(prev);
+                err = "shared KV page_table update failed";
+                return false;
+            }
+        }
+    }
+    if (dev != prev) (void) cudaSetDevice(prev);
+    s.shared_alloc_chunks = need_chunks;
+    return true;
+}
+
+void session_shared_kv_release(SessionState& s) {
+    if (s.shared_kv == nullptr || s.shared_alloc_chunks <= 0) return;
+    for (int64_t c = s.shared_alloc_chunks - 1; c >= 0; --c) {
+        if (s.shared_chunks[(size_t) c] >= 0) {
+            shared_kv_pool_free_chunk(s.shared_kv, s.shared_chunks[(size_t) c]);
+            s.shared_chunks[(size_t) c] = -1;
+        }
+    }
+    s.shared_alloc_chunks = 0;
+}
+
+void session_shared_kv_trim(SessionState& s, int64_t keep_cells) {
+    if (s.shared_kv == nullptr || s.shared_alloc_chunks <= 0) return;
+    const int64_t chunk_cells = kSharedKvChunkPages * strata::kernels::qsa_real_shapes().page_size;
+    const int64_t keep_chunks = keep_cells <= 0 ? 0 : (keep_cells + chunk_cells - 1) / chunk_cells;
+    if (keep_chunks >= s.shared_alloc_chunks) return;
+    for (int64_t c = s.shared_alloc_chunks - 1; c >= keep_chunks; --c) {
+        if (s.shared_chunks[(size_t) c] >= 0) {
+            shared_kv_pool_free_chunk(s.shared_kv, s.shared_chunks[(size_t) c]);
+            s.shared_chunks[(size_t) c] = -1;
+        }
+    }
+    s.shared_alloc_chunks = keep_chunks;
+}
+
 void session_release(SessionState& s) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
-        if (s.qsa_states[j].owns_rope) {
-            strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
-            s.qsa_states[j].owns_rope = false;
+        if (s.qsa_states[s.qsa_ord0 + j].owns_rope) {
+            strata::kernels::rope_table_release(s.qsa_states[s.qsa_ord0 + j].cos_tab);
+            s.qsa_states[s.qsa_ord0 + j].owns_rope = false;
         }
 }
 
@@ -154,15 +241,19 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     cudaStream_t cs = (cudaStream_t) stream;
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.
-    if (R_init != nullptr) {
-        for (int64_t c = 0; c < g.hc; ++c)
-            cudaMemcpyAsync(s.block.R + (size_t) c * g.n_embd, R_init, (size_t) g.n_embd * 4,
-                            cudaMemcpyDeviceToDevice, cs);
-    } else {
-        cudaMemsetAsync(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
+    if (s.block.R != nullptr) {
+        if (R_init != nullptr) {
+            for (int64_t c = 0; c < g.hc; ++c)
+                cudaMemcpyAsync(s.block.R + (size_t) c * g.n_embd, R_init, (size_t) g.n_embd * 4,
+                                cudaMemcpyDeviceToDevice, cs);
+        } else {
+            cudaMemsetAsync(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
+        }
     }
     // every owned GDN layer's recurrence and conv history
     cudaMemsetAsync(s.gdn_state, 0, (size_t) s.gdn_alloc * gdn_state_floats(g) * 4, cs);
+    // release any shared KV chunks before resetting QSA states
+    session_shared_kv_release(s);
     // and every owned QSA layer's cache and indexer
     for (int64_t j = 0; j < s.qsa_alloc; ++j) qsa_state_zero(s.qsa_states[s.qsa_ord0 + j], g, stream);
     // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would

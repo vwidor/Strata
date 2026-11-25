@@ -59,6 +59,9 @@ struct SessionState {
     int64_t qsa_alloc = 0;                ///< allocated QSA states (>= 1 whenever the model has any)
     int64_t gdn_ord0 = 0;                 ///< global GDN ordinal of `gdn_state` row 0
     int64_t gdn_alloc = 0;                ///< allocated GDN rows
+    SharedKvPool* shared_kv = nullptr;    ///< non-owning stage shared KV pool (STRATA_SHARED_KV_CELLS)
+    std::vector<int32_t> shared_chunks;   ///< logical chunk -> physical chunk (-1 unallocated)
+    int64_t shared_alloc_chunks = 0;      ///< contiguous allocated prefix [0, shared_alloc_chunks)
     int qsa_primary() const { return (int) qsa_ord0; }
     /// The doorbell the host loop polls.  Null until a caller provides one - the engine runs without it, and
     /// neither `session_token` nor `session_replay` looks at it.
@@ -96,10 +99,18 @@ struct SessionState {
 /// the default full range is byte-identical to the old whole-model carve.  Pure arithmetic - safe to call for
 /// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
-                       int64_t layer_hi = -1);
+                       int64_t layer_hi = -1, bool share_rope = false, bool slim_scratch = false,
+                       bool shared_kv = false);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1, const QsaState* share_rope = nullptr,
+                      bool slim_scratch = false, SharedKvPool* shared_kv = nullptr);
+/// Ensure `s` has physical chunks mapped in its SharedKvPool for at least `need_cells` cells (0-ns fast path if covered).
+bool session_shared_kv_ensure(SessionState& s, const ModelGeometry& g, int64_t need_cells, std::string& err);
+/// Release all physical chunks held by `s` back to its SharedKvPool.
+void session_shared_kv_release(SessionState& s);
+/// Trim physical chunks past `keep_cells` back to `s`'s SharedKvPool.
+void session_shared_kv_trim(SessionState& s, int64_t keep_cells);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);

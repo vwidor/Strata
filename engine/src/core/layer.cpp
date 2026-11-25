@@ -785,11 +785,138 @@ int64_t qsa_kv_resident_min() {
 }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+struct SharedKvPool {
+    struct LayerPtrs {
+        uint16_t* k_pool = nullptr;
+        uint16_t* v_pool = nullptr;
+        int8_t* k_q = nullptr;
+        int8_t* v_q = nullptr;
+        uint16_t* k_scale = nullptr;
+        uint16_t* v_scale = nullptr;
+        uint8_t* k_q4 = nullptr;
+        uint8_t* v_q4 = nullptr;
+    };
+    int device = 0;
+    int64_t qsa_alloc = 0;
+    int64_t chunk_pages = kSharedKvChunkPages;
+    int64_t total_chunks = 0;
+    int64_t total_pages = 0;
+    uint64_t total_bytes = 0;
+    void* arena = nullptr;
+    std::vector<LayerPtrs> layers;
+    std::vector<int32_t> free_chunks;
+};
+
+static int64_t shared_qsa_count(const ModelGeometry& g, int64_t layer_lo, int64_t layer_hi) {
+    if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
+    if (layer_lo < 0) layer_lo = 0;
+    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
+    const int64_t q_n = layer_hi / I - layer_lo / I;
+    return std::max<int64_t>(q_n, g.n_qsa_layers() > 0 ? 1 : 0);
+}
+
+uint64_t shared_kv_pool_bytes(const ModelGeometry& g, int64_t total_cells, int64_t layer_lo, int64_t layer_hi) {
+    if (total_cells <= 0 || g.n_qsa_layers() <= 0) return 0;
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t chunk_cells = kSharedKvChunkPages * s.page_size;
+    const int64_t chunks = (total_cells + chunk_cells - 1) / chunk_cells;
+    const int64_t pages = chunks * kSharedKvChunkPages;
+    const uint64_t per_layer = align_up16(kv_pool_bytes(s, pages, g_kv_hybrid, g_kv_int8 || g_kv_hybrid) + 4 * 16) + 256;
+    return (uint64_t) shared_qsa_count(g, layer_lo, layer_hi) * per_layer;
+}
+
+SharedKvPool* shared_kv_pool_create(const ModelGeometry& g, int64_t total_cells, int64_t layer_lo, int64_t layer_hi,
+                                    int device, std::string& err) {
+    if (total_cells <= 0 || g.n_qsa_layers() <= 0) { err = "shared KV pool: invalid cell count"; return nullptr; }
+    const QsaShapes s = qsa_shapes(g);
+    const int64_t chunk_cells = kSharedKvChunkPages * s.page_size;
+    const int64_t chunks = (total_cells + chunk_cells - 1) / chunk_cells;
+    const int64_t pages = chunks * kSharedKvChunkPages;
+    const int64_t q_alloc = shared_qsa_count(g, layer_lo, layer_hi);
+    const uint64_t bytes = shared_kv_pool_bytes(g, total_cells, layer_lo, layer_hi);
+    int prev = 0;
+    (void) cudaGetDevice(&prev);
+    if (device >= 0 && device != prev) (void) cudaSetDevice(device);
+    void* arena = nullptr;
+    const cudaError_t ce = cudaMalloc(&arena, bytes);
+    if (ce != cudaSuccess) {
+        if (device >= 0 && device != prev) (void) cudaSetDevice(prev);
+        err = "shared KV pool (" + std::to_string(bytes >> 20) + " MiB) allocation failed: " + cudaGetErrorString(ce);
+        return nullptr;
+    }
+    cudaMemset(arena, 0, bytes);
+    if (device >= 0 && device != prev) (void) cudaSetDevice(prev);
+    auto* p = new SharedKvPool();
+    p->device = device >= 0 ? device : prev;
+    p->qsa_alloc = q_alloc;
+    p->chunk_pages = kSharedKvChunkPages;
+    p->total_chunks = chunks;
+    p->total_pages = pages;
+    p->total_bytes = bytes;
+    p->arena = arena;
+    p->layers.resize((size_t) q_alloc);
+    const uint64_t rows = (uint64_t) pages * s.n_head_kv * s.page_size;
+    const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    const uint64_t per_layer = align_up16(kv_pool_bytes(s, pages, g_kv_hybrid, g_kv_int8 || g_kv_hybrid) + 4 * 16) + 256;
+    for (int64_t j = 0; j < q_alloc; ++j) {
+        Cursor c{(uint8_t*) arena + (size_t) j * per_layer};
+        auto& lp = p->layers[(size_t) j];
+        if (g_kv_hybrid) {
+            lp.k_q = c.take<int8_t>(rows * s.head_dim);
+            lp.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            lp.v_q4 = c.take<uint8_t>(rows * q4_row);
+        } else if (g_kv_q4) {
+            lp.k_q4 = c.take<uint8_t>(rows * q4_row);
+            lp.v_q4 = c.take<uint8_t>(rows * q4_row);
+        } else if (g_kv_int8) {
+            lp.k_q = c.take<int8_t>(rows * s.head_dim);
+            lp.v_q = c.take<int8_t>(rows * s.head_dim);
+            lp.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            lp.v_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        } else {
+            lp.k_pool = c.take<uint16_t>(rows * s.head_dim);
+            lp.v_pool = c.take<uint16_t>(rows * s.head_dim);
+        }
+    }
+    p->free_chunks.reserve((size_t) chunks);
+    for (int64_t c = chunks - 1; c >= 0; --c) p->free_chunks.push_back((int32_t) c);
+    return p;
+}
+
+void shared_kv_pool_destroy(SharedKvPool* pool) {
+    if (!pool) return;
+    if (pool->arena) {
+        int prev = 0;
+        (void) cudaGetDevice(&prev);
+        if (pool->device >= 0 && pool->device != prev) (void) cudaSetDevice(pool->device);
+        (void) cudaFree(pool->arena);
+        if (pool->device >= 0 && pool->device != prev) (void) cudaSetDevice(prev);
+    }
+    delete pool;
+}
+
+int64_t shared_kv_pool_free_chunks(const SharedKvPool* pool) { return pool ? (int64_t) pool->free_chunks.size() : 0; }
+int64_t shared_kv_pool_total_chunks(const SharedKvPool* pool) { return pool ? pool->total_chunks : 0; }
+int shared_kv_pool_device(const SharedKvPool* pool) { return pool ? pool->device : 0; }
+
+bool shared_kv_pool_alloc_chunk(SharedKvPool* pool, int32_t& phys_out) {
+    if (!pool || pool->free_chunks.empty()) return false;
+    phys_out = pool->free_chunks.back();
+    pool->free_chunks.pop_back();
+    return true;
+}
+
+void shared_kv_pool_free_chunk(SharedKvPool* pool, int32_t phys) {
+    if (!pool || phys < 0 || phys >= pool->total_chunks) return;
+    pool->free_chunks.push_back(phys);
+}
+
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
+                         bool skip_kv_pool) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+    if (!skip_kv_pool && !(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
@@ -805,7 +932,9 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+                        const QsaState* share_rope, int64_t ring_cells,
+                        SharedKvPool* shared_kv, int64_t shared_layer_idx,
+                        const std::vector<int32_t>* shared_chunks) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
@@ -820,12 +949,21 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.kv_q4 = false;
     }
     st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
-    st.kv_mode = p.mode;
-    st.n_slots = p.slots;
+    st.kv_mode = shared_kv ? 0 : p.mode;
+    st.n_slots = shared_kv ? shared_kv->total_pages : p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
-    if (g_kv_elastic && p.mode == 0) {
+    st.kv_shared = shared_kv != nullptr;
+    st.shared_chunks = shared_chunks;
+    st.shared_chunk_pages = shared_kv ? shared_kv->chunk_pages : 0;
+    if (shared_kv != nullptr) {
+        const auto& lp = shared_kv->layers[(size_t) shared_layer_idx];
+        st.k_pool = lp.k_pool; st.v_pool = lp.v_pool;
+        st.k_q = lp.k_q; st.v_q = lp.v_q;
+        st.k_scale = lp.k_scale; st.v_scale = lp.v_scale;
+        st.k_q4 = lp.k_q4; st.v_q4 = lp.v_q4;
+    } else if (g_kv_elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
         const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -965,7 +1103,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     }
     // the page table starts as the IDENTITY, which is the simplest legal mapping and what a caller that does
     // not page at all wants; a streamed state starts with nothing resident, a ring at `block % n_slots`.
-    if (p.mode == 0) {
+    if (shared_kv != nullptr) {
+        cudaMemset(st.page_table, 0xff, (size_t) pages * 4);   // -1: allocated lazily in chunks on demand
+    } else if (p.mode == 0) {
         std::vector<int32_t> tab((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
         cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
@@ -981,24 +1121,26 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
-    // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
-    const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
-    const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
-    if (st.kv_hybrid) {
-        cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
-        cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
-    } else if (st.kv_q4) {
-        cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
-        cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
-    } else if (st.kv_int8) {
-        cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
-        cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
-        cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
-    } else {
-        cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
-        cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);
+    if (!st.kv_shared) {
+        // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
+        const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+        const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
+        if (st.kv_hybrid) {
+            cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
+            cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+            cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+        } else if (st.kv_q4) {
+            cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+            cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+        } else if (st.kv_int8) {
+            cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
+            cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
+            cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+            cudaMemsetAsync(st.v_scale, 0, rows * (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, cs);
+        } else {
+            cudaMemsetAsync(st.k_pool, 0, rows * s.head_dim * 2, cs);
+            cudaMemsetAsync(st.v_pool, 0, rows * s.head_dim * 2, cs);
+        }
     }
     // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
     // conversation): no reader names a cell before this sequence has written it, and a block copied in whole

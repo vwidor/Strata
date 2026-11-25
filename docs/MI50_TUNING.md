@@ -126,7 +126,7 @@ Note: if using a custom `model_name` not matched by `drafting.py:supported_model
   "backend": "hip",
   "gpu": [0, 1],
   "gpu_order": "as_given",
-  "layer_split": "26",
+  "layer_split": "28",
   "parallel": 4,
   "drafting": "dflash2",
   "mtp": false,
@@ -179,7 +179,11 @@ Note: if using a custom `model_name` not matched by `drafting.py:supported_model
     "STRATA_PCIE_NEVER": "1",
     "STRATA_CPU_IQ_ALL_EXACT1": "1",
     "STRATA_SPLIT_OWN_BUFFERS": "0",
-    "STRATA_PF_W16_CACHE_MIB": "0"
+    "STRATA_PF_W16_CACHE_MIB": "0",
+    "STRATA_DF2_HEAD": "indexed",
+    "STRATA_TRIM_VERIFY_SCRATCH": "1",
+    "STRATA_LEAN_SLOTS": "1",
+    "STRATA_SHARED_KV_CELLS": "131072"
   },
   "args": [
     "--pack", "/path/to/pack-iq3s",
@@ -358,6 +362,28 @@ Opt-in `gfx906` wave64 rewrites of the four hot decode kernel families (`~86%` o
 | **Solo Code** | `58.5` / `69.8 tok/s` *(96.1% hit)* | **`63.1` / `73.2 tok/s`** *(97.2% hit)* | **`+7.9%`** e2e / **`+4.9%`** pure *(cold warmup `+10.1%`)* |
 | **3× Batch Prose** *(total)* | `63.0` / `71.3 tok/s` *(99.5–100% hit)* | **`72.2` / `81.4 tok/s`** *(100.0% hit)* | **`+14.6%`** e2e / **`+14.2%`** pure |
 | **4× Batch Code** *(total / engine rows/s)* | `83.3` / `101.1` / `88.9 rows/s` *(92.7–97.3% hit)* | **`92.4` / `111.1` / `97.6 rows/s`** *(93.6–98.2% hit)* | **`+10.9%`** e2e / **`+9.9%`** pure / **`+9.8%`** rows/s |
+
+### 9.10 Phase 2: Lossless VRAM Reclamation & Multi-GPU DFlash2 Tap Restore (measured, 2026-11-25)
+Four opt-in lossless VRAM optimizations free `~2.5 GiB` on GPU 0 and `~2.1 GiB` on GPU 1 without reducing context length, batch concurrency, or `--vram-reserve-later-mib 12000`, enabling `layer_split` to move from `26 → 28` (`100%` zero-doorbell GPU 0 on layers `0–27`, `75.4%` GPU 1 residency on layers `28–47`, `90%` total model residency) while keeping `1,560 MiB` free on GPU 0 (elastic vision) and `12,276 MiB` free on GPU 1.
+
+| Opt-in Switch / Fix | Mechanism | Verified VRAM Freed | Parity / Verification |
+|---|---|---|---|
+| `STRATA_SHARED_KV_CELLS=131072` | Per-stage chunk-paged `SharedKvPool` (256 pages = 1,024 cells/chunk) shared across solo + `--batch 4` slots via existing `page_table` indirection (zero kernel/graph changes); auto-reclaims idle cached slots and supports non-contiguous save/copy/restore (`conversation_snapshot.cpp`) | **`-2.31 GiB`** GPU 0, **`-1.68 GiB`** GPU 1 (`4` batch slots: `0.73→0.15 GiB` GPU 0, `0.53→0.11 GiB` GPU 1) | Non-contiguous `[0, 2, 4]` chunk save/copy/restore/verify exact hash match (`0` leaks); live `>6K`-token park (`115 ms`) and restore (`30.7 ms`) |
+| `STRATA_LEAN_SLOTS=1` | Batch slot sessions share the main session's RoPE tables and omit unused single-token `block` / `gdn` / `moe` scratch | Included in `0.15 / 0.11 GiB` slot footprint (`~150 MiB/GPU`) | Default unchanged when unset |
+| `STRATA_TRIM_VERIFY_SCRATCH=1` | Sizes verifier layer scratch (`qkv_L_`, `h_L_`, `dc_arena_`, snapshots) to stage-local layers only; omits `staging_` when `no_pcie`, `head_logits_` on non-final stages, `xil_` on HIP, and `hit_xq_`/`hit_xs_` on native layout | **`~140 MiB/GPU`** (verifier buffers `86.4 → 28.7 MiB` GPU 0, `32.5 MiB` GPU 1) | `layer_split=28` solo + `batch 4` verified |
+| `STRATA_DF2_HEAD=indexed` | `native_mmvq_indexed` (`gfx906` wave64, `Q6_K`/`Q5_K`/`Q4_K`/`Q8_0`) indexes the 106,299 draft-vocab rows directly in the target head instead of duplicating them | **`-213 MiB`** GPU 1 (`625 → 412 MiB` drafter VRAM; `0.0 MiB` draft head) | **Bitwise exact** (`0` diffs vs gathered `native_mmvq` across `Q6_K/Q5_K/Q4_K/Q8_0` × `T=1,3,7`; `+22–197 µs`) |
+| **Multi-GPU DFlash2 prompt taps + slot stash** *(always on)* | Fixed non-final prefill stage `continue;` skipping `on_taps(...)` (`prefill.cpp`); added non-P2P cross-GPU host bounce in `Df2PromptLand` (`generate.cpp`) to avoid ROCm 5.7 `hipMemcpy2DAsync` segfaults; stashed batch slot tap logs on park/evict/handoff (`dflash2.cpp`) | `0` VRAM | `dflash2_ring_test` pass; live `6,244`-token park/restore rebuilt **`2,022 / 2,022` rows (`0` missing, `0` cold starts) in `50.9 ms`** (was `46 / 2,022`), raising restored pure decode from `~43 → 64.2 tok/s` (`74.1%` draft acceptance) and cold 9.6K-prompt decode to `57.5 tok/s` (`73.0%` acceptance) |
+
+**Live End-to-End Dual-MI50 Progression (`--vram-reserve-later-mib 12000`, `180 W`, warm cache, `256` tokens, `temp=0.0`, thinking off):**
+
+| Workload | Phase 0 (`5f43512`, `split=26`, 81% res) | Phase 1 (`10c8655`, `split=26`, 81% res) | **Phase 2 (`split=28`, 90% res)** | Phase 1 → 2 | **Cumulative vs Phase 0** |
+|---|---:|---:|---:|---:|---:|
+| **Solo Prose** *(e2e / pure)* | `43.3` / `47.5 tok/s` | `49.7` / `54.3 tok/s` | **`52.3` / `57.1 tok/s`** | **`+5.2%`** / **`+5.2%`** | **`+20.8%`** / **`+20.2%`** |
+| **Solo Code** *(e2e / pure)* | `58.5` / `69.8 tok/s` | `63.1` / `73.2 tok/s` | **`65.3` / `77.8 tok/s`** | **`+3.5%`** / **`+6.3%`** | **`+11.6%`** / **`+11.5%`** |
+| **3× Batch Prose** *(total e2e)* | `63.0 tok/s` | `72.2 tok/s` | **`78.4 tok/s`** | **`+8.6%`** | **`+24.4%`** |
+| **4× Batch Code** *(total e2e / engine rows/s)* | `83.3` / `88.9 rows/s` | `92.4` / `97.6 rows/s` | **`106.3` / `112.8 rows/s`** | **`+15.0%`** / **`+15.6%`** | **`+27.6%`** / **`+26.9%`** |
+| **Resident Experts** *(total / GPU 1)* | `19,903 (81.0%)` / `58.5%` | `19,903 (81.0%)` / `58.5%` | **`22,054 (90.0%)` / `75.4%`** | **`+2,151`** experts | **`+16.9 pp`** GPU 1 |
+| **Warm Decode Hit Rate** | `95.8–97.6%` | `96.0–99.5%` | **`99.0–99.6%`** | — | — |
 
 ## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
 The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.

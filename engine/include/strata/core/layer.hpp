@@ -47,6 +47,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -239,6 +240,10 @@ struct QsaState {
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
+    /// Shared chunk-paged KV pool (STRATA_SHARED_KV_CELLS): pools point into a stage-shared VRAM pool indexed via page_table.
+    bool kv_shared = false;
+    const std::vector<int32_t>* shared_chunks = nullptr;   ///< logical chunk -> physical chunk (-1 unallocated), owned by SessionState
+    int64_t shared_chunk_pages = 0;                        ///< pages per chunk (kSharedKvChunkPages)
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
@@ -273,10 +278,24 @@ struct QsaState {
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
 };
 
+struct SharedKvPool;
+constexpr int64_t kSharedKvChunkPages = 256;   ///< 256 pages * 4 cells = 1024 cells per chunk
+
+SharedKvPool* shared_kv_pool_create(const ModelGeometry& g, int64_t total_cells, int64_t layer_lo, int64_t layer_hi,
+                                    int device, std::string& err);
+void shared_kv_pool_destroy(SharedKvPool* pool);
+uint64_t shared_kv_pool_bytes(const ModelGeometry& g, int64_t total_cells, int64_t layer_lo, int64_t layer_hi);
+int64_t shared_kv_pool_free_chunks(const SharedKvPool* pool);
+int64_t shared_kv_pool_total_chunks(const SharedKvPool* pool);
+bool shared_kv_pool_alloc_chunk(SharedKvPool* pool, int32_t& phys_out);
+void shared_kv_pool_free_chunk(SharedKvPool* pool, int32_t phys);
+int shared_kv_pool_device(const SharedKvPool* pool);
+
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
+                         bool skip_kv_pool = false);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -324,7 +343,9 @@ inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0,
+                        SharedKvPool* shared_kv = nullptr, int64_t shared_layer_idx = 0,
+                        const std::vector<int32_t>* shared_chunks = nullptr);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

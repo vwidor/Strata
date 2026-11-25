@@ -2661,10 +2661,11 @@ template<> struct WaveOpt<SmallTraits<Q40Block, 4>> {
 // kernel, pre-converts half2 ds -> float d8 for d8-only formats) and processes one row's decoded W at a time (outer i,
 // inner j) with sched_barrier so tmp[NCOLS][R] stays 100% in VGPRs (0B spill) and peak VGPRs stay low.
 // USE_LDS=false reads x directly through L1/L2 with zero barriers and shares each token's decoded X across R rows.
-template<typename F, int NCOLS, int R, bool USE_LDS>
+template<typename F, int NCOLS, int R, bool USE_LDS, bool INDEXED = false>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_tiled_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                                              float* __restrict__ y, int n_in, int n_out) {
+                                              float* __restrict__ y, int n_in, int n_out,
+                                              const int32_t* __restrict__ row_idx = nullptr) {
     using WO = WaveOpt<F>;
     constexpr int BPIW = 64 / F::T;
     constexpr bool PRE_F32 = USE_LDS && WO::kD8Only;
@@ -2696,7 +2697,8 @@ __global__ void native_mmvq_wave_tiled_kernel(const typename F::Block* __restric
         for (int kbx = sub_blk; kbx < blocks_per_row; kbx += BPIW) {
             const int kby = kbx * F::KBY;
             if constexpr (R == 1) {
-                const typename WO::W wv = WO::wload(w + std::size_t(row0) * blocks_per_row + kbx, kqs);
+                const int wrow = INDEXED ? row_idx[row0] : row0;
+                const typename WO::W wv = WO::wload(w + std::size_t(wrow) * blocks_per_row + kbx, kqs);
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j) {
                     tmp[j][0] += WO::dot(wv, WO::template xload<PRE_F32>(sx + j * x_stride + kby, kqs));
@@ -2707,7 +2709,8 @@ __global__ void native_mmvq_wave_tiled_kernel(const typename F::Block* __restric
 #pragma unroll
                 for (int i = 0; i < R; ++i) {
                     if (row0 + i < n_out) {
-                        const typename WO::W wv = WO::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                        const int wrow = INDEXED ? row_idx[row0 + i] : (row0 + i);
+                        const typename WO::W wv = WO::wload(w + std::size_t(wrow) * blocks_per_row + kbx, kqs);
 #pragma unroll
                         for (int j = 0; j < NCOLS; ++j) {
                             tmp[j][i] += WO::dot(wv, WO::template xload<PRE_F32>(sx + j * x_stride + kby, kqs));
@@ -2723,7 +2726,8 @@ __global__ void native_mmvq_wave_tiled_kernel(const typename F::Block* __restric
         for (int kbx = sub_blk; kbx < blocks_per_row; kbx += BPIW) {
             const int kby = kbx * F::KBY;
             if constexpr (R == 1) {
-                const typename WO::W wv = WO::wload(w + std::size_t(row0) * blocks_per_row + kbx, kqs);
+                const int wrow = INDEXED ? row_idx[row0] : row0;
+                const typename WO::W wv = WO::wload(w + std::size_t(wrow) * blocks_per_row + kbx, kqs);
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j) {
                     tmp[j][0] += WO::dot(wv, WO::template xload<false>(x + std::size_t(j) * x_stride + kby, kqs));
@@ -2733,7 +2737,10 @@ __global__ void native_mmvq_wave_tiled_kernel(const typename F::Block* __restric
                 typename WO::W wv[R];
 #pragma unroll
                 for (int i = 0; i < R; ++i) {
-                    if (row0 + i < n_out) wv[i] = WO::wload(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                    if (row0 + i < n_out) {
+                        const int wrow = INDEXED ? row_idx[row0 + i] : (row0 + i);
+                        wv[i] = WO::wload(w + std::size_t(wrow) * blocks_per_row + kbx, kqs);
+                    }
                 }
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j) {
@@ -2759,10 +2766,11 @@ __global__ void native_mmvq_wave_tiled_kernel(const typename F::Block* __restric
         }
 }
 
-template<typename F, int NCOLS, int R>
+template<typename F, int NCOLS, int R, bool INDEXED = false>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out) {
+                                        float* __restrict__ y, int n_in, int n_out,
+                                        const int32_t* __restrict__ row_idx = nullptr) {
     constexpr int BPIW = 64 / F::T;
     static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
     const int lane = int(threadIdx.x) & 63;
@@ -2777,7 +2785,8 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
 #pragma unroll
         for (int i = 0; i < R; ++i) {
             if (row0 + i < n_out) {
-                const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                const int wrow = INDEXED ? row_idx[row0 + i] : (row0 + i);
+                const typename F::W wv = F::load(w + std::size_t(wrow) * blocks_per_row + kbx, kqs);
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
             }
@@ -2926,6 +2935,40 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
 #endif
 #endif
         default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= MAX_NCOLS");
+    }
+}
+template<typename F, int NCOLS>
+void wave_launch_indexed_n(const void* weights, const int32_t* row_idx, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    if constexpr (WaveOpt<F>::ok) {
+        if (wave_opt_mode() > 0) {
+            const std::size_t xbytes = std::size_t(NCOLS) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
+            const unsigned nb = unsigned((std::size_t(n_out) + 3u) / 4u);
+            if (NCOLS <= 3 && xbytes <= 10240u) {
+                native_mmvq_wave_tiled_kernel<F, NCOLS, 1, true, true><<<nb, 256, xbytes, s>>>(w, x, y, n_in, n_out, row_idx);
+            } else {
+                native_mmvq_wave_tiled_kernel<F, NCOLS, 1, false, true><<<nb, 256, 0, s>>>(w, x, y, n_in, n_out, row_idx);
+            }
+            return;
+        }
+    }
+    const unsigned blocks = unsigned((std::size_t(n_out) + 3u) / 4u);
+    native_mmvq_wave_kernel<F, NCOLS, 1, true><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out, row_idx);
+}
+template<typename F>
+void wave_launch_indexed(const void* weights, const int32_t* row_idx, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 1: wave_launch_indexed_n<F, 1>(weights, row_idx, x_q8_1, y, n_in, n_out, s); break;
+        case 2: wave_launch_indexed_n<F, 2>(weights, row_idx, x_q8_1, y, n_in, n_out, s); break;
+        case 3: wave_launch_indexed_n<F, 3>(weights, row_idx, x_q8_1, y, n_in, n_out, s); break;
+        case 4: wave_launch_indexed_n<F, 4>(weights, row_idx, x_q8_1, y, n_in, n_out, s); break;
+        case 5: wave_launch_indexed_n<F, 5>(weights, row_idx, x_q8_1, y, n_in, n_out, s); break;
+        case 6: wave_launch_indexed_n<F, 6>(weights, row_idx, x_q8_1, y, n_in, n_out, s); break;
+        case 7: wave_launch_indexed_n<F, 7>(weights, row_idx, x_q8_1, y, n_in, n_out, s); break;
+        case 8: wave_launch_indexed_n<F, 8>(weights, row_idx, x_q8_1, y, n_in, n_out, s); break;
+        default: throw std::invalid_argument("native MMVQ indexed (wave) requires 1 <= ncols <= 8");
     }
 }
 #define STRATA_WAVE_MMVQ(...) \
@@ -4077,6 +4120,60 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
+}
+
+bool native_mmvq_indexed_supported(int ggml_type) noexcept {
+#if defined(STRATA_HIP_GFX906)
+    return ggml_type == 14 || ggml_type == 13 || ggml_type == 12 || ggml_type == 8;
+#else
+    (void) ggml_type;
+    return false;
+#endif
+}
+
+void native_mmvq_indexed(int ggml_type, const void* weights, const int32_t* row_idx, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int ncols, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    if (ncols > 8) {
+        const std::size_t col_blocks = std::size_t(n_in / Q8K);
+        for (int j = 0; j < ncols; j += 8) {
+            const int nj = (ncols - j < 8) ? (ncols - j) : 8;
+            native_mmvq_indexed(ggml_type, weights, row_idx, static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * col_blocks,
+                                y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj, stream);
+        }
+        return;
+    }
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ indexed requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(row_idx);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    switch (ggml_type) {
+    case 8:
+        validate_shape(n_in, ncols, 32);
+        wave_launch_indexed<SmallTraits<Q80Block, 8>>(weights, row_idx, x_q8_1, y, n_in, n_out, ncols, stream);
+        break;
+    case 12:
+        validate_shape(n_in, ncols, 256);
+        wave_launch_indexed<Q4KTraits>(weights, row_idx, x_q8_1, y, n_in, n_out, ncols, stream);
+        break;
+    case 13:
+        validate_shape(n_in, ncols, 256);
+        wave_launch_indexed<Q5KTraits>(weights, row_idx, x_q8_1, y, n_in, n_out, ncols, stream);
+        break;
+    case 14:
+        validate_shape(n_in, ncols, 256);
+        wave_launch_indexed<Q6KTraits>(weights, row_idx, x_q8_1, y, n_in, n_out, ncols, stream);
+        break;
+    default:
+        throw std::invalid_argument("unsupported native MMVQ indexed GGML type");
+    }
+    launch_check();
+#else
+    (void) ggml_type; (void) weights; (void) row_idx; (void) x_q8_1; (void) y; (void) n_in; (void) n_out; (void) ncols; (void) stream;
+    throw std::invalid_argument("native_mmvq_indexed is only enabled on gfx906 HIP builds");
+#endif
 }
 
 #if !defined(__HIPCC__)
