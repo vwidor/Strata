@@ -169,7 +169,13 @@ Note: if using a custom `model_name` not matched by `drafting.py:supported_model
     "STRATA_PIPE_ADAPT_EVERY": "auto",
     "STRATA_CRASH_BT": "1",
     "STRATA_BATCH_DF2": "1",
-    "STRATA_PIPED_MTP": "3"
+    "STRATA_PIPED_MTP": "3",
+    "STRATA_BATCH_DF2_CAP": "1",
+    "STRATA_DF2_Q4_NARROW": "1",
+    "STRATA_PCIE_NEVER": "1",
+    "STRATA_CPU_IQ_ALL_EXACT1": "1",
+    "STRATA_SPLIT_OWN_BUFFERS": "0",
+    "STRATA_PF_W16_CACHE_MIB": "0"
   },
   "args": [
     "--pack", "/path/to/pack-iq3s",
@@ -323,6 +329,12 @@ The round was stopped here to bring production back; `STRATA_PIPE_ADAPT_EVERY=0`
 - Added to `env`: `STRATA_BATCH_DF2_CAP=1`, `STRATA_DF2_Q4_NARROW=1`, `STRATA_PCIE_NEVER=1` (measured together: batch +3% to +6%), `STRATA_CPU_IQ_ALL_EXACT1=1` (batch +4% to +5%), `STRATA_WATCHDOG_S=900` (section 10). The four speed switches were measured one round at a time, not all together.
 - Unchanged: the second model and its 16.5 GB reserve on GPU 1. Dropping the reserve is the largest gain measured (round A, `ded`), but it needs the second model moved or stopped.
 - Checked after the start on the production service: the engine log names `STRATA_BATCH_DF2_CAP` and `STRATA_PCIE_NEVER`; a 12,033-token prompt read at 799 tok/s; 4 code requests at once gave 22.6, 43.9, then 66.3 tok/s in all as the cache warmed; solo code 40, then 56 tok/s.
+
+### 9.8 GPU 1 VRAM Reclamation (measured, 2026-11-25)
+- **Root cause of the `16,500 MiB` reserve:** With free headroom left on GPU 1 for a co-resident model, Strata skipped prompt-buffer borrowing (`CUDA1 keeps its own prompt buffers: 1.82 GiB`) and silently allocated `~2.6 GiB` of FP16 prefill dense-weight cache (`gemm.cu` auto-caches whenever `>3 GiB` is free), dropping GPU 1 free VRAM by **`-2,730 MiB`** on the first prompt.
+- **Fix (config only, zero changes to the co-resident model):** Set `STRATA_SPLIT_OWN_BUFFERS=0`, `STRATA_PF_W16_CACHE_MIB=0`, and lower `--vram-reserve-later-mib` from `16500` to `12000`.
+- **Measured result:** GPU 1 post-prompt VRAM drop fell from **`-2,730 MiB` → `-174 MiB`**. GPU 1 expert cache grew from **`4,396` (39.0%, `8.82 GiB`) → `6,591 / 11,264` (58.5%, `13.21 GiB`, `+2,195` experts)** while leaving **`1,953 MiB` free** alongside the co-resident model (`~9.8–10.1 GiB` VRAM). On live 27k–35k-token requests, decode expert hit rate rose from `89–93%` to **`95.8–97.6%`** and live decode rose from `25–34 tok/s` to **`38–80 tok/s`**.
+- **Rejected:** Shrinking the co-resident model's `--ubatch-size` (`16384 → 1024`) freed `~4 GiB` idle VRAM, but the model uses non-causal attention requiring `n_ubatch >= n_tokens` and aborts on real prompts up to `16k` tokens.
 
 ## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
 The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.
