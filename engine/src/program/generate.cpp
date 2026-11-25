@@ -1778,6 +1778,28 @@ static uint64_t file_tier_activity() {
 #endif
 }
 
+// The time every non-idle task of the system spent stalled on storage, in microseconds (Linux PSI, /proc/pressure/io,
+// the "full" line's total).  A VM whose disk writes wait on a hypervisor backup (copy-before-write) stalls the log, the
+// journal and the session files for minutes while the GPU and the experts are fine; the #29 watchdog counts a growing
+// total like the file tier's reads (#1407): slow storage, not a stuck flag.  Zero where unavailable.
+static uint64_t system_io_stall_us() {
+#if defined(__linux__)
+    uint64_t total = 0;
+    if (FILE* f = std::fopen("/proc/pressure/io", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f) != nullptr) {
+            unsigned long long v = 0;
+            const char* t = std::strstr(line, "total=");
+            if (std::strncmp(line, "full", 4) == 0 && t != nullptr && std::sscanf(t, "total=%llu", &v) == 1) total = v;
+        }
+        std::fclose(f);
+    }
+    return total;
+#else
+    return 0;
+#endif
+}
+
 std::string stage_text() {
     const strata::core::Progress& p = strata::core::progress();
     std::string s = std::string(p.where.load()) + " " + std::to_string((long long) p.detail.load());
@@ -15633,17 +15655,23 @@ int main(int argc, char** argv) {
                     auto since = std::chrono::steady_clock::now();
                     auto io_since = since;
                     uint64_t io_last = file_tier_activity();
-                    auto io_active_at = since;   // the last second the file tier was busy
-                    bool io_noted = false;
+                    uint64_t stall_last = system_io_stall_us();
+                    auto io_active_at = since;   // the last second the file tier was busy or the system stalled on storage
+                    bool io_noted = false, stall_seen = false;
                     for (;;) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         const auto now = std::chrono::steady_clock::now();
                         const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_active_at = now; io_noted = false; io_last = file_tier_activity(); continue; }
+                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_active_at = now; io_noted = false; stall_seen = false; io_last = file_tier_activity(); stall_last = system_io_stall_us(); continue; }
                         {   // sampled every second, also during the first `limit` seconds, so a busy file tier is seen
                             const uint64_t a = file_tier_activity();
                             if (a >= io_last + 16) io_active_at = now;   // 16 = faults + MiB read in a second: busy
                             io_last = a;
+                            // the whole system stalled on storage for a fifth of the second or more (PSI "full"): a hypervisor
+                            // backup holding the VM's writes stops this engine's log and session-file writes, not its GPU work
+                            const uint64_t s = system_io_stall_us();
+                            if (s >= stall_last + 200000) { io_active_at = now; stall_seen = true; }
+                            stall_last = s;
                         }
                         if (now - since < std::chrono::seconds(limit)) continue;
                         if (io_limit > limit && now - io_since < std::chrono::seconds(io_limit)) {
@@ -15652,21 +15680,38 @@ int main(int argc, char** argv) {
                             if (now - io_active_at < std::chrono::seconds(10)) {
                                 if (!io_noted) {
                                     io_noted = true;
-                                    std::fprintf(stderr, "strata serve: no step finished for %d s, but the file tier is still being read "
-                                                         "(slow storage or low RAM): waiting up to %d s in all (STRATA_WATCHDOG_IO_S) (#1407)\n",
-                                                 limit, io_limit);
+                                    std::fprintf(stderr, "strata serve: no step finished for %d s, but %s: waiting up to %d s in all "
+                                                         "(STRATA_WATCHDOG_IO_S) (#1407)\n", limit,
+                                                 stall_seen ? "the system is stalled on storage (/proc/pressure/io: a slow or held disk, "
+                                                              "for example a hypervisor backup)"
+                                                            : "the file tier is still being read (slow storage or low RAM)",
+                                                 io_limit);
                                 }
                                 continue;
                             }
                         }
                         // a blocking step's explicit allowance (session files): still within it, not yet stuck
                         if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
+                        const auto report_at = std::chrono::steady_clock::now();
                         std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
                                              "the engine so the server starts it again (issue #29)%s\n",
                                      limit, stage_text().c_str(),
                                      launch_blocking() ? "; CUDA_LAUNCH_BLOCKING=1 is set, and no verify window can "
                                                          "finish with it (#1341)" : "");
                         stall_report(stderr, p.ticks.load() - ticks_at);
+                        // the report takes a few seconds, more when the log's own storage is held: a request that moved
+                        // meanwhile was waiting on that storage, not stuck - keep it (nothing was released yet)
+                        if (p.beats.load() != last || !p.busy.load()) {
+                            std::fprintf(stderr, "strata serve: the request moved again while the report was written (%lld s) - "
+                                                 "it was waiting, not stuck; not stopping the engine\n",
+                                         (long long) std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::steady_clock::now() - report_at).count());
+                            std::fflush(stderr);
+                            last = p.beats.load(); ticks_at = p.ticks.load();
+                            since = io_since = io_active_at = std::chrono::steady_clock::now();
+                            io_noted = stall_seen = false; io_last = file_tier_activity(); stall_last = system_io_stall_us();
+                            continue;
+                        }
                         strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
                         std::fflush(stderr);
                         std::abort();

@@ -291,3 +291,39 @@ New opt-in switches. The default path is unchanged, and none of them has a measu
 - **C:** `STRATA_EXP_MODE=8`, `STRATA_BATCH_GDN_GROUPS`, `STRATA_POOL_DEP=0`, `--pool-tasks 12` and `24`.
 
 Run the engine under the same user, groups and `LimitMEMLOCK=infinity` as the production service (for example with `systemd-run`), with the build configured exactly as production's (`STRATA_PORTABLE=ON`; a default configure gives a native-CPU build that differs).
+
+### 9.5 Measured: round A (2026-11-25)
+Dual MI50, the production profile (`layer_split` 26, `--pipeline-windows 2`, `--batch 4`, `STRATA_BATCH_DF2=1`, `STRATA_PIPED_MTP=3`, `--vram-reserve-later-mib 16500`: GPU 1 keeps 16.5 GB free for a second model), the second model stopped. `terminal/tools/decode_ab.py`, 3 runs per arm, each arm freshly loaded (a cold expert cache: 80-92% hits, against 94% in long production use), 256-token answers, thinking off. tok/s are medians; "paired" is the median ratio of the same prompt in the same run against `base` (the new build, switches off), with the share of pairs that were faster.
+
+| Arm | Solo prose | Solo code | 3x prose | 3x code | 4x prose | 4x code | Paired vs base |
+|---|---|---|---|---|---|---|---|
+| prod (production binary) | 31.8 | 45.4 | 39.2 | 47.9 | 51.2 | 40.8 | -4% to +1% (4x code -10%, 1 of 3) |
+| base | 31.5 | 44.5 | 40.0 | 43.5 | 50.8 | 45.3 | - |
+| `STRATA_BATCH_DF2_CAP=1` | 31.9 | 45.0 | 41.4 | 47.0 | 53.4 | 47.8 | solo 0%; 4x +5% (3 of 3, both kinds) |
+| `STRATA_DF2_Q4_NARROW=1` | 33.0 | 43.9 | 40.9 | 45.8 | 52.3 | 46.2 | -3% to +5%, mixed |
+| `STRATA_PCIE_NEVER=1` | 32.0 | 44.6 | 40.1 | 46.2 | 52.3 | 46.6 | -1% to +3% |
+| all three | 30.9 | 46.2 | 40.0 | 46.7 | 52.2 | 46.9 | solo -2%/+2%; batch +3% to +6% |
+| `ded`: `--vram-reserve-later-mib 0` | 43.5 | 74.2 | 66.9 | 89.3 | 77.4 | 101.8 | solo +39%/+76%; batch +49% to +132% (every pair) |
+| `ded25`: the same, `layer_split` 25 | 44.0 | 74.2 | 66.0 | 89.2 | 76.9 | 100.0 | the same as `ded` |
+
+What it means:
+- **The reserve for the second model is by far the biggest cost.** With 16.5 GB kept free, GPU 1 caches 4,396 of its 11,264 profiled experts (39%); without the reserve it caches them all. Solo code goes from 44.5 to 74.2 tok/s and 4 requests from 45 to 102 tok/s. Moving one more layer to GPU 1 (`layer_split` 25) changes nothing.
+- The three new switches are small and within the noise of 3 runs: `STRATA_BATCH_DF2_CAP` gave +5% on 4 requests in every pair and nothing solo, as expected (it only trims the slot drafters' work). None of them made anything slower beyond noise.
+- `prod` and `base` (the always-on host plan change) are level.
+- The narrow Q4_0 drafter kernels matched the 8-column kernel bit for bit for 1, 2, 3 and 4 columns on GPU 1 (`dflash2_gemm_bench`).
+- Greedy answers are not repeatable here even within one arm (0 of 4 repeats of the same essay identical): which experts the CPU or the GPU computes changes near-ties. Answer identity is therefore no check between arms on this rig; the kernel and plan checks above are.
+
+## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
+The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.
+
+What the guest's logs show for the night of 2026-11-25:
+- From about 00:46 no write finished for about 10 minutes. `systemd-journald` and `systemd-timesyncd` hit their 3-minute watchdogs; journald could not be killed until 00:56:49. The same journald watchdog kill is in the journal on Nov 22 (00:40) and Nov 23 (00:37): it happens most nights.
+- The admission service's records of the five requests that ended during the stall all carry 00:56:49, so its SQLite writes waited too. (The night's earlier deadline failures, from 23:45 on, fall inside the backup window as well; whether the backup slowed them is not shown.)
+- Strata kept serving through the stall: two short and two long requests finished, and a 9,269-token answer ran at 31 tok/s until the client's 300 s deadline cancelled it. The next request then stood still for about 3 minutes while it parked the previous conversation (most likely on a write: the GPU and the CPU expert pool were idle). The engine's watchdog (issue #29, `STRATA_WATCHDOG_S`, default 60 s) saw no heartbeat, but its own message to the engine log on the same disk was stuck too. It got out when the writes resumed and stopped the engine 7 s later, although the stall report showed every GPU stream and every CPU expert job finished. The park itself then took 111 ms.
+- The client stopped sending after that error; no request reached the admission service for the next 4 hours.
+
+Fixes:
+1. **On the hypervisor: backup fleecing.** The old blocks go to a local fleecing image instead of the backup target, so guest writes no longer wait on the backup (Proxmox: the backup job's `fleecing: enabled=1,storage=<fast local storage>`). Keeping the model files out of the backup shortens the window too. This is the fix that also covers the journal and the admission service.
+2. **Engine watchdog (this branch, `src/program/generate.cpp`):** a system-wide storage stall (Linux PSI, `/proc/pressure/io`, the "full" total grows by 0.2 s or more in a second) now counts like the file tier's reads (#1407): slow, not stuck, within `STRATA_WATCHDOG_IO_S` (default 10 x the limit). After the stall report, which takes 2 s or more, the watchdog looks again; a request that moved meanwhile is kept, and nothing is released or stopped. Behaviour changes only while the system is stalled on storage or the request moves during the report.
+3. **Until that build is in production:** `STRATA_WATCHDOG_S=900` in the production profile's `env`. A real GPU hang then takes up to 15 minutes to recover instead of 1.
+4. **The client** should retry after a backend error instead of stopping for the night.
