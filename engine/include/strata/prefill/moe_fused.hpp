@@ -63,6 +63,10 @@ bool requested();
 size_t act_bytes(int64_t rows, int64_t cols);
 /// Bytes of the grouping tables for `n` routed rows over `n_expert` experts.
 size_t group_bytes(int64_t n, int n_expert);
+/// Pointer to the `n_expert + 1` cumulative row offsets written by `group()` inside `scratch`.
+inline const int32_t* group_offsets(const void* scratch, int n_expert) {
+    return reinterpret_cast<const int32_t*>(scratch) + n_expert;
+}
 
 /// x [rows][cols] FP32 -> `xa` (act_bytes(rows, cols)).
 void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);

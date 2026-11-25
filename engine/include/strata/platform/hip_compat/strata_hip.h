@@ -89,8 +89,10 @@
 // the plain per-block limit (64 KB of LDS on gfx906).
 inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, int dev) {
     hipError_t e = hipDeviceGetAttribute(v, a, dev);
-    if (e == hipSuccess && a == hipDeviceAttributeSharedMemPerBlockOptin && *v <= 0)
+    if (a == hipDeviceAttributeSharedMemPerBlockOptin && (e != hipSuccess || *v <= 0)) {
+        (void) hipGetLastError();
         e = hipDeviceGetAttribute(v, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
+    }
     return e;
 }
 #define cudaDeviceGetAttribute strata_device_get_attribute

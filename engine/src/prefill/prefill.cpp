@@ -5665,6 +5665,54 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #if STRATA_EXPERT_NIBBLE_BUILT
                     if (fused_l && nib_l.on) core::nibble::fatal(l, "the prompt path's fused experts", "they read GGUF blocks");
 #endif
+                    // Opt-in on-GPU routing plan for native_expert_i8 (STRATA_PF_I8_GPU_PLAN=1): uses fused::group() on the
+                    // GPU to eliminate per-layer cudaStreamSynchronize, D2H/H2D routing copies, and 16-expert group splits
+                    // (1 launch for all resident experts, or ring/3-streamed batches when stream_all is active).
+                    static const bool i8_gpu_plan_env = [] {
+                        const char* v = std::getenv("STRATA_PF_I8_GPU_PLAN");
+                        return v != nullptr && std::atoi(v) != 0;
+                    }();
+                    strata::kernels::NativeExpertLayout i8_gp_L{};
+                    size_t i8_gp_scr_al = 0, i8_gp_grp_al = 0;
+                    bool i8_gpu_plan = false;
+                    if (i8_gpu_plan_env && !fused_l && lay.native && !lay.fmt.empty() && !had_gu && !had_d &&
+                        !lay.fmt[(size_t) l].tail_off && no_peer && !m.pp && !on_routes && !rs_on &&
+                        std::getenv("STRATA_DUMP_MOE_INPUT") == nullptr &&
+                        m.group_cap == 0 && !m.fused_bufs && ws::mode() == 0 &&
+                        !(m.cache && mmq_plan().direct[(size_t) l]) &&
+                        m.cache != nullptr && m.host_res != nullptr && m.GU != nullptr && m.Dm != nullptr &&
+                        m.src_dev != nullptr && m.slot_dev != nullptr && m.ids_identity != nullptr &&
+                        m.g->n_expert > 0 && m.g->n_expert <= 1024 &&
+                        T * K >= m.g->n_expert * 5 &&
+#if STRATA_EXPERT_NIBBLE_BUILT
+                        !nib_l.on &&
+#endif
+                        true) {
+                        bool all_res = true;
+                        if (!stream_all) {
+                            const int32_t* lr = m.host_res + (size_t) l * (size_t) m.g->n_expert;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                if (lr[e] < 0) { all_res = false; break; }
+                            }
+                        }
+                        if (stream_all || all_res) {
+                            const auto& f = lay.fmt[(size_t) l];
+                            i8_gp_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                            const bool i8_same = i8_gp_L.up_off == f.up_off && i8_gp_L.down_off == f.down_off &&
+                                                 i8_gp_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF;
+                            const int64_t avg_grp = (T * K) / std::max<int64_t>(1, (m.g->n_expert + MMQ_GROUP - 1) / MMQ_GROUP);
+                            if (i8_same && strata::kernels::native_expert_i8_supported(i8_gp_L) &&
+                                strata::kernels::native_expert_i8_prompt(i8_gp_L, avg_grp)) {
+                                const size_t i8_scr = strata::kernels::native_expert_i8_scratch_bytes(T * K, m.g->n_expert, kFF);
+                                const size_t grp_b = fused::group_bytes(T * K, (int) m.g->n_expert);
+                                const size_t ptr_b = (size_t) m.g->n_expert * sizeof(unsigned long long) + 256;
+                                i8_gp_scr_al = (i8_scr + 255) & ~(size_t) 255;
+                                i8_gp_grp_al = (grp_b + 255) & ~(size_t) 255;
+                                const size_t gu_cap = (size_t) T * (size_t) K * (size_t) kFF2 * sizeof(float);
+                                i8_gpu_plan = (i8_gp_scr_al + i8_gp_grp_al + ptr_b <= gu_cap);
+                            }
+                        }
+                    }
                     if (fused_l) {
                         if (static bool said = false; !said) {
                             said = true;
@@ -5759,6 +5807,82 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (fused_nat && fused::p1a_wanted()) {
                             fused::p1a_input(nullptr, 0);
                             p1a_report(lay.fmt, (size_t) l, p1a_layer);
+                        }
+                    } else if (i8_gpu_plan) {
+                        if (static bool said_gp = false; !said_gp) {
+                            said_gp = true;
+                            std::fprintf(stderr, "strata: prompt int8 experts with on-GPU routing plan (STRATA_PF_I8_GPU_PLAN=1)\n");
+                        }
+                        if (defer_shared && !shared_expert()) return false;
+                        pt.mark(kPfGather, cs);
+                        if (m.fr_xq == nullptr || m.fr_xq_rows < T) {
+                            if (m.fr_xq) cudaFree(m.fr_xq);
+                            m.fr_xq = nullptr;
+                            m.fr_xq_rows = 0;
+                            if (cudaMalloc(&m.fr_xq, (size_t) T * (size_t) (N / 32) * 36) != cudaSuccess) {
+                                m.fr_xq = nullptr;
+                                err = "prefill: int8 gpu-plan: no memory for the activations";
+                                return false;
+                            }
+                            m.fr_xq_rows = T;
+                        }
+                        uint8_t* const gu_base = (uint8_t*) m.GU;
+                        void* const tab_buf = gu_base + i8_gp_scr_al;
+                        unsigned long long* const ptr_dev = (unsigned long long*) (gu_base + i8_gp_scr_al + i8_gp_grp_al);
+                        int32_t* const ng_dev = (int32_t*) ((uint8_t*) ptr_dev +
+                                                            (((size_t) m.g->n_expert * sizeof(unsigned long long) + 15) & ~(size_t) 15));
+                        fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, tab_buf, m.slot_dev, m.src_dev, m.cs);
+                        const int32_t* const off_dev = fused::group_offsets(tab_buf, (int) m.g->n_expert);
+                        strata::kernels::native_expert_i8_quantize(m.mixed, T, N, m.fr_xq, m.cs);
+                        const size_t per = (size_t) std::max(1, m.ring / 3);
+                        size_t k = stream_all ? seq_start[(size_t) l] : 0;
+                        const size_t kend = stream_all ? seq_start[(size_t) l + 1] : 0;
+                        std::vector<unsigned long long> ptrs((size_t) m.g->n_expert);
+                        for (int32_t e = 0; e < m.g->n_expert;) {
+                            const int32_t e0 = e;
+                            const size_t k0 = k;
+                            for (; e < m.g->n_expert; ++e) {
+                                if (k < kend && seq[k].e == e) {
+                                    if (k - k0 == per) break;
+                                    ptrs[(size_t) (e - e0)] = (unsigned long long) (uintptr_t) m.stage_dev[k % (size_t) m.ring];
+                                    ++k;
+                                } else {
+                                    const int32_t slot = m.host_res[(size_t) l * (size_t) m.g->n_expert + (size_t) e];
+                                    ptrs[(size_t) (e - e0)] = (unsigned long long) (uintptr_t) m.cache->device_slot(slot);
+                                    ++stats_.experts_resident;
+                                }
+                            }
+                            const int32_t ne = e - e0;
+                            const size_t nbytes = (size_t) ne * sizeof(unsigned long long);
+                            for (size_t off = 0; off < nbytes; off += strata::kernels::kI8PutRecordMax) {
+                                const size_t chunk = std::min(strata::kernels::kI8PutRecordMax, nbytes - off);
+                                if (!strata::kernels::native_expert_i8_put_record((uint8_t*) ptr_dev + off,
+                                                                                  (const uint8_t*) ptrs.data() + off,
+                                                                                  chunk, m.cs)) {
+                                    err = "prefill: int8 gpu-plan: failed to upload expert pointers";
+                                    return false;
+                                }
+                            }
+                            if (!strata::kernels::native_expert_i8_put_record(ng_dev, &ne, sizeof(ne), m.cs)) {
+                                err = "prefill: int8 gpu-plan: failed to upload batch count";
+                                return false;
+                            }
+                            if (k > k0) {
+                                pt.mark(kPfWaitCopy, cs);
+                                wait_issued(k - 1);
+                                wait_copied(k - 1, (k - 1) % (size_t) m.ring);
+                            }
+                            pt.mark(kPfGemmGU, cs);
+                            strata::kernels::native_expert_i8(i8_gp_L, ptr_dev, off_dev + e0, ng_dev,
+                                                              m.ids_identity, m.src_dev,
+                                                              m.g->n_expert, T * K, m.fr_xq, m.GU, m.Dm, m.cs);
+                            if (k > k0) {
+                                const int rel = (int) ((k - 1) % (size_t) m.ring);
+                                cudaEventRecord(m.used[rel], m.cs);
+                                for (size_t kk = k0; kk < k; ++kk) m.used_of[kk % (size_t) m.ring] = rel;
+                                consumed = k;
+                                give_back(consumed);
+                            }
                         }
                     } else {
                         // group the (token, k) pairs by expert on the host

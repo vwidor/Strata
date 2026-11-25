@@ -1097,6 +1097,252 @@ i8b_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __rest
     }
 }
 
+#if defined(STRATA_HIP_GFX906)
+// ---------------------------------------------------------------- variant W (tile codes 6 & 7, gfx906 wave64):
+// <32 KiB single-buffered LDS (128 weight rows x 64 entries, 64 K-values/stage) with __launch_bounds__(256, 2) so two
+// blocks (8 wave64) reside per MI50 CU (64 KiB LDS, 256 VGPRs/SIMD -> <=128 VGPRs/wave for 2 waves/SIMD).
+//   tile 6 (W2X16=false): 8 x 32-lane groups, 4 rows x 8 entries/thread (28 b128 LDS reads per 256 v_dot4)
+//   tile 7 (W2X16=true):  4 x 64-lane waves,  2 rows x 16 entries/thread (64-lane uniform activation broadcasts, lower VGPRs)
+// Arithmetic and accumulation order are identical to i8_kernel / i8b_kernel (bitwise identical output).
+constexpr int I8W_BM = 64, I8W_LD = 20, I8W_KS = 64;
+template <int T, bool GG = i8_gg_type(T)>
+struct I8WSmem {
+    static constexpr int GW = GG ? 0 : (i8_grid_words(T) + 3) / 4 * 4;
+    static constexpr int SG = i8_sign_type(T) ? 512 : 0;
+    static constexpr int SZ_W = 128 * I8W_LD, SZ_A = I8W_BM * I8W_LD, SZ_R = 2 * 128 * 4, SZ_D = 2 * I8W_BM;
+    static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + SZ_W, o_r = o_a + SZ_A, o_d = o_r + SZ_R,
+                         o_src = o_d + SZ_D, total = (o_src + I8W_BM + 3) / 4 * 4;
+    static constexpr size_t bytes = (size_t) total * 4;
+};
+
+template <int T, bool GU, bool W2X16, bool GG = i8_gg_type(T)>
+__global__ void __launch_bounds__(I8_NT, 2)
+i8w_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
+           const int32_t* __restrict__ tile_off, const int32_t* __restrict__ ent_idx, const block_q8_1* __restrict__ A,
+           block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L, int bisect) {
+    (void) bisect;
+    using SM = I8WSmem<T, GG>;
+    extern __shared__ uint4 i8_dyn[];
+    uint32_t* const smem = (uint32_t*) i8_dyn;
+    uint32_t* const s_grid = smem;
+    const uint32_t* const grid_rd = GG ? i8_grid_src<T>() : s_grid;
+    uint32_t* const s_sg = smem + SM::o_sg;
+    uint32_t* const s_w = smem + SM::o_w;
+    uint32_t* const s_a = smem + SM::o_a;
+    uint32_t* const s_r = smem + SM::o_r;
+    float* const s_ad = (float*) (smem + SM::o_d);
+    int* const s_src = (int*) (smem + SM::o_src);
+
+    const int ng = *n_groups;
+    const int ti = blockIdx.x;
+    if (ti >= tile_off[ng]) return;
+    int lo = 0, hi = ng - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (tile_off[mid] <= ti) lo = mid; else hi = mid - 1;
+    }
+    const int g = lo;
+    const int e_lo = grp_start[g] + (ti - tile_off[g]) * I8W_BM;
+    const int e_hi = min(grp_start[g + 1], e_lo + I8W_BM);
+    const int nv = e_hi - e_lo;
+    I8P blob = i8_uniform(I8_GPTR(grp_ptr[g]));
+    const int tid = threadIdx.x;
+    const int K = GU ? (int) L.n_embd : (int) L.n_ff;
+    const int ns = K / I8W_KS;
+    const size_t wrb = GU ? L.gu_row : L.d_row;
+
+    if constexpr (i8_grid_words(T) > 4 && !GG) {
+        const uint32_t* src = i8_grid_src<T>();
+        for (int i = tid; i < i8_grid_words(T); i += I8_NT) s_grid[i] = src[i];
+    }
+    if constexpr (i8_sign_type(T)) {
+        const uint32_t b = (uint32_t) tid;
+        uint32_t sb = b;
+        if constexpr (T != 21 && T != 22) sb = (b & 127u) | (((uint32_t) __popc(b & 127u) & 1u) << 7);
+        uint32_t mlo = 0, mhi = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            mlo |= ((sb >> k) & 1u) ? (0xFFu << (8 * k)) : 0u;
+            mhi |= ((sb >> (4 + k)) & 1u) ? (0xFFu << (8 * k)) : 0u;
+        }
+        *(uint2*) (s_sg + 2 * b) = make_uint2(mlo, mhi);
+    }
+    uint32_t kv[4] = {0, 0, 0, 0};
+    if constexpr (T == 20 || T == 23) {
+        const uint32_t* t = (const uint32_t*) kvalues_iq4nl;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) kv[i] = t[i];
+    }
+    if (tid < I8W_BM) s_src[tid] = (e_lo + tid < e_hi) ? (GU ? ent_idx[e_lo + tid] : e_lo + tid) : -1;
+    __syncthreads();
+
+    const int wr = tid >> 1, wp = tid & 1;
+    size_t row_off;
+    if constexpr (GU) row_off = (wr >= 64 ? L.up_off : (size_t) 0) + (size_t) (blockIdx.y * 64 + (wr & 63)) * wrb;
+    else row_off = L.down_off + (size_t) (blockIdx.y * 128 + wr) * wrb;
+    I8P const wrowb = blob + row_off;
+
+    const bool a_thr = tid < 2 * I8W_BM;   // threads 0..127 (waves 0-1): 64 entries x 2 q8_1 blocks
+    const int ea = tid >> 1, ba = tid & 1;
+    I8P const abase = I8_GPTR(A);
+    uint32_t a_vo = 0;
+    if (a_thr) {
+        const int src = s_src[ea];
+        a_vo = (uint32_t) ((size_t) (src >= 0 ? src : 0) * (size_t) ((K / 32) * 36) + (size_t) ba * 36);
+    }
+
+    auto load_w = [&](int st, uint32_t (&r)[I8NR<T>]) {
+        const int sb = 2 * st + wp;
+        int bi, ib;
+        if constexpr (i8_block_vals(T) == 256) { bi = sb >> 3; ib = sb & 7; }
+        else if constexpr (i8_block_vals(T) == 64) { bi = sb >> 1; ib = sb & 1; }
+        else { bi = sb; ib = 0; }
+        i8_load_bp<T>(wrowb + (size_t) bi * i8_block_bytes(T), ib, r);
+    };
+    auto store_w = [&](int st, const uint32_t (&r)[I8NR<T>]) {
+        uint32_t q[8], w[I8NW<T>];
+        int m0, m1;
+        float base;
+        i8_pack<T>(r, (2 * st + wp) & 7, w);
+        i8_convert<T>(w, grid_rd, (const uint2*) s_sg, kv, q, m0, m1, base);
+        uint4* dst = (uint4*) (s_w + wr * I8W_LD + wp * 8);
+        dst[0] = make_uint4(q[0], q[1], q[2], q[3]);
+        dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
+        *(uint4*) (s_r + (wp * 128 + wr) * 4) = make_uint4((uint32_t) m0, (uint32_t) m1, __float_as_uint(base), 0u);
+    };
+    auto load_a = [&](int st, uint32_t (&ar)[9]) {
+        if (a_thr) {
+            I8P p = abase + (size_t) st * 72 + a_vo;
+#pragma unroll
+            for (int k = 0; k < 9; ++k) ar[k] = i8_ldw(p + 4 * k);
+        }
+    };
+    auto store_a = [&](const uint32_t (&ar)[9]) {
+        if (a_thr) {
+            uint4* d = (uint4*) (s_a + ea * I8W_LD + ba * 8);
+            d[0] = make_uint4(ar[1], ar[2], ar[3], ar[4]);
+            d[1] = make_uint4(ar[5], ar[6], ar[7], ar[8]);
+            s_ad[ba * I8W_BM + ea] = __uint_as_float(ar[0]);
+        }
+    };
+
+    constexpr int NJ = W2X16 ? 16 : 8, NI = W2X16 ? 2 : 4;
+    float acc[NJ][NI];
+#pragma unroll
+    for (int j = 0; j < NJ; ++j)
+#pragma unroll
+        for (int i = 0; i < NI; ++i) acc[j][i] = 0.0f;
+
+    uint32_t wraw[I8NR<T>], ar[9];
+    const int lane = W2X16 ? (tid & 63) : (tid & 31);
+    const int ebase = W2X16 ? (16 * (tid >> 6)) : (8 * (tid >> 5));
+    const int rstride = W2X16 ? 64 : 32;
+
+    for (int st = 0; st < ns; ++st) {
+        load_w(st, wraw);
+        load_a(st, ar);
+        store_w(st, wraw);
+        store_a(ar);
+        __syncthreads();
+        if (ebase < nv) {
+#pragma unroll 1
+            for (int blk = 0; blk < 2; ++blk) {
+                uint4 rc[NI], wv[NI][2];
+#pragma unroll
+                for (int i = 0; i < NI; ++i) {
+                    const int row = lane + rstride * i;
+                    rc[i] = *(const uint4*) (s_r + blk * 512 + row * 4);
+                    wv[i][0] = *(const uint4*) (s_w + row * I8W_LD + blk * 8);
+                    wv[i][1] = *(const uint4*) (s_w + row * I8W_LD + blk * 8 + 4);
+                }
+                if (ebase + NJ <= nv) {
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        const int e = ebase + j;
+                        const float ax = s_ad[blk * I8W_BM + e];
+                        const uint4 a0 = *(const uint4*) (s_a + e * I8W_LD + blk * 8);
+                        const uint4 a1 = *(const uint4*) (s_a + e * I8W_LD + blk * 8 + 4);
+#pragma unroll
+                        for (int i = 0; i < NI; ++i) {
+                            const int t = i8_row_t<T>(wv[i], rc[i], a0, a1);
+                            acc[j][i] = fmaf((float) t, __uint_as_float(rc[i].z) * ax, acc[j][i]);
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int j = 0; j < NJ; ++j) {
+                        if (ebase + j < nv) {
+                            const int e = ebase + j;
+                            const float ax = s_ad[blk * I8W_BM + e];
+                            const uint4 a0 = *(const uint4*) (s_a + e * I8W_LD + blk * 8);
+                            const uint4 a1 = *(const uint4*) (s_a + e * I8W_LD + blk * 8 + 4);
+#pragma unroll
+                            for (int i = 0; i < NI; ++i) {
+                                const int t = i8_row_t<T>(wv[i], rc[i], a0, a1);
+                                acc[j][i] = fmaf((float) t, __uint_as_float(rc[i].z) * ax, acc[j][i]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (st + 1 < ns) __syncthreads();
+    }
+
+    if (ebase >= nv) return;
+    if constexpr (GU) {
+        const int nb = (int) (L.n_ff / 32);
+        if constexpr (W2X16) {
+            const int half = lane >> 5, sub = lane & 31;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                if (ebase + j < nv) {
+                    const int e = e_lo + ebase + j;
+                    const float g0 = acc[j][0], u0 = acc[j][1];
+                    const float h0 = (g0 / (1.0f + __expf(-g0))) * u0;
+                    float amax = fabsf(h0);
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                    const float d_inv = 127.0f / amax;
+                    block_q8_1* hb = hq + (size_t) e * nb + 2 * blockIdx.y + half;
+                    hb->qs[sub] = i8_code(h0, d_inv, amax);
+                    if (sub == 0) i8_put_scale(hb, amax, d_inv);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                if (ebase + j < nv) {
+                    const int e = e_lo + ebase + j;
+#pragma unroll
+                    for (int half = 0; half < 2; ++half) {
+                        const float g0 = acc[j][half], u0 = acc[j][2 + half];
+                        const float h0 = (g0 / (1.0f + __expf(-g0))) * u0;
+                        float amax = fabsf(h0);
+#pragma unroll
+                        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                        const float d_inv = 127.0f / amax;
+                        block_q8_1* hb = hq + (size_t) e * nb + 2 * blockIdx.y + half;
+                        hb->qs[lane] = i8_code(h0, d_inv, amax);
+                        if (lane == 0) i8_put_scale(hb, amax, d_inv);
+                    }
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < NJ; ++j) {
+            if (ebase + j < nv) {
+                const int e = e_lo + ebase + j;
+                float* o = out + (size_t) ent_idx[e] * L.n_embd + (size_t) blockIdx.y * 128 + lane;
+#pragma unroll
+                for (int i = 0; i < NI; ++i) o[rstride * i] = acc[j][i];
+            }
+        }
+    }
+}
+#endif
+
 #if !defined(__HIPCC__)
 #include "i8h_volta.cuh"   // TUNE-0216: the Volta tensor-core form (tile code 5)
 #endif
@@ -1172,11 +1418,26 @@ void i8b_launch(const I8Args& a, cudaStream_t s) {
         i8b_kernel<T, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
     i8_note_launch(GU, 8, smem);
 }
-// shared memory of the instances of a gate/up and a down type for tile code tm (2, 3, 4: rows of 16 entries; 8: variant B), and the device's limit per block
+#if defined(STRATA_HIP_GFX906)
+template <int T, bool GU>
+void i8w_launch(const I8Args& a, cudaStream_t s) {
+    constexpr size_t smem = I8WSmem<T>::bytes;
+    const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 64 : a.L.n_embd / 128));
+    if constexpr (GU)
+        i8w_kernel<T, true, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+    else
+        i8w_kernel<T, false, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+    i8_note_launch(GU, 7, smem);
+}
+#endif
+// shared memory of the instances of a gate/up and a down type for tile code tm (2, 3, 4: rows of 16 entries; 6/7: gfx906 wave64; 8: variant B), and the device's limit per block
 template <int T>
 size_t i8_sm(int tm, bool gg = false) {
 #if !defined(__HIPCC__)
     if (tm == 5) return I8HSmem<T>::bytes;
+#endif
+#if defined(STRATA_HIP_GFX906)
+    if (tm == 6 || tm == 7) return I8WSmem<T>::bytes;
 #endif
     if (gg && i8_gg_type(T) && tm != 8) return tm <= 2 ? I8Smem<T, 2, true>::bytes : tm == 3 ? I8Smem<T, 3, true>::bytes : I8Smem<T, 4, true>::bytes;
     return tm == 8 ? I8BSmem<T>::bytes : tm <= 2 ? I8Smem<T, 2>::bytes : tm == 3 ? I8Smem<T, 3>::bytes : I8Smem<T, 4>::bytes;
@@ -1213,7 +1474,15 @@ bool i8_smem_launches(size_t bytes) {
 size_t i8_smem_limit() {
     int dev = 0, v = 0;
     size_t lim = 48 * 1024;
-    if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) == cudaSuccess && v > 0) lim = (size_t) v;
+    if (cudaGetDevice(&dev) == cudaSuccess) {
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) == cudaSuccess && v > 0) lim = (size_t) v;
+#if defined(__HIPCC__)
+        else {
+            (void) hipGetLastError();
+            if (hipDeviceGetAttribute(&v, hipDeviceAttributeMaxSharedMemoryPerBlock, dev) == hipSuccess && v > 0) lim = (size_t) v;
+        }
+#endif
+    }
     const int o = i8_env_int("STRATA_I8_SMEM_LIMIT", 0);   // research / the parity test: pretend a smaller device
     return o > 0 && (size_t) o < lim ? (size_t) o : lim;
 }
@@ -1235,6 +1504,11 @@ void i8_launch(int tm, const I8Args& a, cudaStream_t s) {
 #if !defined(__HIPCC__)
     if constexpr (i8h_type(T)) {
         if (tm == 5) { i8h_launch<T, GU>(a, s); return; }   // the Volta tensor-core form (native_expert_i8 takes tile 5 only on a compute capability 7.0 card)
+    }
+#endif
+#if defined(STRATA_HIP_GFX906)
+    if constexpr (i8_tile8_type(T)) {
+        if (tm == 6 || tm == 7) { i8w_launch<T, GU>(a, s); return; }
     }
 #endif
     if constexpr (i8_tile8_type(T)) {

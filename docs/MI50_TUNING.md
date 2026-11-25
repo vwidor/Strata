@@ -189,7 +189,12 @@ Note: if using a custom `model_name` not matched by `drafting.py:supported_model
     "STRATA_DF2_PW_DYN": "1",
     "STRATA_BATCH_DYN_GROUPS": "1",
     "STRATA_BATCH_SLOT_RUNS": "1",
-    "STRATA_FUSE_HITS": "1"
+    "STRATA_FUSE_HITS": "1",
+    "STRATA_ROCBLAS_TUNING": "/path/to/gfx906-rocblas-2.47.0.txt",
+    "STRATA_I8_TM": "7",
+    "STRATA_QSA_PA_GFX906": "1",
+    "STRATA_PF_I8_GPU_PLAN": "1",
+    "STRATA_ATTN_MERGE_V2": "1"
   },
   "args": [
     "--pack", "/path/to/pack-iq3s",
@@ -412,6 +417,33 @@ Four opt-in spec-decode/pipeline upgrades in `generate.cpp`, paired with the ver
 | **2× Batch Code** *(total / engine rows/s)* | — | — | `89.2` / `98.1 rows/s` | **`96.2` / `106.0 rows/s`** | **`+7.8%`** vs Phase 2 |
 | **3× Batch Prose** *(total / engine rows/s)* | `63.0 tok/s` | `72.2 tok/s` | `78.4` / `82.6 rows/s` | **`84.6` / `89.4 rows/s`** | **`+34.3%`** |
 | **4× Batch Code** *(total / engine rows/s)* | `83.3` / `88.9 rows/s` | `92.4` / `97.6 rows/s` | `106.3` / `112.8 rows/s` | **`110.9–120.0` / `118.6–129.1 rows/s`** | **`+33.1–44.1%`** e2e / **`+33.4–45.2%`** rows/s |
+
+### 9.12 Phase 4: Prefill Rework & `gfx906` rocBLAS Tuning (measured, 2026-11-25)
+Five opt-in `gfx906` prefill upgrades targeting the four dominant MI50 prompt bottlenecks (untuned FP16 dense GEMMs, `<32 KiB` LDS occupancy in routed `native_expert_i8`, per-layer host sync + 16-expert group splits, and FP32/LDS-bound `k8v4` QSA prompt attention), plus a ROCm 5.7 `Optin` shared-memory attribute fallback fix (`strata_hip.h` / `i8_expert.cuh`). Default behavior is unchanged when flags are unset.
+
+| Opt-in Switch / Fix | Mechanism | Parity / Verification | Measured MI50 Micro-Benchmark (`180 W`) |
+|---|---|---|---|
+| `STRATA_ROCBLAS_TUNING=<table.txt>` *(+ CMake `STRATA_ROCBLAS_AVAILABLE` for `gfx906`)* | Enables `STRATA_ROCBLAS_AVAILABLE` and `gfx906_prefill_rocblas_gemm` in `backends/hip.cmake` / `strata_gpu_engine.cmake`; includes tuned `gfx906` `rocBLAS 2.47.0` table (`terminal/tools/hip/gfx906-rocblas-2.47.0.txt`, `98` rows / `88` solutions) for `STRATA_HIP_PROMPT_F16=1` | `gfx906_prefill_rocblas_gemm` `PASS` (`4/4` cases, `rel_l2=2.08e-4`, `tuned_launches=4, fallbacks=0`) | **`1.43×–3.35×`** vs default `f16/bf16->f32` (`1.67×–4.06×` vs untuned `f16o`): `hc_down` `4.55→1.36 ms (3.35×)`, `hc_up` `2.37→0.82 ms (2.91×)`, `router` `1.08→0.46 ms (2.32×)`, `attn_q` `11.07→6.36 ms (1.74×)`, `gdn_qkv` `8.83→5.35 ms (1.65×)` |
+| `STRATA_I8_TM=7` *(+ ROCm 5.7 64 KiB `i8_smem_limit()` fix)* | New `<32 KiB` single-buffered LDS wave64 `i8w_kernel` (`i8_expert.cuh`: `128×64` tile, `20.2–24.3 KiB` LDS, 2 blocks/CU, `127–128` VGPRs, **`0` spills / `0 B` private scratch** across all model quant types); fixes ROCm 5.7 `hipDeviceAttributeSharedMemPerBlockOptin` error returning `48 KiB` instead of `64 KiB` | **Bitwise exact** output hashes vs baseline `TM=2/3/4/8`; `native_i8_parity` `all ok` (`70+` quant pairs) | `IQ3_S/IQ4_NL`: `T=2048: 22.54→18.81 ms (1.20×)`, `T=4096: 46.19→36.83 ms (1.25×)`; `IQ2_S/IQ4_NL`: `T=2048: 29.99→19.36 ms (1.55× vs pre-fix TM=2)`, `T=4096: 46.56→37.16 ms (1.25×)`; `IQ3_XXS/IQ4_NL`: `T=2048: 22.90→18.42 ms (1.24×)` |
+| `STRATA_PF_I8_GPU_PLAN=1` | On-GPU routing plan via `fused::group()` inside `m.GU` tail (`0` extra VRAM, `prefill.cpp` + `moe_fused.hpp`): eliminates per-layer `cudaStreamSynchronize`, D2H/H2D routing copies, and `32×` 16-expert group splits (launches all `512` resident experts in `1` call on GPU 0 and `ring/3`-streamed batches on GPU 1) | Verified live activation + coherent outputs on `pp4k`–`pp29k` (`0` errors) | Eliminates `48` host syncs + `~1,500` small group launches per 2K chunk |
+| `STRATA_QSA_PA_GFX906=1` | Single-pass online-softmax wave64 `prompt_attn_gfx906_kernel` (`qsa_prompt_attn.cu`, `k8v4` & `int8`): power-of-2 prescaled FP16 Q (`6 KiB` LDS) + cell-paired FP16 P×V via hardware `v_dot2_f32_f16` (`11.4 KiB` LDS, `0` spills, `0` split-K scratch/merge launches) | `qsa_parity` ok; standalone `n_q=2048, cap=2051`: `nan=0`, `k8v4 rel_l2=3.08e-4`, `int8 rel_l2=3.90e-4` | `n_q=2048, cap=2051` shared block-4 IDs: `k8v4` `58.55→46.95 ms` (**`1.25×`**), `int8` `58.95→45.25 ms` (**`1.30×`**) |
+| `STRATA_ATTN_MERGE_V2=1` + existing GDN flags | Batched attention merge (bitwise exact); verified existing `STRATA_GDN_HEAD=1`, `STRATA_GDN_PP=2`, `STRATA_GDN_NOY=1` on `gfx906_gdn_rec_head` (`7.80→3.24 ms/layer`, `2.41×`, `0` diffs). Note: `gdn_chunk.cu` targets Volta WMMA (`>64 KiB` LDS) and no container runtime was available on the host for ROCm 6.3+/7.x A/B | Bitwise exact (`FAILURES: 0`) | `~164 ms`/chunk saved by GDN recurrence flags (already enabled in profile) |
+
+**Live End-to-End Dual-MI50 Prefill & Decode Summary (Phases 0 → 4, `--vram-reserve-later-mib 12000`, `180 W`, `temp=0.0`, thinking off):**
+
+| Workload | Phase 0 (`5f43512`) | Phase 3 (`7416972`) | **Phase 4 (live)** | **Phase 3 → 4** | **Cumulative vs Phase 0** |
+|---|---:|---:|---:|---:|---:|
+| **Prefill `pp4k` (`7,328` tok, 0% reuse)** *(pure / e2e)* | — | `453.8` / `451.1 tok/s` (`16.15 s`) | **`882.5` / `732.8 tok/s`** (`8.30 s`) | **`+94.5%`** (`1.94×` pure) | — |
+| **Prefill `pp9k` (`9,318` tok, 0% reuse, warm)** *(pure / e2e)* | — | — | **`950.2` / `939.9 tok/s`** (`9.81 s`) | — | — |
+| **Prefill `pp12k` (`22,588` tok, 0% reuse)** *(pure / e2e)* | — | `763.4` / `760.8 tok/s` (`29.59 s`) | **`995.5` / `990.4 tok/s`** (`22.69 s`) | **`+30.4%`** (`1.30×` pure) | — |
+| **Prefill `pp29k` (`28,818` tok, 0% reuse, warm)** *(pure / e2e)* | — | — | **`937.3` / `933.9 tok/s`** (`30.74 s`) | — | — |
+| **Solo Prose** *(e2e)* | `43.3 tok/s` | `56.9 tok/s` | **`58.6 tok/s`** | `+3.0%` | **`+35.3%`** |
+| **Solo Code** *(e2e / pure)* | `58.5` / `69.8 tok/s` | `73.7` / `87.5 tok/s` | **`71.1–73.6` / `90.3 tok/s`** | level / `+3.2%` pure | **`+25.8%`** / **`+29.4%`** |
+| **Solo Penalized Prose** *(e2e / pure)* | — | `51.8–54.4` / `55.6–58.7 tok/s` | **`54.7` / `59.0 tok/s`** | `+0.6%` | **`+18.4%`** vs Phase 2 |
+| **2× Batch Code** *(total / engine rows/s)* | — | `96.2` / `106.0 rows/s` | **`98.7` / `109.3 rows/s`** | `+2.6%` | **`+10.7%`** vs Phase 2 |
+| **3× Batch Prose** *(total e2e)* | `63.0 tok/s` | `84.6 tok/s` | **`82.7 tok/s`** | within run noise | **`+31.3%`** |
+| **4× Batch Code** *(total / engine rows/s)* | `83.3` / `88.9 rows/s` | `110.9–120.0` / `118.6–129.1 rows/s` | **`117.3` / `120.1 rows/s`** | level | **`+40.8%`** / **`+35.1%`** |
+| **Post-Prefill Free VRAM** *(GPU 0 / GPU 1)* | `~1.7` / `~1.9 GiB` | `1.56` / `12.0 GiB` | **`1,276 MiB` / `11,929 MiB`** | `12 GiB` reserve intact | — |
 
 ## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
 The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.

@@ -78,9 +78,15 @@ bool run_case(strata::prefill::Gemm& gemm, hipblasHandle_t blas, hipStream_t str
     HIP_CHECK(hipStreamSynchronize(stream));
 
     const float alpha = 1.0f, beta = 0.0f;
+#if HIP_VERSION_MAJOR < 6
+    HIPBLAS_CHECK(hipblasGemmEx(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, n, t, k, &alpha, dw.p, HIPBLAS_R_16F, k, dx.p, HIPBLAS_R_16F,
+                                k, &beta, (float*) dref.p + output_offset, HIPBLAS_R_32F, ldy, HIPBLAS_R_32F,
+                                HIPBLAS_GEMM_DEFAULT));
+#else
     HIPBLAS_CHECK(hipblasGemmEx(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, n, t, k, &alpha, dw.p, HIP_R_16F, k, dx.p, HIP_R_16F,
                                 k, &beta, (float*) dref.p + output_offset, HIP_R_32F, ldy, HIPBLAS_COMPUTE_32F,
                                 HIPBLAS_GEMM_DEFAULT));
+#endif
     gemm.f16((const uint16_t*) dx.p, (const uint16_t*) dw.p, (float*) dy.p + output_offset, t, n, k, ldy, beta);
     HIP_CHECK(hipStreamSynchronize(stream));
 
