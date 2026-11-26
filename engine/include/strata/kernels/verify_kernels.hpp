@@ -57,6 +57,10 @@ struct GdnGroups {
     int ntok[8] = {};
     int n = 0;
 };
+/// gdn_conv_l2_multi over several slots' groups at once (opt-in STRATA_BATCH_GDN_CONV_GROUPS=1): bit-identical per row.
+/// `conv_off` is the float offset from each slot's `groups.state[i]` to its conv history.
+void gdn_conv_l2_groups(const GdnGroups& groups, int64_t conv_off, const float* qkv, const float* conv_w, float* h,
+                        int channels, int qk_heads, float eps, bool commit, void* stream);
 /// gdn_step_norm_multi over several slots' groups at once (the generic kernel, grid.y = group; per group the
 /// same arithmetic as one call each: bit-identical).  `commit`: every group keeps *keep[i] tokens, no outputs used.
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
@@ -209,6 +213,21 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 /// so).  Graph-capturable.
 uint64_t argmax_rows_scratch_bytes(int n_rows);
 void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream);
+/// Same as argmax_rows, with optional folded non-finite logit guard (`nf_flags`, n_rows * kNonfiniteBlocks words;
+/// null skips the guard). Avoids a second full-vocab pass over head logits.
+void argmax_rows_nf(const float* logits, int n_rows, int n, void* scratch, int32_t* out, uint32_t* nf_flags,
+                    void* stream);
+/// On-GPU single-row logprobs summary (STRATA_GPU_LOGPROBS=1): computes FP64 logsumexp, token logit, and either
+/// top-K (id, logit) pairs (k <= 24) or gathered allowed-id logits, downloading <512 B instead of ~1 MB logits.
+struct RowLogprobOut {
+    double lse = 0.0;
+    float tok_logit = 0.0f;
+    int32_t top_k = 0;
+    int32_t top_id[24] = {};
+    float top_val[24] = {};
+};
+bool row_logprobs_gpu(const float* logits, int n_vocab, int32_t token, int top_k, const int32_t* allowed_dev,
+                      int n_allowed, float* allowed_vals_dev, RowLogprobOut* out_dev, void* stream);
 /// row_top_prob over 8 blocks a row, each computing 4 of its 32 warps' sums, the row's last block adding the 32 in
 /// order: bitwise row_top_prob.  `scratch`: row_top_prob_scratch_bytes(n_rows), zero before the first launch.
 uint64_t row_top_prob_scratch_bytes(int n_rows);

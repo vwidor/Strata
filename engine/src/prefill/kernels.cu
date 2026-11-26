@@ -3534,4 +3534,214 @@ void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t 
     check("gate_attn");
 }
 
+#if defined(STRATA_HIP_GFX906)
+namespace {
+
+template <bool X_F16>
+__device__ __forceinline__ float unpack16_lo(uint32_t u) {
+    if constexpr (X_F16) return __half2float(__ushort_as_half((uint16_t) (u & 0xffffu)));
+    else return __uint_as_float(u << 16);
+}
+template <bool X_F16>
+__device__ __forceinline__ float unpack16_hi(uint32_t u) {
+    if constexpr (X_F16) return __half2float(__ushort_as_half((uint16_t) (u >> 16)));
+    else return __uint_as_float(u & 0xffff0000u);
+}
+
+// Opt-in STRATA_PF_TINY_WAVE=1 (gfx906): shared_gate (N=1, K=2560), 4 tokens/block (1 wave64/token).
+template <bool X_F16>
+__launch_bounds__(256)
+__global__ void pf_shared_gate_bf16_kernel(const uint16_t* __restrict__ x16, const uint16_t* __restrict__ w_bf16,
+                                           float* __restrict__ out, int64_t T, int K) {
+    __shared__ __align__(16) float sw[2560];
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 63;
+    const int wave = tid >> 6;
+    const int64_t tk = (int64_t) blockIdx.x * 4 + wave;
+    const uint32_t* w2 = reinterpret_cast<const uint32_t*>(w_bf16);
+    for (int i = tid; i < K / 2; i += 256) {
+        const uint32_t u = __ldg(w2 + i);
+        sw[2 * i + 0] = __uint_as_float(u << 16);
+        sw[2 * i + 1] = __uint_as_float(u & 0xffff0000u);
+    }
+    __syncthreads();
+    if (tk >= T) return;
+    float acc = 0.0f;
+    const uint16_t* xrow = x16 + (size_t) tk * (size_t) K;
+    for (int k0 = 0; k0 < K; k0 += 512) {
+        const uint4 xv = __ldg(reinterpret_cast<const uint4*>(xrow + k0) + lane);
+        const float4 w0 = reinterpret_cast<const float4*>(sw + k0)[lane * 2 + 0];
+        const float4 w1 = reinterpret_cast<const float4*>(sw + k0)[lane * 2 + 1];
+        acc = fmaf(unpack16_lo<X_F16>(xv.x), w0.x, acc);
+        acc = fmaf(unpack16_hi<X_F16>(xv.x), w0.y, acc);
+        acc = fmaf(unpack16_lo<X_F16>(xv.y), w0.z, acc);
+        acc = fmaf(unpack16_hi<X_F16>(xv.y), w0.w, acc);
+        acc = fmaf(unpack16_lo<X_F16>(xv.z), w1.x, acc);
+        acc = fmaf(unpack16_hi<X_F16>(xv.z), w1.y, acc);
+        acc = fmaf(unpack16_lo<X_F16>(xv.w), w1.z, acc);
+        acc = fmaf(unpack16_hi<X_F16>(xv.w), w1.w, acc);
+    }
+#pragma unroll
+    for (int o = 32; o > 0; o >>= 1) acc += __shfl_xor(acc, o, 64);
+    if (lane == 0) out[tk] = acc;
+}
+
+// Opt-in STRATA_PF_TINY_WAVE=1 (gfx906): hc_inject (N=4, K=10240), 1 token/block (4 wave64s = 4 output rows).
+template <bool X_F16>
+__launch_bounds__(256)
+__global__ void pf_hc_inject_bf16_kernel(const uint16_t* __restrict__ x16, int64_t ldx,
+                                         const uint16_t* __restrict__ w_bf16, float* __restrict__ out, int K) {
+    __shared__ __align__(16) float sx[512];
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 63;
+    const int wave = tid >> 6;   // 0..3 = HC output row
+    const int64_t t = (int64_t) blockIdx.x;
+    const uint16_t* xrow = x16 + (size_t) t * (size_t) ldx;
+    const uint16_t* wrow = w_bf16 + (size_t) wave * (size_t) K;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += 512) {
+        const uint32_t u = __ldg(reinterpret_cast<const uint32_t*>(xrow + k0) + tid);
+        sx[2 * tid + 0] = unpack16_lo<X_F16>(u);
+        sx[2 * tid + 1] = unpack16_hi<X_F16>(u);
+        __syncthreads();
+        const uint4 wv = __ldg(reinterpret_cast<const uint4*>(wrow + k0) + lane);
+        const float4 x0 = reinterpret_cast<const float4*>(sx)[lane * 2 + 0];
+        const float4 x1 = reinterpret_cast<const float4*>(sx)[lane * 2 + 1];
+        acc = fmaf(__uint_as_float(wv.x << 16), x0.x, acc);
+        acc = fmaf(__uint_as_float(wv.x & 0xffff0000u), x0.y, acc);
+        acc = fmaf(__uint_as_float(wv.y << 16), x0.z, acc);
+        acc = fmaf(__uint_as_float(wv.y & 0xffff0000u), x0.w, acc);
+        acc = fmaf(__uint_as_float(wv.z << 16), x1.x, acc);
+        acc = fmaf(__uint_as_float(wv.z & 0xffff0000u), x1.y, acc);
+        acc = fmaf(__uint_as_float(wv.w << 16), x1.z, acc);
+        acc = fmaf(__uint_as_float(wv.w & 0xffff0000u), x1.w, acc);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int o = 32; o > 0; o >>= 1) acc += __shfl_xor(acc, o, 64);
+    if (lane == 0) out[(size_t) t * 4 + wave] = acc;
+}
+
+// Opt-in STRATA_PF_TINY_WAVE=1 (gfx906): fused ssm_alpha + ssm_beta + gdn_gates (N=2*HV=96, K=2560).
+// Each block computes 4 output rows across 4 tokens (4 wave64s, 8 KiB LDS).
+template <bool X_F16>
+__launch_bounds__(256)
+__global__ void pf_gdn_ab_gates_bf16_kernel(const uint16_t* __restrict__ x16, const uint16_t* __restrict__ wa_bf16,
+                                            const uint16_t* __restrict__ wb_bf16, const float* __restrict__ dt,
+                                            const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                            float* __restrict__ beta, int64_t T, int K, int HV) {
+    __shared__ __align__(16) float sx[4][512];
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 63;
+    const int wave = tid >> 6;
+    const int r = (int) blockIdx.x * 4 + wave;
+    const int64_t t0 = (int64_t) blockIdx.y * 4;
+    const bool active = r < 2 * HV;
+    const uint16_t* wrow = active ? ((r < HV) ? (wa_bf16 + (size_t) r * (size_t) K)
+                                              : (wb_bf16 + (size_t) (r - HV) * (size_t) K))
+                                  : nullptr;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k0 = 0; k0 < K; k0 += 512) {
+#pragma unroll
+        for (int tk = 0; tk < 4; ++tk) {
+            if (t0 + tk < T) {
+                const uint32_t u = __ldg(reinterpret_cast<const uint32_t*>(x16 + (size_t) (t0 + tk) * (size_t) K + k0) + tid);
+                sx[tk][2 * tid + 0] = unpack16_lo<X_F16>(u);
+                sx[tk][2 * tid + 1] = unpack16_hi<X_F16>(u);
+            }
+        }
+        __syncthreads();
+        if (active) {
+            const uint4 wv = __ldg(reinterpret_cast<const uint4*>(wrow + k0) + lane);
+            const float w0 = __uint_as_float(wv.x << 16), w1 = __uint_as_float(wv.x & 0xffff0000u);
+            const float w2 = __uint_as_float(wv.y << 16), w3 = __uint_as_float(wv.y & 0xffff0000u);
+            const float w4 = __uint_as_float(wv.z << 16), w5 = __uint_as_float(wv.z & 0xffff0000u);
+            const float w6 = __uint_as_float(wv.w << 16), w7 = __uint_as_float(wv.w & 0xffff0000u);
+#pragma unroll
+            for (int tk = 0; tk < 4; ++tk) {
+                const float4 x0 = reinterpret_cast<const float4*>(sx[tk])[lane * 2 + 0];
+                const float4 x1 = reinterpret_cast<const float4*>(sx[tk])[lane * 2 + 1];
+                float a = acc[tk];
+                a = fmaf(w0, x0.x, a); a = fmaf(w1, x0.y, a);
+                a = fmaf(w2, x0.z, a); a = fmaf(w3, x0.w, a);
+                a = fmaf(w4, x1.x, a); a = fmaf(w5, x1.y, a);
+                a = fmaf(w6, x1.z, a); a = fmaf(w7, x1.w, a);
+                acc[tk] = a;
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+    const bool is_alpha = r < HV;
+    const int h = is_alpha ? r : (r - HV);
+    const float dth = is_alpha ? dt[h] : 0.0f;
+    const float sah = is_alpha ? ssm_a[h] : 0.0f;
+#pragma unroll
+    for (int tk = 0; tk < 4; ++tk) {
+        if (t0 + tk >= T) break;
+        float v = acc[tk];
+#pragma unroll
+        for (int o = 32; o > 0; o >>= 1) v += __shfl_xor(v, o, 64);
+        if (lane == 0) {
+            if (is_alpha) {
+                const float u = v + dth;
+                gate[(size_t) (t0 + tk) * (size_t) HV + h] = (u > 20.0f ? u : log1pf(__expf(u))) * sah;
+            } else {
+                beta[(size_t) (t0 + tk) * (size_t) HV + h] = 1.0f / (1.0f + __expf(-v));
+            }
+        }
+    }
+}
+
+}  // namespace
+
+bool pf_shared_gate_bf16(const uint16_t* x16, bool x_is_f16, const uint16_t* w_bf16, float* out, int64_t T,
+                         int64_t K, void* stream) {
+    if (T <= 0 || K != 2560 || !x16 || !w_bf16 || !out || ((uintptr_t) x16 & 15u) != 0 || ((uintptr_t) w_bf16 & 3u) != 0)
+        return false;
+    const unsigned nb = (unsigned) ((T + 3) / 4);
+    if (x_is_f16)
+        pf_shared_gate_bf16_kernel<true><<<nb, 256, 0, (cudaStream_t) stream>>>(x16, w_bf16, out, T, (int) K);
+    else
+        pf_shared_gate_bf16_kernel<false><<<nb, 256, 0, (cudaStream_t) stream>>>(x16, w_bf16, out, T, (int) K);
+    check("pf_shared_gate_bf16");
+    return true;
+}
+
+bool pf_hc_inject_bf16(const uint16_t* x16, int64_t ldx, bool x_is_f16, const uint16_t* w_bf16, float* out,
+                       int64_t T, int64_t K, void* stream) {
+    if (T <= 0 || K <= 0 || (K & 511) != 0 || ldx < K || (ldx & 1) != 0 || !x16 || !w_bf16 || !out ||
+        ((uintptr_t) x16 & 3u) != 0 || ((uintptr_t) w_bf16 & 15u) != 0)
+        return false;
+    if (x_is_f16)
+        pf_hc_inject_bf16_kernel<true><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(x16, ldx, w_bf16, out, (int) K);
+    else
+        pf_hc_inject_bf16_kernel<false><<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(x16, ldx, w_bf16, out, (int) K);
+    check("pf_hc_inject_bf16");
+    return true;
+}
+
+bool pf_gdn_ab_gates_bf16(const uint16_t* x16, bool x_is_f16, const uint16_t* wa_bf16, const uint16_t* wb_bf16,
+                          const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, int64_t K,
+                          int64_t HV, void* stream) {
+    if (T <= 0 || K <= 0 || (K & 511) != 0 || HV <= 0 || !x16 || !wa_bf16 || !wb_bf16 || !dt || !ssm_a || !gate ||
+        !beta || ((uintptr_t) x16 & 3u) != 0 || ((uintptr_t) wa_bf16 & 15u) != 0 || ((uintptr_t) wb_bf16 & 15u) != 0)
+        return false;
+    const dim3 grid((unsigned) ((2 * HV + 3) / 4), (unsigned) ((T + 3) / 4));
+    if (x_is_f16)
+        pf_gdn_ab_gates_bf16_kernel<true><<<grid, 256, 0, (cudaStream_t) stream>>>(
+            x16, wa_bf16, wb_bf16, dt, ssm_a, gate, beta, T, (int) K, (int) HV);
+    else
+        pf_gdn_ab_gates_bf16_kernel<false><<<grid, 256, 0, (cudaStream_t) stream>>>(
+            x16, wa_bf16, wb_bf16, dt, ssm_a, gate, beta, T, (int) K, (int) HV);
+    check("pf_gdn_ab_gates_bf16");
+    return true;
+}
+#else
+bool pf_shared_gate_bf16(const uint16_t*, bool, const uint16_t*, float*, int64_t, int64_t, void*) { return false; }
+bool pf_hc_inject_bf16(const uint16_t*, int64_t, bool, const uint16_t*, float*, int64_t, int64_t, void*) { return false; }
+bool pf_gdn_ab_gates_bf16(const uint16_t*, bool, const uint16_t*, const uint16_t*, const float*, const float*,
+                          float*, float*, int64_t, int64_t, int64_t, void*) { return false; }
+#endif
+
 }  // namespace strata::prefill

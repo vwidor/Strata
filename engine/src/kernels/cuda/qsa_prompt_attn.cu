@@ -2466,27 +2466,31 @@ __device__ __forceinline__ float pa906_load_v1(const QsaAttnPools& p, long long 
     }
 }
 
-template <bool KV_V4>
+template <bool KV_V4, bool FUSE_GATE = false, bool DO_FWHT = false>
 __global__ void __launch_bounds__(PA906_THREADS, 2)
 prompt_attn_gfx906_kernel(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
                           const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale,
-                          float* __restrict__ attn, int cap) {
+                          float* __restrict__ attn, int cap, const float* __restrict__ qf = nullptr,
+                          uint16_t* __restrict__ o16 = nullptr, int64_t ld16 = 0) {
     const int qi = blockIdx.x, kvh = blockIdx.y;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     q += (size_t) qi * (size_t) (n_kv_heads * G) * HD;
     ids += (size_t) qi * (size_t) cap;
     const int n_ids = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
-    attn += (size_t) qi * (size_t) (n_kv_heads * G) * HD;
+    if constexpr (!FUSE_GATE) attn += (size_t) qi * (size_t) (n_kv_heads * G) * HD;
 
     __shared__ __align__(16) pa906_f16x2 sq_h[G][HD / 2];          // 6 KiB (power-of-2 prescaled FP16 Q)
-    __shared__ __align__(16) float spt[PA906_CHUNK][G];            // 3 KiB (cell-major scores)
+    __shared__ __align__(16) float spt[PA906_CHUNK][G];            // 3 KiB (cell-major scores; reused for FWHT in epilogue)
     __shared__ __align__(16) pa906_f16x2 spt_h[PA906_CHUNK / 2][G]; // 1.5 KiB (paired cell probabilities)
     __shared__ long long srow[PA906_CHUNK];                        // 512 B
     __shared__ float sm[G], sl[G], srescale[G], sqmax[PA906_WARPS]; // 176 B
 
     if (n_ids <= 0) {
 #pragma unroll
-        for (int h = 0; h < G; ++h) attn[(size_t) (kvh * G + h) * HD + t] = 0.0f;
+        for (int h = 0; h < G; ++h) {
+            if constexpr (FUSE_GATE) o16[(size_t) qi * (size_t) ld16 + (size_t) (kvh * G + h) * HD + t] = 0u;
+            else attn[(size_t) (kvh * G + h) * HD + t] = 0.0f;
+        }
         return;
     }
     // Power-of-2 prescale Q so max|Q * qup| in [0.5, 1.0]: exact exponent shift, zero FP16 overflow/underflow
@@ -2652,10 +2656,46 @@ prompt_attn_gfx906_kernel(const float* __restrict__ q, QsaAttnPools p, const int
         __syncthreads();
     }
 
+    if constexpr (!FUSE_GATE) {
 #pragma unroll
-    for (int h = 0; h < G; ++h) {
-        const float inv_l = sl[h] > 0.0f ? (1.0f / sl[h]) : 0.0f;
-        attn[(size_t) (kvh * G + h) * HD + t] = acc[h] * inv_l;
+        for (int h = 0; h < G; ++h) {
+            const float inv_l = sl[h] > 0.0f ? (1.0f / sl[h]) : 0.0f;
+            attn[(size_t) (kvh * G + h) * HD + t] = acc[h] * inv_l;
+        }
+    } else {
+        float* const sf = &spt[0][0];   // 3 KiB >= 1 KiB (256 floats): zero extra LDS
+        const float* const qf_row = qf + (size_t) qi * (size_t) (n_kv_heads * G * 2 * HD);
+        uint16_t* const o_row = o16 + (size_t) qi * (size_t) ld16;
+        for (int h = 0; h < G; ++h) {
+            const float inv_l = sl[h] > 0.0f ? (1.0f / sl[h]) : 0.0f;
+            float val = acc[h] * inv_l;
+            if constexpr (DO_FWHT) {
+                val *= 0.0625f;   // 1 / sqrt(256)
+#pragma unroll
+                for (int stride = 1; stride < 64; stride <<= 1) {
+                    const float v2 = __shfl_xor(val, stride, 64);
+                    val = ((t & stride) == 0) ? (val + v2) : (v2 - val);
+                }
+                sf[t] = val;
+                __syncthreads();
+                {
+                    const float v2 = sf[t ^ 64];
+                    val = ((t & 64) == 0) ? (val + v2) : (v2 - val);
+                }
+                __syncthreads();
+                sf[t] = val;
+                __syncthreads();
+                {
+                    const float v2 = sf[t ^ 128];
+                    val = ((t & 128) == 0) ? (val + v2) : (v2 - val);
+                }
+                __syncthreads();
+            }
+            const int gh = kvh * G + h;
+            const float gv = qf_row[(size_t) gh * (2 * HD) + HD + t];
+            const float outv = val * (1.0f / (1.0f + __expf(-gv)));
+            o_row[(size_t) gh * HD + t] = __half_as_ushort(__float2half_rn(outv));
+        }
     }
 }
 
@@ -2667,14 +2707,32 @@ bool pa906_enabled() {
     return on;
 }
 
+bool pa906_fuse_epilogue_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_QSA_PA_FUSE_EPILOGUE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
 template <bool KV_V4>
 bool launch_gfx906(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-                   const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+                   const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st,
+                   const float* qf = nullptr, uint16_t* o16 = nullptr, int64_t ld16 = 0, bool apply_fwht = false) {
     if (n_q <= 0 || n_q > 65535) return false;
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_q, (unsigned) s.n_head_kv);
-    prompt_attn_gfx906_kernel<KV_V4><<<grid, PA906_THREADS, 0, st>>>(
-        q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, attn, (int) cap);
+    if (qf != nullptr && o16 != nullptr) {
+        if (apply_fwht)
+            prompt_attn_gfx906_kernel<KV_V4, true, true><<<grid, PA906_THREADS, 0, st>>>(
+                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, nullptr, (int) cap, qf, o16, ld16);
+        else
+            prompt_attn_gfx906_kernel<KV_V4, true, false><<<grid, PA906_THREADS, 0, st>>>(
+                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, nullptr, (int) cap, qf, o16, ld16);
+    } else {
+        prompt_attn_gfx906_kernel<KV_V4, false, false><<<grid, PA906_THREADS, 0, st>>>(
+            q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, attn, (int) cap);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_prompt_attn_batch (gfx906): %s\n", cudaGetErrorString(e));
@@ -2766,17 +2824,29 @@ bool qsa_hip_wmma_active() { return qsa_prompt_attn_matrix_cores_requested(); }
 
 bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                                  int64_t cap, const QsaShapes& s, const float* qf, uint16_t* o16, int64_t ld16, int64_t n_q,
-                                 void* stream) {
-#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+                                 void* stream, bool apply_fwht) {
+#if defined(STRATA_HIP_GFX906)
     if (n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
+    if (pa906_enabled() && pa906_fuse_epilogue_enabled() && pools.k_q != nullptr && pools.k_scale != nullptr &&
+        pools.k_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv && cap > 0 && ids && steps &&
+        pools.page_table) {
+        if (pools.v_q4 != nullptr)
+            return launch_gfx906<true>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16, apply_fwht);
+        if (pools.v_q != nullptr && pools.v_scale != nullptr)
+            return launch_gfx906<false>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16, apply_fwht);
+    }
+    return false;
+#elif defined(__HIPCC__)
+    if (apply_fwht || n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
         return launch_wmma(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);
-#else
-    (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) qf; (void) o16; (void) ld16; (void) n_q; (void) stream;
-#endif
     return false;
+#else
+    (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) qf; (void) o16; (void) ld16; (void) n_q; (void) stream; (void) apply_fwht;
+    return false;
+#endif
 }
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,

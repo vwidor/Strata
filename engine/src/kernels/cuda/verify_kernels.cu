@@ -78,6 +78,21 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(float* hist, const
     gdn_conv_l2_body(blockIdx.x, blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
 }
 
+struct GdnConvMap {
+    float* hist[8] = {};
+    int first[8] = {};
+    int local_t[8] = {};
+};
+
+__global__ void __launch_bounds__(S) gdn_conv_l2_groups_kernel(GdnConvMap map, const float* __restrict__ qkv,
+                                                               const float* __restrict__ w, float* __restrict__ h,
+                                                               int C, int qk_heads, float eps, bool commit) {
+    const int row = (int) blockIdx.y;
+    const int f = map.first[row];
+    gdn_conv_l2_body(blockIdx.x, map.local_t[row], map.hist[row], qkv + (size_t) f * C, w, h + (size_t) f * C,
+                     C, qk_heads, eps, 0, commit);
+}
+
 __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
                                        const int32_t* __restrict__ n_keep) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -847,10 +862,11 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
     check("row_top_prob");
 }
 
-#if !defined(STRATA_HIP_GFX906)   // wave32 kernels (CUDA and RDNA HIP; wave64 gfx906 keeps the one-block kernels)
 namespace {
 
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
+constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 16;   // wave64 gfx906: 4 waves/block argmax, 1 wave/block top_prob
+#elif defined(__HIPCC__)
 constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 32;   // RDNA HIP (#3264): single-warp blocks, no block barrier
 #else
 constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 8;
@@ -863,6 +879,28 @@ __device__ __forceinline__ void arg_take(float ov, int oi, float& bv, int& bi) {
 
 // a block's (value, index) pick, in thread 0; `none` is the index of no candidate
 __device__ __forceinline__ void arg_block(float& bv, int& bi, int none) {
+#if defined(STRATA_HIP_GFX906)
+    __shared__ float sv[4];
+    __shared__ int si[4];
+    for (int off = 32; off > 0; off >>= 1) {
+        const float ov = __shfl_down(bv, off, 64);
+        const int oi = __shfl_down(bi, off, 64);
+        arg_take(ov, oi, bv, bi);
+    }
+    const int wave = (int) (threadIdx.x >> 6), lane = (int) (threadIdx.x & 63);
+    if (lane == 0) { sv[wave] = bv; si[wave] = bi; }
+    __syncthreads();
+    if (wave == 0) {
+        const int nw = (int) (blockDim.x >> 6);
+        bv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
+        bi = lane < nw ? si[lane] : none;
+        for (int off = 2; off > 0; off >>= 1) {
+            const float ov = __shfl_down(bv, off, 64);
+            const int oi = __shfl_down(bi, off, 64);
+            arg_take(ov, oi, bv, bi);
+        }
+    }
+#else
     __shared__ float sv[32];
     __shared__ int si[32];
     for (int off = 16; off > 0; off >>= 1) {
@@ -883,20 +921,22 @@ __device__ __forceinline__ void arg_block(float& bv, int& bi, int none) {
             arg_take(ov, oi, bv, bi);
         }
     }
+#endif
 }
 
 // A row's scratch, whatever the launch's row count (one scratch serves windows of every size): its counter, then
-// the blocks' values and indices.
+// the blocks' values, indices, and optional non-finite flags.
 struct ArgRow {
     unsigned counter;
     unsigned pad[3];
     float v[kArgMaxBlocks];
     int i[kArgMaxBlocks];
+    uint32_t nf[kArgMaxBlocks];
 };
 
 // grid (blocks, rows): block b scans [b * per_block, +per_block) of its row
 __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int per_block, ArgRow* __restrict__ rows,
-                                   int32_t* out) {
+                                   int32_t* out, uint32_t* nf_flags) {
     const int row = (int) blockIdx.y, b = (int) blockIdx.x, nb = (int) gridDim.x;
     unsigned* counter = &rows[row].counter;
     float* pv = rows[row].v;
@@ -905,9 +945,15 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     const int lo = b * per_block, hi = min(n, lo + per_block);
     float bv = __int_as_float(0xff800000);   // -inf
     int bi = n;
+    int bad = 0;
     for (int v = lo + (int) threadIdx.x; v < hi; v += (int) blockDim.x) {
         const float s = l[v];
+        if (nf_flags != nullptr) bad |= (__float_as_uint(s) & 0x7f800000u) == 0x7f800000u;
         if (s > bv) { bv = s; bi = v; }
+    }
+    if (nf_flags != nullptr) {
+        bad = __syncthreads_or(bad);
+        if (threadIdx.x == 0) rows[row].nf[b] = bad ? 1u : 0u;
     }
     arg_block(bv, bi, n);
     __shared__ bool last;
@@ -920,6 +966,12 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     __syncthreads();
     if (!last) return;
     __threadfence();
+    if (nf_flags != nullptr) {
+        int rb = ((int) threadIdx.x < nb) ? (int) ((volatile const uint32_t*) rows[row].nf)[threadIdx.x] : 0;
+        rb = __syncthreads_or(rb);
+        if ((int) threadIdx.x < kNonfiniteBlocks)
+            nf_flags[row * kNonfiniteBlocks + (int) threadIdx.x] = (threadIdx.x == 0 && rb) ? 1u : 0u;
+    }
     bv = __int_as_float(0xff800000);
     bi = n;
     if ((int) threadIdx.x < nb) {
@@ -933,7 +985,7 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     }
 }
 
-// a row's top-probability scratch: its counter, then its 32 warps' sums
+// a row's top-probability scratch: its counter, then its warps' sums
 struct TopRow {
     unsigned counter;
     unsigned pad[3];
@@ -953,6 +1005,17 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
 #pragma unroll 8
 #endif
     for (int i = vt; i < n_vocab; i += 1024) s += __expf(l[i] - m);
+#if defined(STRATA_HIP_GFX906)
+    for (int o = 32; o > 0; o >>= 1) s += __shfl_xor(s, o, 64);
+    if ((threadIdx.x & 63) == 0) parts[vt >> 6] = s;
+    __threadfence();
+    if (blockDim.x > 64) __syncthreads();
+    if (threadIdx.x != 0) return;
+    if (atomicAdd(&rows[row].counter, 1u) != (unsigned) (gridDim.x - 1)) return;
+    __threadfence();
+    float tot = 0.0f;
+    for (int w = 0; w < 16; ++w) tot += ((volatile const float*) parts)[w];
+#else
     for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
     if ((threadIdx.x & 31) == 0) parts[vt >> 5] = s;
     __threadfence();
@@ -962,21 +1025,138 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
     __threadfence();
     float tot = 0.0f;
     for (int w = 0; w < 32; ++w) tot += ((volatile const float*) parts)[w];
+#endif
     probs[row] = 1.0f / tot;
     rows[row].counter = 0;
+}
+
+// One-block 1024-thread on-GPU logprobs summary (STRATA_GPU_LOGPROBS=1).
+__global__ void row_logprobs_gpu_kernel(const float* __restrict__ logits, int n_vocab, int32_t token, int top_k,
+                                        const int32_t* __restrict__ allowed_dev, int n_allowed,
+                                        float* __restrict__ allowed_vals_dev, RowLogprobOut* __restrict__ out) {
+#if defined(STRATA_HIP_GFX906)
+    constexpr int kW = 64, kNW = 16;
+#else
+    constexpr int kW = 32, kNW = 32;
+#endif
+    __shared__ float sv[kNW];
+    __shared__ int si[kNW];
+    __shared__ double sd[1024];
+    __shared__ float s_mx;
+    __shared__ int32_t s_picked[24];
+    const int tid = (int) threadIdx.x;
+    const int wave = tid / kW, lane = tid % kW;
+
+    auto reduce_arg = [&](float& bv, int& bi) {
+#if defined(STRATA_HIP_GFX906)
+        for (int o = 32; o > 0; o >>= 1) {
+            const float ov = __shfl_down(bv, o, 64);
+            const int oi = __shfl_down(bi, o, 64);
+            arg_take(ov, oi, bv, bi);
+        }
+#else
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_down_sync(0xffffffffu, bi, o);
+            arg_take(ov, oi, bv, bi);
+        }
+#endif
+        if (lane == 0) { sv[wave] = bv; si[wave] = bi; }
+        __syncthreads();
+        if (wave == 0) {
+            bv = lane < kNW ? sv[lane] : __int_as_float(0xff800000);
+            bi = lane < kNW ? si[lane] : n_vocab;
+#if defined(STRATA_HIP_GFX906)
+            for (int o = 8; o > 0; o >>= 1) {
+                const float ov = __shfl_down(bv, o, 64);
+                const int oi = __shfl_down(bi, o, 64);
+                arg_take(ov, oi, bv, bi);
+            }
+#else
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_down_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_down_sync(0xffffffffu, bi, o);
+                arg_take(ov, oi, bv, bi);
+            }
+#endif
+        }
+    };
+
+    // Pass 1: global max and top-0 pick
+    float bv = __int_as_float(0xff800000);
+    int bi = n_vocab;
+    for (int v = tid; v < n_vocab; v += 1024) {
+        const float s = logits[v];
+        if (s > bv) { bv = s; bi = v; }
+    }
+    reduce_arg(bv, bi);
+    if (tid == 0) {
+        s_mx = bv;
+        s_picked[0] = bi < n_vocab ? bi : 0;
+        out->tok_logit = (token >= 0 && token < n_vocab) ? logits[token] : __int_as_float(0xff800000);
+        out->top_k = top_k;
+        if (top_k > 0) { out->top_id[0] = s_picked[0]; out->top_val[0] = bv; }
+    }
+    __syncthreads();
+    const double mx = (double) s_mx;
+
+    // Pass 2: FP64 sum(exp(v - mx)) matching host emit_lp_line
+    double se = 0.0;
+    for (int v = tid; v < n_vocab; v += 1024) se += exp((double) logits[v] - mx);
+    sd[tid] = se;
+    __syncthreads();
+    for (int s = 512; s > 0; s >>= 1) {
+        if (tid < s) sd[tid] += sd[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) out->lse = mx + log(sd[0]);
+
+    if (n_allowed > 0 && allowed_dev != nullptr && allowed_vals_dev != nullptr) {
+        for (int i = tid; i < n_allowed; i += 1024) {
+            const int32_t id = allowed_dev[i];
+            allowed_vals_dev[i] = (id >= 0 && id < n_vocab) ? logits[id] : __int_as_float(0xff800000);
+        }
+        return;
+    }
+
+    // Remaining top-K picks (L2-resident logits, k <= 24)
+    for (int j = 1; j < top_k; ++j) {
+        float jv = __int_as_float(0xff800000);
+        int ji = n_vocab;
+        for (int v = tid; v < n_vocab; v += 1024) {
+            bool skip = false;
+            for (int p = 0; p < j; ++p) skip |= (s_picked[p] == v);
+            if (!skip) {
+                const float s = logits[v];
+                if (s > jv) { jv = s; ji = v; }
+            }
+        }
+        reduce_arg(jv, ji);
+        if (tid == 0) {
+            s_picked[j] = ji < n_vocab ? ji : 0;
+            out->top_id[j] = s_picked[j];
+            out->top_val[j] = jv;
+        }
+        __syncthreads();
+    }
 }
 
 }  // namespace
 
 uint64_t argmax_rows_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(ArgRow); }
 
-void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream) {
+void argmax_rows_nf(const float* logits, int n_rows, int n, void* scratch, int32_t* out, uint32_t* nf_flags,
+                    void* stream) {
     if (n_rows <= 0) return;
     const int nb = std::min(kArgMaxBlocks, std::max(1, (n + 4095) / 4096));
     const int per_block = (n + nb - 1) / nb;
     argmax_rows_kernel<<<dim3((unsigned) nb, (unsigned) n_rows), kArgThreads, 0, (cudaStream_t) stream>>>(
-        logits, n, per_block, (ArgRow*) scratch, out);
+        logits, n, per_block, (ArgRow*) scratch, out, nf_flags);
     check("argmax_rows");
+}
+
+void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream) {
+    argmax_rows_nf(logits, n_rows, n, scratch, out, nullptr, stream);
 }
 
 uint64_t row_top_prob_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(TopRow); }
@@ -988,18 +1168,16 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
         logits, n_vocab, ids, probs, (TopRow*) scratch);
     check("row_top_prob_split");
 }
-#else
-uint64_t argmax_rows_scratch_bytes(int) { return 0; }
-void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
-    std::fprintf(stderr, "argmax_rows: not built for this backend\n");
-    std::exit(1);
+
+bool row_logprobs_gpu(const float* logits, int n_vocab, int32_t token, int top_k, const int32_t* allowed_dev,
+                      int n_allowed, float* allowed_vals_dev, RowLogprobOut* out_dev, void* stream) {
+    if (logits == nullptr || out_dev == nullptr || n_vocab <= 0 || top_k < 0 || top_k > 24) return false;
+    row_logprobs_gpu_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
+        logits, n_vocab, token, n_allowed > 0 ? 0 : top_k, allowed_dev, n_allowed, allowed_vals_dev, out_dev);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return false;
+    return true;
 }
-uint64_t row_top_prob_scratch_bytes(int) { return 0; }
-void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void*,
-                        void* stream) {
-    row_top_prob(logits, n_rows, n_vocab, ids, probs, stream);
-}
-#endif
 
 namespace {
 // grid (kNonfiniteBlocks, rows): block b of row t scans [b * per_block, +per_block) and writes its own word.  The
@@ -1026,7 +1204,11 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
 
 bool multi_block_head_ops() {
 #if defined(STRATA_HIP_GFX906)
-    return false;
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HIP_FAST_HEAD");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
 #else
     static const int env = [] {
         const char* v = std::getenv("STRATA_MULTI_BLOCK_ARGMAX");
@@ -1050,7 +1232,11 @@ bool multi_block_head_ops() {
 
 bool argmax_rows_wanted() {
 #if defined(STRATA_HIP_GFX906)
-    return false;
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HIP_FAST_HEAD");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
 #else
     static const int env = [] {
         const char* v = std::getenv("STRATA_ARGMAX_ROWS");
@@ -1141,6 +1327,32 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
     gdn_conv_l2_multi_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
         const_cast<float*>(history), qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit);
     check("gdn_conv_l2_multi");
+}
+
+void gdn_conv_l2_groups(const GdnGroups& groups, int64_t conv_off, const float* qkv, const float* conv_w, float* h,
+                        int channels, int qk_heads, float eps, bool commit, void* stream) {
+    if (groups.n < 1 || groups.n > 8 || !qkv || !conv_w || !h || channels % S != 0) {
+        std::fprintf(stderr, "gdn_conv_l2_groups: invalid arguments\n");
+        std::exit(1);
+    }
+    GdnConvMap map;
+    int total_rows = 0;
+    for (int i = 0; i < groups.n; ++i) {
+        if (!groups.state[i] || groups.ntok[i] < 1 || (commit && groups.ntok[i] != 1) || total_rows + groups.ntok[i] > 8) {
+            std::fprintf(stderr, "gdn_conv_l2_groups: invalid group %d\n", i);
+            std::exit(1);
+        }
+        float* const hist = groups.state[i] + conv_off;
+        for (int u = 0; u < groups.ntok[i]; ++u) {
+            map.hist[total_rows] = hist;
+            map.first[total_rows] = groups.first[i];
+            map.local_t[total_rows] = u;
+            ++total_rows;
+        }
+    }
+    gdn_conv_l2_groups_kernel<<<dim3((unsigned) (channels / S), (unsigned) total_rows), S, 0, (cudaStream_t) stream>>>(
+        map, qkv, conv_w, h, channels, qk_heads, eps, commit);
+    check("gdn_conv_l2_groups");
 }
 
 void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,

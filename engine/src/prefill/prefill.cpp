@@ -2238,6 +2238,18 @@ bool pf_hc_region() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_HC_REGION"); return v != nullptr && std::atoi(v) != 0; }();
     return on && !gr_unfused();
 }
+// Opt-in STRATA_PF_MIXED_ALIAS=1: on FP16 prompt path without BF16x2 low half, mixed_bf and mixed_h hold identical
+// FP16 activations, so alias mixed_h = mixed_bf to save 10 MiB/chunk and eliminate duplicate stores in gr_mix_r.
+bool pf_mixed_alias() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_MIXED_ALIAS"); return v != nullptr && v[0] != '\0' && v[0] != '0'; }();
+    return on;
+}
+// Opt-in STRATA_PF_TINY_WAVE=1 (gfx906): wave64 BF16 GEMV/GEMM kernels for N=1 shared_gate, N=4 hc_inject, and
+// fused N=96 ssm_alpha+beta+gates, bypassing rocBLAS tiny-N launch overhead.
+bool pf_tiny_wave() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_TINY_WAVE"); return v != nullptr && v[0] != '\0' && v[0] != '0'; }();
+    return on;
+}
 uint64_t hc_set_bytes(size_t T, bool f16_io) {
     Alloc a; a.count_only = true; bool ok = true;
     a.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); a.take<float>(T * LR, ok); a.take<uint16_t>(T * LR, ok);
@@ -2726,7 +2738,8 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
-    m.mixed_h = o.take<uint16_t>(T * N, ok);
+    const bool alias_mixed = pf_mixed_alias() && m.f16_io && !bf16x2(m.f16_io);
+    m.mixed_h = alias_mixed ? m.mixed_bf : o.take<uint16_t>(T * N, ok);
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
     m.bo = m.emb;
     if (!hcr && bf16x2_hc(m.f16_io)) { m.xn16_lo = o.take<uint16_t>(T * D, ok); m.lo16_lo = o.take<uint16_t>(T * LR, ok); }
@@ -3694,9 +3707,10 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     }
     const bool hcr = pf_hc_region();
     if (!hcr) { o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok); f(T * D); }
-    f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok); o.take<uint16_t>(T * N, ok);
-    if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     const bool f16_io = prompt_f16();   // the current device's mode (the stage's), as Prefill::init will decide it
+    f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok);
+    if (!(pf_mixed_alias() && f16_io && !bf16x2(f16_io))) o.take<uint16_t>(T * N, ok);
+    if (!emb_reuse_account()) f(T * N);   // bo: aliases emb in carve; still counted unless STRATA_EMB_REUSE_ACCOUNT=1
     if (!hcr && bf16x2_hc(f16_io)) { o.take<uint16_t>(T * D, ok); o.take<uint16_t>(T * LR, ok); }
     if (bf16x2(f16_io)) o.take<uint16_t>(T * N, ok);
     o.take<int32_t>(T * strata::kernels::kStepCount, ok);
@@ -5089,13 +5103,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
                 pt.mark(kPfHcInj, cs);
-                if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                const bool inj_wave = !hcd && pf_tiny_wave() && wi->q8_scale == nullptr && !m.xn16_lo &&
+                                      wi->kind == core::WeightKind::Bf16InF32 && wi->data != nullptr &&
+                                      wi->ne0 == D && wi->ne1 == HC &&
+                                      pf_hc_inject_bf16(m.xn16, ldx, m.f16_io || xf16, (const uint16_t*) wi->data, m.inj, T, D, m.cs);
+                if (!hcd && !inj_wave && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 pt.mark(kPfHcMix, cs);
+                uint16_t* const mh_dst = (m.mixed_h == m.mixed_bf) ? nullptr : m.mixed_h;
                 if (upmixed) {
                 } else if (gr_unfused()) {
-                    gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
+                    gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, mh_dst, m.mixed_bf_lo);
                 } else {
-                    gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
+                    gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, mh_dst,
                              m.mixed_bf_lo);
                 }
 
@@ -5123,10 +5142,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }();
                     if ((!kva_state_only || kva_gdn_norm) &&
                         !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
-                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
-                    gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    const bool ab_wave = pf_tiny_wave() && !m.mixed_bf_lo &&
+                                         wa->kind == core::WeightKind::Bf16InF32 && wb->kind == core::WeightKind::Bf16InF32 &&
+                                         wa->data != nullptr && wb->data != nullptr && wa->ne0 == N && wa->ne1 == HV &&
+                                         wb->ne0 == N && wb->ne1 == HV &&
+                                         pf_gdn_ab_gates_bf16(m.mixed_bf, m.f16_io, (const uint16_t*) wa->data,
+                                                              (const uint16_t*) wb->data, (const float*) wdt->data,
+                                                              (const float*) wsa->data, m.gate, m.beta, T, N, HV, m.cs);
+                    if (!ab_wave) {
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    } else {
+                        pt.mark(kPfGdnConv, cs);
+                    }
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     bool fused_gdn = false;
 #if defined(STRATA_USE_HIP)
@@ -5475,9 +5505,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    const bool gated = !old_attn && !st.kv_rot && !st.kv_hybrid && qsa_fuse_gate() &&
+                    const bool need_fwht = st.kv_rot || st.kv_hybrid;
+                    const bool gated = !old_attn && qsa_fuse_gate() &&
                                        strata::kernels::qsa_prompt_attn_batch_gated(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.Qf,
-                                                                                    m.attn_h, ld_a > 0 ? ld_a : ZV, T, m.cs);
+                                                                                    m.attn_h, ld_a > 0 ? ld_a : ZV, T, m.cs, need_fwht);
                     {
                         static bool told = false;   // once: which of the two fusions this run took
                         if (!told) {
@@ -5504,7 +5535,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
                                                                    s, m.attn_scratch, m.attn + t0 * kQW, nb, m.cs);
                         }
-                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * kNHead, m.cs);
+                    if (!gated && need_fwht) strata::kernels::fwht256_inplace_cuda(m.attn, T * kNHead, m.cs);
                     pt.mark(kPfQsa, cs);
                     if (!gated) gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
@@ -5588,8 +5619,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        const bool sg_wave = pf_tiny_wave() && !m.mixed_bf_lo && wgi->data != nullptr &&
+                                             pf_shared_gate_bf16(m.mixed_bf, m.f16_io, (const uint16_t*) wgi->data, m.sg, T, N, m.cs);
+                        if (!sg_wave) {
+                            m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                            if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        }
                         return true;
                     };
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
@@ -9514,8 +9549,12 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                         swiglu_pair(m.sgate, m.sup, m.sh_h, T, cs);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        const bool sg_wave = pf_tiny_wave() && !m.mixed_bf_lo && wgi->data != nullptr &&
+                                             pf_shared_gate_bf16(m.mixed_bf, m.f16_io, (const uint16_t*) wgi->data, m.sg, T, N, m.cs);
+                        if (!sg_wave) {
+                            m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                            if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        }
                         moe_shared_init(m.shared, m.sg, acc, T, cs);
                         break;   // the FFN half's write waits for the experts (the next layer, or the final pass)
                     }

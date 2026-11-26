@@ -180,4 +180,16 @@ void round_f16(const float* x, float* y, int64_t n, void* stream);
 /// Expert blob -> FP16 (Q2_0 values are exact in FP16).
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 
+// ---- Opt-in STRATA_PF_TINY_WAVE=1 (gfx906 wave64): tiny-N BF16 GEMMs bypassing rocBLAS overhead
+/// Shared expert scalar gate (N=1, K=2560): out[t] = dot(x16[t,:], w_bf16[:]).
+bool pf_shared_gate_bf16(const uint16_t* x16, bool x_is_f16, const uint16_t* w_bf16, float* out, int64_t T,
+                         int64_t K, void* stream);
+/// Hyper-connection inject (N=4, K=10240): out[t,c] = dot(x16[t,:], w_bf16[c,:]).
+bool pf_hc_inject_bf16(const uint16_t* x16, int64_t ldx, bool x_is_f16, const uint16_t* w_bf16, float* out,
+                       int64_t T, int64_t K, void* stream);
+/// Fused GDN alpha + beta + gates (N=2*HV=96, K=2560): writes gate[T,HV] and beta[T,HV] directly from x16.
+bool pf_gdn_ab_gates_bf16(const uint16_t* x16, bool x_is_f16, const uint16_t* wa_bf16, const uint16_t* wb_bf16,
+                          const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, int64_t K,
+                          int64_t HV, void* stream);
+
 }  // namespace strata::prefill

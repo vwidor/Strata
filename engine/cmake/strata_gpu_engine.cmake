@@ -244,22 +244,36 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # plan v0.3 P6: the GGUF block layouts and codebook grids for the i-quant formats (third_party/ggml/ggml-common.h forwards to include/strata/quant/strata-quant-common.h)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
+  option(STRATA_HIP_FAST_MATH "Enable CUDA-equivalent fast-math flags on native_*.cu HIP kernels (opt-in)" OFF)
+  set(_strata_native_math_sources
+    src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
+    src/kernels/cuda/native_gr_norm.cu
+    src/kernels/cuda/native_moe.cu
+    src/kernels/cuda/native_gdn.cu
+    src/kernels/cuda/native_gr_postops.cu
+    src/kernels/cuda/native_router.cu
+    src/kernels/cuda/native_gdn_preprocess.cu
+    src/kernels/cuda/native_qsa.cu
+    src/kernels/cuda/native_rope.cu
+    src/kernels/cuda/native_ple_postops.cu
+    src/kernels/cuda/native_flash_attn.cu
+    src/kernels/cuda/native_qsa_indexer.cu
+    src/kernels/cuda/native_qsa_score.cu)
   if(STRATA_ENABLE_CUDA)
-    set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
-      src/kernels/cuda/native_gr_norm.cu
-      src/kernels/cuda/native_moe.cu
-      src/kernels/cuda/native_gdn.cu
-      src/kernels/cuda/native_gr_postops.cu
-      src/kernels/cuda/native_router.cu
-      src/kernels/cuda/native_gdn_preprocess.cu
-      src/kernels/cuda/native_qsa.cu
-      src/kernels/cuda/native_rope.cu
-      src/kernels/cuda/native_ple_postops.cu
-      src/kernels/cuda/native_flash_attn.cu
-      src/kernels/cuda/native_qsa_indexer.cu
-      src/kernels/cuda/native_qsa_score.cu
-      PROPERTIES COMPILE_OPTIONS "$<IF:$<BOOL:${STRATA_HIP_GFX906}>,,--use_fast_math>")
+    if(STRATA_HIP_GFX906)
+      if(STRATA_HIP_FAST_MATH)
+        set_source_files_properties(${_strata_native_math_sources}
+          PROPERTIES COMPILE_OPTIONS "-fapprox-func;-fcuda-flush-denormals-to-zero;-fno-math-errno")
+      endif()
+    else()
+      set_source_files_properties(${_strata_native_math_sources}
+        PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+    endif()
   elseif(STRATA_ENABLE_HIP)
+    if(STRATA_HIP_FAST_MATH)
+      set_source_files_properties(${_strata_native_math_sources}
+        PROPERTIES COMPILE_OPTIONS "-fapprox-func;-fcuda-flush-denormals-to-zero;-fno-math-errno")
+    endif()
     # Keep Q8_K's multiply and magic-bias rounding as separate FP32 operations on HIP; contraction to an
     # FMA changes tie results. The embedding gather also relies on separately rounded operations.
     set_source_files_properties(src/kernels/cuda/elementwise.cu src/kernels/cuda/quantize_act.cu

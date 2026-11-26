@@ -107,6 +107,9 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
                       bool slim_scratch = false, SharedKvPool* shared_kv = nullptr);
 /// Ensure `s` has physical chunks mapped in its SharedKvPool for at least `need_cells` cells (0-ns fast path if covered).
 bool session_shared_kv_ensure(SessionState& s, const ModelGeometry& g, int64_t need_cells, std::string& err);
+/// Zero-copy transfer of SharedKvPool chunk ownership (plus page_table and idx_pooled up to `upto`) from `src` to `dst`.
+/// Both sessions must belong to the same SharedKvPool. Releases `dst`'s previous chunks and empties `src`.
+bool session_shared_kv_move(SessionState& dst, SessionState& src, const ModelGeometry& g, int64_t upto, std::string& err);
 /// Release all physical chunks held by `s` back to its SharedKvPool.
 void session_shared_kv_release(SessionState& s);
 /// Trim physical chunks past `keep_cells` back to `s`'s SharedKvPool.

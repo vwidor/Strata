@@ -384,4 +384,172 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
+
+namespace {
+// Opt-in STRATA_ROUTER_PLAN_FUSE=1: fuses route_multi (n_tok in 1..8, 512 experts, top-10) and resident_plan<128>
+// into one 256-thread block on all-resident layers. Every token's softmax/top-10 and the plan's grouping order are
+// bitwise identical to running native_router_top10_multi followed by resident_plan.
+__launch_bounds__(256, 1)
+__global__ void route_top10_plan_fused_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                                              float* __restrict__ weights, int n_tok,
+                                              const int32_t* __restrict__ res, int n_expert,
+                                              const uint8_t* cache_base, const unsigned long long* slot_off,
+                                              long long blob, int32_t* __restrict__ pl, long long capx,
+                                              volatile uint32_t* plan_err) {
+    __shared__ int32_t s_ids[128];
+    __shared__ int32_t s_excl[128];
+    __shared__ int32_t s_wsum[4];
+    __shared__ int s_bad;
+
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 31;
+    const int tk = tid >> 5;   // 0..7 (32-lane logical warp per token)
+    if (tid == 0) s_bad = 0;
+
+    if (tk < n_tok) {
+        const float* l = logits + (size_t) tk * 512;
+        int32_t* id_out = ids + (size_t) tk * 10;
+        float* w_out = weights + (size_t) tk * 10;
+        float values[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) values[i] = l[lane + i * 32];
+        float maximum = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+        maximum = warp_max(maximum);
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] = expf(values[i] - maximum);
+            sum += values[i];
+        }
+        const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] *= reciprocal;
+            if (__isnanf(values[i])) values[i] = -FLT_MAX;
+        }
+        float selected = 0.0f, selected_sum = 0.0f;
+        for (int rank = 0; rank < 10; ++rank) {
+            float best = values[0];
+            int expert = lane;
+#pragma unroll
+            for (int i = 1; i < 16; ++i) {
+                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+            }
+#pragma unroll
+            for (int mask = 16; mask; mask >>= 1) {
+                const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+                const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+                if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+            }
+            if ((expert & 31) == lane) {
+                values[expert / 32] = -INFINITY;
+                id_out[rank] = expert;
+                s_ids[tk * 10 + rank] = expert;
+                selected_sum += best;
+            }
+            if (rank == lane) selected = best;
+        }
+        selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+        const float inverse_selected_sum = 1.0f / selected_sum;
+        if (lane < 10) w_out[lane] = selected * inverse_selected_sum;
+    }
+    __syncthreads();
+
+    const int n = n_tok * 10;
+    int32_t eid = -1;
+    int32_t slot = -1;
+    if (tid < n) {
+        eid = s_ids[tid];
+        slot = (eid >= 0 && eid < n_expert) ? res[eid] : -1;
+        if (slot < 0) atomicOr(&s_bad, 1);
+    }
+    __syncthreads();
+    if (s_bad) {
+        if (tid == 0) {
+            pl[0] = 0; pl[1] = 0; pl[2] = 0;
+            if (plan_err != nullptr) { *plan_err = 1; __threadfence_system(); }
+        }
+        return;
+    }
+
+    int first_j = tid;
+    int rank_in_group = 0;
+    int count_same = 0;
+    if (tid < n) {
+        for (int j = 0; j < n; ++j) {
+            if (s_ids[j] == eid) {
+                if (j < first_j) first_j = j;
+                if (j < tid) ++rank_in_group;
+                ++count_same;
+            }
+        }
+    }
+    const bool is_first = (tid < n && first_j == tid && slot >= 0);
+    if (tid < 128) {
+        const int my_cnt = is_first ? count_same : 0;
+        const int my_pack = (my_cnt << 16) | (is_first ? 1 : 0);
+        int pref = my_pack;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const int up = __shfl_up_sync(0xffffffffu, pref, d);
+            if (lane >= d) pref += up;
+        }
+        s_excl[tid] = pref - my_pack;
+        if (lane == 31) s_wsum[tk] = pref;
+    }
+    __syncthreads();
+
+    if (tid >= 128) return;
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+
+    if (is_first) {
+        int tot = s_excl[tid];
+#pragma unroll
+        for (int w = 0; w < 4; ++w)
+            if (w < tk) tot += s_wsum[w];
+        const int grp_idx = tot & 0xffff;
+        const int ent_start = tot >> 16;
+        ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+        start[grp_idx] = ent_start;
+    }
+    if (tid < n) {
+        const int fj_warp = first_j >> 5;
+        int fj_tot = s_excl[first_j];
+#pragma unroll
+        for (int w = 0; w < 4; ++w)
+            if (w < fj_warp) fj_tot += s_wsum[w];
+        const int out_idx = (fj_tot >> 16) + rank_in_group;
+        dst[out_idx] = tid;
+        tok[out_idx] = tid / 10;
+    }
+    if (tid == 0) {
+        const int groups = (s_wsum[0] + s_wsum[1] + s_wsum[2] + s_wsum[3]) & 0xffff;
+        start[groups] = n;
+        start2[0] = n;
+        counts[0] = groups;
+        counts[1] = n;
+        counts[2] = 0;
+    }
+}
+}  // namespace
+
+void native_router_top10_plan_fused(const float* logits, int32_t* ids, float* weights, int n_tok,
+                                    const int32_t* res_layer, int n_expert, const uint8_t* cache_base,
+                                    const unsigned long long* slot_off, long long blob, int32_t* plan,
+                                    long long capx, uint32_t* plan_err, void* stream) {
+    if (!stream || n_tok < 1 || n_tok > 8 || !logits || !ids || !weights || !res_layer || !plan)
+        throw std::invalid_argument("native_router_top10_plan_fused: bad arguments");
+    route_top10_plan_fused_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        logits, ids, weights, n_tok, res_layer, n_expert, cache_base, slot_off, blob, plan, capx, plan_err);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
 }

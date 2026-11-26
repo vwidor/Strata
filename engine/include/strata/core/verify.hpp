@@ -126,6 +126,10 @@ public:
     bool prepare(int T, bool& no_vram, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
+    /// Opt-in STRATA_GPU_LOGPROBS=1: compute row `t` logprobs (lse, tok_logit, top-K or allowed ids) on GPU.
+    bool row_logprobs(int t, int32_t token, int top_k, const std::vector<int32_t>& allowed, double& lse,
+                      float& tok_logit, std::vector<std::pair<int32_t, float>>& top_out,
+                      std::vector<float>& allowed_out) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
     /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph
@@ -598,6 +602,8 @@ private:
     /// every window then runs the doorbell graph (exec_nr_ / the batch key's top bit), the same as a stage that never
     /// was all-resident.  refresh_ar() looks at the host table before each window.
     bool ar_off_ = false;
+    bool fl_ar_on_ = false;               ///< ar_on() latched by pl_launch() for the graph in flight
+    std::atomic<bool> b_ar_on_{false};    ///< ar_on() latched by batch_launch*() for the batch graph in flight
     bool ar_on() const { return all_resident_ && !ar_off_; }
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)

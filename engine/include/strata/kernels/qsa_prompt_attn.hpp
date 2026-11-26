@@ -35,7 +35,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 /// prefill's gate_attn gives (STRATA_QSA_FUSE_GATE).  Nothing is launched on false; the caller runs the two-step path.
 bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                                  int64_t cap, const QsaShapes& s, const float* qf, uint16_t* o16, int64_t ld16, int64_t n_q,
-                                 void* stream);
+                                 void* stream, bool apply_fwht = false);
 
 /// HIP only (false in every other build): the prompt attention runs on the RDNA4 matrix cores on the current device -
 /// the default on gfx12 (STRATA_HIP_WMMA=0 turns it off), STRATA_HIP_WMMA=1 on gfx11 as well.  The prompt path sizes its

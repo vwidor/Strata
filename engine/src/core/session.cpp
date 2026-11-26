@@ -187,6 +187,72 @@ bool session_shared_kv_ensure(SessionState& s, const ModelGeometry& g, int64_t n
     return true;
 }
 
+bool session_shared_kv_move(SessionState& dst, SessionState& src, const ModelGeometry& g, int64_t upto, std::string& err) {
+    (void) g;
+    if (dst.shared_kv == nullptr || src.shared_kv == nullptr || dst.shared_kv != src.shared_kv) {
+        err = "shared KV move: sessions do not share a pool";
+        return false;
+    }
+    if (dst.qsa_alloc != src.qsa_alloc) {
+        err = "shared KV move: QSA layer count mismatch";
+        return false;
+    }
+    session_shared_kv_release(dst);
+    const auto shapes = strata::kernels::qsa_real_shapes();
+    const int dev = shared_kv_pool_device(dst.shared_kv);
+    int prev = 0;
+    (void) cudaGetDevice(&prev);
+    if (dev != prev) (void) cudaSetDevice(dev);
+    const int64_t copy_chunks = std::min<int64_t>(src.shared_alloc_chunks, (int64_t) dst.shared_chunks.size());
+    for (int64_t j = 0; j < dst.qsa_alloc; ++j) {
+        const QsaState& sst = src.qsa_states[src.qsa_ord0 + j];
+        const QsaState& dst_st = dst.qsa_states[dst.qsa_ord0 + j];
+        const int64_t pages = std::min<int64_t>(sst.n_pages, dst_st.n_pages);
+        if (pages > 0 && cudaMemcpy(dst_st.page_table, sst.page_table, (size_t) pages * sizeof(int32_t),
+                                    cudaMemcpyDeviceToDevice) != cudaSuccess) {
+            if (dev != prev) (void) cudaSetDevice(prev);
+            err = "shared KV move: page_table copy failed";
+            return false;
+        }
+        if (dst_st.n_pages > pages &&
+            cudaMemset(dst_st.page_table + pages, 0xff, (size_t) (dst_st.n_pages - pages) * sizeof(int32_t)) != cudaSuccess) {
+            if (dev != prev) (void) cudaSetDevice(prev);
+            err = "shared KV move: page_table tail reset failed";
+            return false;
+        }
+        if (sst.n_pages > 0 &&
+            cudaMemset(sst.page_table, 0xff, (size_t) sst.n_pages * sizeof(int32_t)) != cudaSuccess) {
+            if (dev != prev) (void) cudaSetDevice(prev);
+            err = "shared KV move: source page_table reset failed";
+            return false;
+        }
+        const int64_t want_rows = upto > 0 ? (upto / shapes.idx_block + 2) : 0;
+        const int64_t pooled_rows = std::min<int64_t>(want_rows, std::min<int64_t>(sst.idx_pooled_rows, dst_st.idx_pooled_rows));
+        if (pooled_rows > 0 &&
+            cudaMemcpy(dst_st.idx_pooled, sst.idx_pooled, (size_t) pooled_rows * (size_t) shapes.idx_dim * sizeof(float),
+                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
+            if (dev != prev) (void) cudaSetDevice(prev);
+            err = "shared KV move: idx_pooled copy failed";
+            return false;
+        }
+    }
+    if (dev != prev) (void) cudaSetDevice(prev);
+    for (int64_t c = 0; c < copy_chunks; ++c) {
+        dst.shared_chunks[(size_t) c] = src.shared_chunks[(size_t) c];
+        src.shared_chunks[(size_t) c] = -1;
+    }
+    for (int64_t c = copy_chunks; c < src.shared_alloc_chunks; ++c) {
+        if (src.shared_chunks[(size_t) c] >= 0) {
+            shared_kv_pool_free_chunk(src.shared_kv, src.shared_chunks[(size_t) c]);
+            src.shared_chunks[(size_t) c] = -1;
+        }
+    }
+    dst.shared_alloc_chunks = copy_chunks;
+    src.shared_alloc_chunks = 0;
+    if (upto > 0) session_shared_kv_trim(dst, upto + 16);
+    return true;
+}
+
 void session_shared_kv_release(SessionState& s) {
     if (s.shared_kv == nullptr || s.shared_alloc_chunks <= 0) return;
     for (int64_t c = s.shared_alloc_chunks - 1; c >= 0; --c) {

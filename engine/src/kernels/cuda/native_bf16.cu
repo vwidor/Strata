@@ -391,12 +391,15 @@ int mmvf_block_size(int64_t n_in) {
 template <int NT, int R>
 __launch_bounds__(256)
 __global__ void bf16_f32_mmvf_wave_kernel(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
-                                          float* __restrict__ y, int64_t ldy, int n_in, int n_out) {
+                                          float* __restrict__ y, int64_t ldy, int n_in, int n_out,
+                                          const uint16_t* __restrict__ w_aux = nullptr,
+                                          float* __restrict__ y_aux = nullptr, int64_t ldy_aux = 0) {
     __shared__ __align__(16) float xs[NT][512];
     const int tid = int(threadIdx.x);
     const int lane = tid & 63;
     const int wave = tid >> 6;
     const int row0 = (int(blockIdx.x) * 4 + wave) * R;
+    const int total_out = w_aux != nullptr ? (n_out + 1) : n_out;
     float acc[R][NT];
 #pragma unroll
     for (int r = 0; r < R; ++r)
@@ -411,11 +414,13 @@ __global__ void bf16_f32_mmvf_wave_kernel(const float* __restrict__ x, int64_t l
                 __ldg(reinterpret_cast<const float2*>(x + (size_t) tk * ldx + k0) + q);
         }
         __syncthreads();
-        if (row0 < n_out) {
+        if (row0 < total_out) {
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                if (row0 + r >= n_out) break;
-                const uint4 wv = __ldg(reinterpret_cast<const uint4*>(w + (size_t) (row0 + r) * n_in + k0) + lane);
+                const int rr = row0 + r;
+                if (rr >= total_out) break;
+                const uint16_t* wrow = (rr < n_out) ? (w + (size_t) rr * n_in + k0) : (w_aux + k0);
+                const uint4 wv = __ldg(reinterpret_cast<const uint4*>(wrow) + lane);
                 const float w0 = __uint_as_float(wv.x << 16), w1 = __uint_as_float(wv.x & 0xffff0000u);
                 const float w2 = __uint_as_float(wv.y << 16), w3 = __uint_as_float(wv.y & 0xffff0000u);
                 const float w4 = __uint_as_float(wv.z << 16), w5 = __uint_as_float(wv.z & 0xffff0000u);
@@ -436,16 +441,20 @@ __global__ void bf16_f32_mmvf_wave_kernel(const float* __restrict__ x, int64_t l
         }
         __syncthreads();
     }
-    if (row0 >= n_out) return;
+    if (row0 >= total_out) return;
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        if (row0 + r >= n_out) break;
+        const int rr = row0 + r;
+        if (rr >= total_out) break;
 #pragma unroll
         for (int k = 0; k < NT; ++k) {
             float v = acc[r][k];
 #pragma unroll
             for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
-            if (lane == 0) y[(size_t) k * ldy + row0 + r] = v;
+            if (lane == 0) {
+                if (rr < n_out) y[(size_t) k * ldy + rr] = v;
+                else y_aux[(size_t) k * ldy_aux] = v;
+            }
         }
     }
 }
@@ -457,28 +466,32 @@ int mmvf_wave_mode() {
 
 template <int NT>
 void launch_mmvf_wave_t(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out,
-                        int /*r_mode*/, cudaStream_t st) {
+                        int /*r_mode*/, cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr,
+                        int64_t ldy_aux = 0) {
     // R=1 (21-41 VGPRs, 0 spills, 6-10 waves/SIMD) beats R=2/R=4 at every T=1..8 on MI50.
-    const unsigned nb = unsigned(((size_t) n_out + 3u) / 4u);
-    bf16_f32_mmvf_wave_kernel<NT, 1><<<nb, 256, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out);
+    const size_t total = (size_t) n_out + (w_aux != nullptr ? 1u : 0u);
+    const unsigned nb = unsigned((total + 3u) / 4u);
+    bf16_f32_mmvf_wave_kernel<NT, 1><<<nb, 256, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, w_aux, y_aux, ldy_aux);
 }
 
 bool try_launch_mmvf_wave(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int64_t n_in,
-                          int64_t n_out, int n_tok, cudaStream_t st) {
+                          int64_t n_out, int n_tok, cudaStream_t st, const uint16_t* w_aux = nullptr,
+                          float* y_aux = nullptr, int64_t ldy_aux = 0) {
     const int wm = mmvf_wave_mode();
     if (wm <= 0 || n_out < 512 || n_tok < 1 || n_tok > 8 || (n_in & 511) != 0 || (ldx & 1) != 0 ||
-        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w) & 15u) != 0)
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w) & 15u) != 0 ||
+        (w_aux != nullptr && ((reinterpret_cast<uintptr_t>(w_aux) & 15u) != 0 || y_aux == nullptr)))
         return false;
     const int ni = (int) n_in, no = (int) n_out;
     switch (n_tok) {
-        case 1: launch_mmvf_wave_t<1>(x, ldx, w, y, ldy, ni, no, wm, st); break;
-        case 2: launch_mmvf_wave_t<2>(x, ldx, w, y, ldy, ni, no, wm, st); break;
-        case 3: launch_mmvf_wave_t<3>(x, ldx, w, y, ldy, ni, no, wm, st); break;
-        case 4: launch_mmvf_wave_t<4>(x, ldx, w, y, ldy, ni, no, wm, st); break;
-        case 5: launch_mmvf_wave_t<5>(x, ldx, w, y, ldy, ni, no, wm, st); break;
-        case 6: launch_mmvf_wave_t<6>(x, ldx, w, y, ldy, ni, no, wm, st); break;
-        case 7: launch_mmvf_wave_t<7>(x, ldx, w, y, ldy, ni, no, wm, st); break;
-        default: launch_mmvf_wave_t<8>(x, ldx, w, y, ldy, ni, no, wm, st); break;
+        case 1: launch_mmvf_wave_t<1>(x, ldx, w, y, ldy, ni, no, wm, st, w_aux, y_aux, ldy_aux); break;
+        case 2: launch_mmvf_wave_t<2>(x, ldx, w, y, ldy, ni, no, wm, st, w_aux, y_aux, ldy_aux); break;
+        case 3: launch_mmvf_wave_t<3>(x, ldx, w, y, ldy, ni, no, wm, st, w_aux, y_aux, ldy_aux); break;
+        case 4: launch_mmvf_wave_t<4>(x, ldx, w, y, ldy, ni, no, wm, st, w_aux, y_aux, ldy_aux); break;
+        case 5: launch_mmvf_wave_t<5>(x, ldx, w, y, ldy, ni, no, wm, st, w_aux, y_aux, ldy_aux); break;
+        case 6: launch_mmvf_wave_t<6>(x, ldx, w, y, ldy, ni, no, wm, st, w_aux, y_aux, ldy_aux); break;
+        case 7: launch_mmvf_wave_t<7>(x, ldx, w, y, ldy, ni, no, wm, st, w_aux, y_aux, ldy_aux); break;
+        default: launch_mmvf_wave_t<8>(x, ldx, w, y, ldy, ni, no, wm, st, w_aux, y_aux, ldy_aux); break;
     }
     const cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess)
@@ -492,6 +505,12 @@ bool try_launch_mmvf_wave(const float* x, int64_t ldx, const uint16_t* w, float*
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    if (x != nullptr && w != nullptr && y != nullptr && w_aux != nullptr && y_aux != nullptr &&
+        n_in > 0 && n_out > 0 && n_tok >= 1 && n_tok <= 8 &&
+        try_launch_mmvf_wave(x, ldx, w, y, ldy, n_in, n_out, n_tok, (cudaStream_t) stream, w_aux, y_aux, ldy_aux))
+        return true;
+#endif
     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
     // exactly the conditions under which both calls would take the rows / multi kernels at the same block size
     if (!rows || n_out < 64 || n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 || x == nullptr ||

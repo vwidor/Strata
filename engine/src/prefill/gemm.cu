@@ -1092,7 +1092,11 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 #ifndef STRATA_USE_HIP
         static const bool w16_bf16 = [] {
             const char* v = std::getenv("STRATA_PF_W16_BF16");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
+            if (v == nullptr || v[0] == '\0' || v[0] == '0') return false;
+            const char* hq = std::getenv("STRATA_HC_Q8");
+            const char* hr = std::getenv("STRATA_HC_REQ8");
+            if ((hq && hq[0] != '\0' && hq[0] != '0') || (hr && hr[0] != '\0' && hr[0] != '0')) return false;
+            return true;
         }();
         if (w16_bf16) {
             if (w16_budget_ < 0) w16_init();
@@ -1135,6 +1139,9 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
             bf16_to_f16_rows<<<blk, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
             f16_inplace(X, scratch_, Y + r0, T, n, K, ldy);
         }
+        // STRATA_DEQUANT_SIDE: bf16() wrote and read scratch_ on stream_; the side stream's next dequant into
+        // scratch_ must wait until these FP16 GEMMs finish reading it.
+        if (side_scratch_) (void) cudaEventRecord((cudaEvent_t) side_free_[0], (cudaStream_t) stream_);
         return;
     }
 #endif

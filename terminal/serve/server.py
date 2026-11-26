@@ -398,18 +398,25 @@ def end_leftover_engines(exe: str) -> None:
 
 def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     """#874: where one request's combined image-embeddings file goes.  Every request with images rewrites it (it is
-    deleted after the request), which on a disk is steady heavy writing: on Linux it goes to /dev/shm when that has
-    room (the engine reads it back at once), on Windows the file is opened short-lived (the cache is not forced out
-    to the drive).  Anywhere else, or when /dev/shm is too small (Docker's default is 64 MB), it stays in the encoder's
-    own directory, as before."""
+    deleted after the request), which on a disk is steady heavy writing: on Linux, prefer systemd's
+    RUNTIME_DIRECTORY (tmpfs, never wiped by systemd-logind RemoveIPC) when set, then /dev/shm when it has room
+    (the engine reads it back at once); on Windows the file is opened short-lived (the cache is not forced out
+    to the drive).  Anywhere else, or when tmpfs is too small (Docker's default is 64 MB), it stays in the
+    encoder's own directory, as before."""
     name = f"req-{uuid.uuid4().hex[:12]}.sve"
-    shm = Path("/dev/shm")
-    if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
-        try:
-            if shutil.disk_usage(shm).free > 2 * nbytes + (16 << 20):
-                return shm / f"strata-vision-{os.getpid()}-{name}"
-        except OSError:
-            pass
+    if os.name != "nt":
+        candidates: list[tuple[Path, str]] = []
+        rt = (os.environ.get("RUNTIME_DIRECTORY") or "").split(":")[0].strip()
+        if rt and " " not in rt:
+            candidates.append((Path(rt), f"strata-vision-{os.getpid()}-{name}"))
+        candidates.append((Path("/dev/shm"), f"strata-vision-{os.getpid()}-{name}"))
+        for base, fname in candidates:
+            if base.is_dir() and os.access(base, os.W_OK):
+                try:
+                    if shutil.disk_usage(base).free > 2 * nbytes + (16 << 20):
+                        return base / fname
+                except OSError:
+                    pass
     return Path(vision_dir) / name
 
 

@@ -618,6 +618,15 @@ class VisionTempFiles(unittest.TestCase):
             with mock.patch("serve.server.shutil.disk_usage", return_value=SimpleNamespace(free=1 << 20)):
                 self.assertEqual(combined_embeddings_path(Path(d), 1 << 20).parent, Path(d))
 
+    def test_combined_file_prefers_runtime_directory(self):
+        from serve.server import combined_embeddings_path
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as rt:
+            if os.name == "nt":
+                return
+            with mock.patch.dict(os.environ, {"RUNTIME_DIRECTORY": rt}, clear=False), \
+                 mock.patch("serve.server.shutil.disk_usage", return_value=SimpleNamespace(free=1 << 30)):
+                self.assertEqual(combined_embeddings_path(Path(d), 1024).parent, Path(rt))
+
     def test_smart_app_control_is_said_in_words(self):
         import subprocess
         from serve.server import popen

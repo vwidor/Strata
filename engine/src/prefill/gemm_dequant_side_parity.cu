@@ -116,6 +116,50 @@ int main() {
         }
     }
     gemm.set_dequant_side(nullptr, err);
+#if defined(__HIPCC__)
+    // Regression test for HIP FP16 prompt path: interleaved Gemm::bf16() + Gemm::native() sharing scratch_
+    // with STRATA_DEQUANT_SIDE=1 must remain bitwise identical to serial execution.
+    {
+        gemm.set_f16_io(true);
+        const int64_t bf_n = 512, bf_k = 2560;
+        std::vector<uint16_t> wbf_h((size_t) bf_n * bf_k);
+        for (uint16_t& v : wbf_h) {
+            const float f = ((float) (rng() & 0xffff) / 32768.0f - 1.0f) * 0.5f;
+            uint32_t u = 0;
+            std::memcpy(&u, &f, 4);
+            v = (uint16_t) (u >> 16);
+        }
+        uint16_t* wbf = nullptr;
+        float* ybf[2] = {nullptr, nullptr};
+        if (!ok(cudaMalloc((void**) &wbf, wbf_h.size() * 2), "wbf") ||
+            !ok(cudaMemcpy(wbf, wbf_h.data(), wbf_h.size() * 2, cudaMemcpyHostToDevice), "wbf copy") ||
+            !ok(cudaMalloc((void**) &ybf[0], (size_t) T * bf_n * 4), "ybf0") ||
+            !ok(cudaMalloc((void**) &ybf[1], (size_t) T * bf_n * 4), "ybf1"))
+            return 1;
+        for (int side = 0; side < 2; ++side) {
+            std::string e2;
+            if (!gemm.set_dequant_side(side ? scratch2 : nullptr, e2)) { std::printf("FAIL: set_dequant_side f16_io: %s\n", e2.c_str()); return 1; }
+            cudaMemset(Y[side], 0xff, (size_t) T * max_n * 4 * ws.size());
+            cudaMemset(ybf[side], 0xff, (size_t) T * bf_n * 4);
+            for (int round = 0; round < 3; ++round) {
+                for (size_t i = 0; i < ws.size(); ++i) {
+                    gemm.native(X, ws[i].type, ws[i].dev, Y[side] + (size_t) i * T * max_n, T, ws[i].N, ws[i].K, max_n, 0.0f);
+                    gemm.bf16(X, wbf, ybf[side], T, bf_n, bf_k, bf_n, 0.0f);
+                }
+            }
+            if (!ok(cudaStreamSynchronize(st), "run f16_io") || !ok(cudaDeviceSynchronize(), "device f16_io")) return 1;
+        }
+        std::vector<uint8_t> ba((size_t) T * bf_n * 4), bb(ba.size());
+        cudaMemcpy(ba.data(), ybf[0], ba.size(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(bb.data(), ybf[1], bb.size(), cudaMemcpyDeviceToHost);
+        const bool bf_diff = std::memcmp(ba.data(), bb.data(), ba.size()) != 0;
+        std::printf("  f16_io interleaved bf16 (N %lld K %lld): %s\n", (long long) bf_n, (long long) bf_k,
+                    bf_diff ? "*** DIFFERS ***" : "bitwise equal");
+        if (bf_diff) ++bad;
+        gemm.set_dequant_side(nullptr, err);
+        cudaFree(wbf); cudaFree(ybf[0]); cudaFree(ybf[1]);
+    }
+#endif
     std::printf("gemm_dequant_side_parity: %s\n", bad ? "FAILED" : "OK");
     return bad ? 1 : 0;
 }

@@ -16,6 +16,12 @@ bool native_router_enabled();
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
+/// Opt-in STRATA_ROUTER_PLAN_FUSE=1: fused 512/10 router + all-resident expert plan in one 256-thread block
+/// (n_tok in 1..8, bitwise identical ids/weights/plan to native_router_top10_multi + resident_plan).
+void native_router_top10_plan_fused(const float* logits, int32_t* ids, float* weights, int n_tok,
+                                    const int32_t* res_layer, int n_expert, const uint8_t* cache_base,
+                                    const unsigned long long* slot_off, long long blob, int32_t* plan,
+                                    long long capx, uint32_t* plan_err, void* stream);
 /// The same contract for a model family's (experts, top-k): 512 / 10 (Flash-Next: the two calls above, unchanged) and
 /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
 bool native_router_topk_supported(int n_expert, int k);
