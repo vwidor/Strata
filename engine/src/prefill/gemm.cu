@@ -1072,6 +1072,7 @@ __global__ void f16_to_bf16_kernel(const __half* __restrict__ in, uint16_t* __re
 }
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta, int64_t ldx, bool x_f16) {
+    last_raw_f16_ = false;
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
@@ -1137,7 +1138,8 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
             const int64_t n = std::min(rows, N - r0);
             const unsigned blk = (unsigned) std::max<int64_t>(1, std::min<int64_t>(1024, (n * K + 255) / 256));
             bf16_to_f16_rows<<<blk, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
-            f16_inplace(X, scratch_, Y + r0, T, n, K, ldy);
+            float* const y_dst = skip_widen_ ? reinterpret_cast<float*>(reinterpret_cast<uint16_t*>(Y) + r0) : (Y + r0);
+            f16_inplace(X, scratch_, y_dst, T, n, K, ldy);
         }
         // STRATA_DEQUANT_SIDE: bf16() wrote and read scratch_ on stream_; the side stream's next dequant into
         // scratch_ must wait until these FP16 GEMMs finish reading it.
@@ -1246,6 +1248,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
+    last_raw_f16_ = false;
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #ifdef STRATA_USE_HIP
@@ -1415,6 +1418,10 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
            "cublasGemmEx f16 out");
     }
     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
+    if (skip_widen_ && !dbg_nan) {
+        last_raw_f16_ = true;
+        return;
+    }
     widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
     if (dbg_nan) {   // debug only: a sync per GEMM
         unsigned long long bad = 0, zero_count = 0;
@@ -1465,6 +1472,7 @@ void Gemm::w16_init() {
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
+    last_raw_f16_ = false;
 #ifdef STRATA_USE_HIP
     // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
     // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory
@@ -1556,10 +1564,12 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         const int64_t rows = scratch_elems_ / K;
         if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
         if (ldy <= 0) ldy = N;
+        const bool slice_raw = skip_widen_ && f16_io_ && beta == 0.0f;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
-            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+            float* const y_dst = slice_raw ? reinterpret_cast<float*>(reinterpret_cast<uint16_t*>(Y) + r0) : (Y + r0);
+            f16(X, scratch_, y_dst, T, n, K, ldy, beta);
         }
         // the side stream's next dequant into scratch_ waits for these slices' reads and writes of it
         if (side_scratch_) (void) cudaEventRecord((cudaEvent_t) side_free_[0], (cudaStream_t) stream_);

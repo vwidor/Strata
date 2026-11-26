@@ -2466,7 +2466,7 @@ __device__ __forceinline__ float pa906_load_v1(const QsaAttnPools& p, long long 
     }
 }
 
-template <bool KV_V4, bool FUSE_GATE = false, bool DO_FWHT = false>
+template <bool KV_V4, bool FUSE_GATE = false, bool DO_FWHT = false, bool QF_F16 = false>
 __global__ void __launch_bounds__(PA906_THREADS, 2)
 prompt_attn_gfx906_kernel(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
                           const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale,
@@ -2664,7 +2664,9 @@ prompt_attn_gfx906_kernel(const float* __restrict__ q, QsaAttnPools p, const int
         }
     } else {
         float* const sf = &spt[0][0];   // 3 KiB >= 1 KiB (256 floats): zero extra LDS
-        const float* const qf_row = qf + (size_t) qi * (size_t) (n_kv_heads * G * 2 * HD);
+        const size_t qf_stride = (size_t) n_kv_heads * (size_t) G * (2 * HD);
+        const float* const qf_row = qf + (size_t) qi * qf_stride;
+        const uint16_t* const qf_row16 = reinterpret_cast<const uint16_t*>(qf) + (size_t) qi * (2 * qf_stride);
         uint16_t* const o_row = o16 + (size_t) qi * (size_t) ld16;
         for (int h = 0; h < G; ++h) {
             const float inv_l = sl[h] > 0.0f ? (1.0f / sl[h]) : 0.0f;
@@ -2692,20 +2694,509 @@ prompt_attn_gfx906_kernel(const float* __restrict__ q, QsaAttnPools p, const int
                 __syncthreads();
             }
             const int gh = kvh * G + h;
-            const float gv = qf_row[(size_t) gh * (2 * HD) + HD + t];
+            const size_t gidx = (size_t) gh * (2 * HD) + HD + t;
+            const float gv = QF_F16 ? __half2float(__ushort_as_half(qf_row16[gidx])) : qf_row[gidx];
             const float outv = val * (1.0f / (1.0f + __expf(-gv)));
             o_row[(size_t) gh * HD + t] = __half_as_ushort(__float2half_rn(outv));
         }
     }
 }
 
-bool pa906_enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_QSA_PA_GFX906");
-        return v != nullptr && v[0] == '1';
-    }();
-    return on;
+// Phase 6C-2 (P4, opt-in STRATA_QSA_PA_GFX906=2): Zero-Shuffle Query-Grouped Flash-QSA for gfx906 wave64.
+// Groups BQ=2 consecutive queries into one 256-thread (4-wave64) CTA with <= 32 KiB LDS (2 CTAs/CU = 8 waves/CU):
+//   - Parallel fast-path union merge of 64 cells (coalesced LDS staging + wave64 ballot equality check; 0 serial global loads).
+//   - K (int8) staged ONCE into XOR-swizzled 16 KiB LDS (zero bank conflicts); Q staged in 12 KiB LDS (100% broadcast reads).
+//   - Q*K runs zero-shuffle 2D-tiled (1 wave64 = 6 heads x 64 cells, 24 v_dot2 per 8 dims) directly into wave64 register softmax!
+//   - V staged ONCE per 32-cell sub-pass (vectorized Q4_0 / int8 unpack) into reused 16 KiB LDS; P*V does 24 v_dot2/cell-pair.
+//   - Fused wave64 256-pt FWHT (strides 1..64 in regs/shuffles, stride 128 via dead kv tile in 2x6 batches) + gate epilogue.
+constexpr int PA906G_CHUNK = 64;
+constexpr int PA906G_VSUB = 32;
+typedef uint32_t pa906_u32a __attribute__((aligned(2)));
+
+struct Pa906GShared {
+    pa906_f16x2 s_q[2][G][HD / 2];                    // 12,288 B
+    union {
+        uint2 k8[PA906G_CHUNK][HD / 8];               // 16,384 B (64 cells x 256 int8, XOR-swizzled)
+        pa906_f16x2 v[PA906G_VSUB][HD / 2];           // 16,384 B (32 cells x 256 fp16)
+        struct {
+            int ids[2][PA906G_CHUNK];                 //    512 B
+            int cells[PA906G_CHUNK];                  //    256 B
+        } merge;
+        float fwht[2 * 6 * HD];                       // 12,288 B (epilogue 256-pt FWHT)
+    } kv;                                             // 16,384 B
+    union {
+        pa906_f16x2 p[2][PA906G_CHUNK / 2][G];        //  3,072 B
+        uint16_t ksc[PA906G_CHUNK][HD / KV_Q8_GROUP]; //    512 B
+    } pk;                                             //  3,072 B
+    long long s_row[PA906G_CHUNK];                    //    512 B
+    float s_m[2][G], s_l[2][G], s_rescale[2][G];      //    288 B
+    float s_qm[2][2];                                 //     16 B
+    uint8_t s_mask[PA906G_CHUNK];                     //     64 B
+    int s_nids[2], s_ptr[2], s_nhere, s_need_resolve; //     24 B
+};
+static_assert(sizeof(Pa906GShared) <= 32768, "Pa906GShared must fit 2 CTAs/CU in 64 KiB LDS");
+
+template <bool KV_V4, bool FUSE_GATE, bool DO_FWHT, bool QF_F16 = false>
+__global__ void __launch_bounds__(256, 2)
+prompt_attn_gfx906_grouped_kernel(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
+                                  const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale,
+                                  float* __restrict__ attn, int cap, int n_q, const float* __restrict__ qf = nullptr,
+                                  uint16_t* __restrict__ o16 = nullptr, int64_t ld16 = 0) {
+    constexpr int NT = 256;
+    const int q_base = blockIdx.x * 2;
+    const int kvh = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int q_local = tid >> 7;        // 0 or 1 (2 wave64s per query)
+    const int lane128 = tid & 127;       // 2 dims/lane in P*V & epilogue
+    const int hw = lane128 >> 6;         // 0: heads 0..5 (Q*K) / dims 0..127 (P*V); 1: heads 6..11 / dims 128..255
+    const int lane64 = lane128 & 63;     // cell index 0..63 in Q*K & softmax
+    const int qi = q_base + q_local;
+    const bool q_valid = (qi < n_q);
+
+    __shared__ __align__(16) Pa906GShared S;
+
+    if (tid < 2) {
+        const int qj = q_base + tid;
+        S.s_nids[tid] = (qj < n_q) ? __ldg(steps + (size_t) qj * kStepCount + kStepWidth) : 0;
+        S.s_ptr[tid] = 0;
+        S.s_qm[tid][0] = 0.0f;
+        S.s_qm[tid][1] = 0.0f;
+    }
+    if (lane128 < G) {
+        S.s_m[q_local][lane128] = -FLT_MAX;
+        S.s_l[q_local][lane128] = 0.0f;
+        S.s_rescale[q_local][lane128] = 1.0f;
+    }
+    __syncthreads();
+
+    const int n_ids_my = S.s_nids[q_local];
+    if (max(S.s_nids[0], S.s_nids[1]) <= 0) {
+        if (q_valid) {
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const int gh = kvh * G + h;
+                if constexpr (FUSE_GATE) {
+                    *reinterpret_cast<uint32_t*>(o16 + (size_t) qi * (size_t) ld16 + (size_t) gh * HD + lane128 * 2) = 0u;
+                } else {
+                    *reinterpret_cast<float2*>(attn + ((size_t) qi * (size_t) (n_kv_heads * G) + (size_t) gh) * HD + lane128 * 2) =
+                        make_float2(0.0f, 0.0f);
+                }
+            }
+        }
+        return;
+    }
+
+    // Stage both queries' scaled FP16 Q into S.s_q[2][12][128] (12 KiB; 100% broadcast reads in Q*K).
+    const float* const qk = q + ((size_t) qi * (size_t) (n_kv_heads * G) + (size_t) (kvh * G)) * HD + lane128 * 2;
+    if (q_valid && n_ids_my > 0) {
+        float qm = 0.0f;
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const float2 qf2 = *reinterpret_cast<const float2*>(qk + (size_t) h * HD);
+            qm = fmaxf(qm, fmaxf(fabsf(qf2.x), fabsf(qf2.y)));
+        }
+#pragma unroll
+        for (int o = 32; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor(qm, o, 64));
+        if (lane64 == 0) S.s_qm[q_local][hw] = qm;
+    }
+    __syncthreads();
+
+    float qdown = scale;
+    if (q_valid && n_ids_my > 0) {
+        const float qm = fmaxf(S.s_qm[q_local][0], S.s_qm[q_local][1]);
+        int qe = 0;
+        if (qm > 0.0f) frexpf(qm, &qe);
+        const float qup = ldexpf(1.0f, -qe);
+        qdown = scale * ldexpf(1.0f, qe);
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const float2 qf2 = *reinterpret_cast<const float2*>(qk + (size_t) h * HD);
+            S.s_q[q_local][h][lane128] = pa906_h2(qf2.x * qup, qf2.y * qup);
+        }
+    }
+
+    float acc[G][2];
+#pragma unroll
+    for (int h = 0; h < G; ++h) {
+        acc[h][0] = 0.0f;
+        acc[h][1] = 0.0f;
+    }
+
+    const uint32_t qbit = 1u << q_local;
+    const int k_swizzle = lane64 & 31;
+
+    for (;;) {
+        // 1. Parallel coalesced staging of up to 64 IDs per query into LDS + fast-path wave64 equality check.
+        if (tid < 2 * PA906G_CHUNK) {
+            const int qq = tid >> 6;
+            const int off = tid & 63;
+            const int pidx = S.s_ptr[qq] + off;
+            S.kv.merge.ids[qq][off] =
+                (pidx < S.s_nids[qq]) ? __ldg(ids + (size_t) (q_base + qq) * (size_t) cap + pidx) : 0x7fffffff;
+        }
+        if (tid == 0) S.s_need_resolve = 0;
+        __syncthreads();
+
+        if (tid < PA906G_CHUNK) {
+            const int c0 = S.kv.merge.ids[0][tid];
+            const int c1 = S.kv.merge.ids[1][tid];
+            const unsigned long long diff = __ballot(c0 != c1);
+            if (diff == 0ull) {
+                const int cnt = __popcll(__ballot(c0 != 0x7fffffff));
+                if (tid < cnt) {
+                    const long long page = (long long) __ldg(p.page_table + c0 / page_size);
+                    const long long r = (page >= 0) ? ((page * n_kv_heads + kvh) * page_size + (c0 % page_size)) : -1ll;
+                    S.s_row[tid] = r;
+                    S.s_mask[tid] = (r >= 0) ? (uint8_t) 3u : (uint8_t) 0u;
+                }
+                if (tid == 0) {
+                    S.s_nhere = cnt;
+                    S.s_ptr[0] += cnt;
+                    S.s_ptr[1] += cnt;
+                }
+            } else if (tid == 0) {
+                int i0 = 0, i1 = 0, cnt = 0;
+                while (cnt < PA906G_CHUNK) {
+                    const int v0 = S.kv.merge.ids[0][i0];
+                    const int v1 = S.kv.merge.ids[1][i1];
+                    const int mn = min(v0, v1);
+                    if (mn == 0x7fffffff) break;
+                    uint8_t m = 0u;
+                    if (v0 == mn) { m |= 1u; ++i0; }
+                    if (v1 == mn) { m |= 2u; ++i1; }
+                    S.kv.merge.cells[cnt] = mn;
+                    S.s_mask[cnt] = m;
+                    ++cnt;
+                }
+                S.s_nhere = cnt;
+                S.s_ptr[0] += i0;
+                S.s_ptr[1] += i1;
+                S.s_need_resolve = 1;
+            }
+        }
+        __syncthreads();
+
+        const int n_here = S.s_nhere;
+        if (n_here == 0) break;
+
+        if (S.s_need_resolve) {
+            if (tid < n_here) {
+                const int cell = S.kv.merge.cells[tid];
+                const long long page = (long long) __ldg(p.page_table + cell / page_size);
+                const long long r = (page >= 0) ? ((page * n_kv_heads + kvh) * page_size + (cell % page_size)) : -1ll;
+                S.s_row[tid] = r;
+                if (r < 0) S.s_mask[tid] = 0u;
+            }
+            __syncthreads();
+        }
+
+        // 2. Cooperatively stage raw int8 K (XOR-swizzled, 0 bank conflicts) + FP16 K scales into LDS.
+        for (int idx = tid; idx < n_here * 16; idx += NT) {
+            const int c = idx >> 4;
+            const int g16 = idx & 15;
+            const long long row = S.s_row[c];
+            if ((g16 & 3) == 0) {
+                S.pk.ksc[c][g16 >> 2] = (row >= 0) ? p.k_scale[row * 4 + (g16 >> 2)] : (uint16_t) 0u;
+            }
+            if (row >= 0) {
+                const uint4 raw = *reinterpret_cast<const uint4*>(p.k_q + row * HD + g16 * 16);
+                const int sw = c & 31;
+                S.kv.k8[c][(g16 * 2) ^ sw] = make_uint2(raw.x, raw.y);
+                S.kv.k8[c][(g16 * 2 + 1) ^ sw] = make_uint2(raw.z, raw.w);
+            }
+        }
+        __syncthreads();
+
+        // 3. Zero-shuffle 2D-tiled Q*K: wave (q_local, hw) computes 6 heads x 64 cells (lane64 = cell).
+        const bool cell_active = q_valid && n_ids_my > 0 && (lane64 < n_here) && ((S.s_mask[lane64] & qbit) != 0u);
+        float sc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        if (__any(cell_active)) {
+            const int hbase = hw * 6;
+            if (cell_active) {
+#pragma unroll 1
+                for (int g = 0; g < 4; ++g) {
+                    float tg[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 1
+                    for (int j = 0; j < 8; ++j) {
+                        const int col8 = g * 8 + j;
+                        const uint2 rawk = S.kv.k8[lane64][col8 ^ k_swizzle];
+                        const int8_t* const cc = reinterpret_cast<const int8_t*>(&rawk);
+                        const pa906_f16x2 kh0 = pa906_h2((float) cc[0], (float) cc[1]);
+                        const pa906_f16x2 kh1 = pa906_h2((float) cc[2], (float) cc[3]);
+                        const pa906_f16x2 kh2 = pa906_h2((float) cc[4], (float) cc[5]);
+                        const pa906_f16x2 kh3 = pa906_h2((float) cc[6], (float) cc[7]);
+#pragma unroll
+                        for (int hi = 0; hi < 6; ++hi) {
+                            const uint4 qr = *reinterpret_cast<const uint4*>(&S.s_q[q_local][hbase + hi][col8 * 4]);
+                            const pa906_f16x2* const qh = reinterpret_cast<const pa906_f16x2*>(&qr);
+                            float d = pa906_fdot2(kh0, qh[0], tg[hi]);
+                            d = pa906_fdot2(kh1, qh[1], d);
+                            d = pa906_fdot2(kh2, qh[2], d);
+                            tg[hi] = pa906_fdot2(kh3, qh[3], d);
+                        }
+                    }
+                    const float ksc = __half2float(__ushort_as_half(S.pk.ksc[lane64][g]));
+#pragma unroll
+                    for (int hi = 0; hi < 6; ++hi) sc[hi] = fmaf(tg[hi], ksc, sc[hi]);
+                }
+            }
+        }
+        __syncthreads();  // all waves done reading S.kv.k8 & S.pk.ksc before S.pk.p & S.kv.v overwrite them
+
+        // 4a. In-register wave64 online softmax (0 LDS for scores!) writing S.pk.p[q_local][0..31][0..11].
+        if (q_valid && n_ids_my > 0) {
+            const int hbase = hw * 6;
+#pragma unroll
+            for (int hi = 0; hi < 6; ++hi) {
+                const int h = hbase + hi;
+                const float sv = cell_active ? (sc[hi] * qdown) : -FLT_MAX;
+                float mc = sv;
+#pragma unroll
+                for (int o = 32; o > 0; o >>= 1) mc = fmaxf(mc, __shfl_xor(mc, o, 64));
+                const float m_old = S.s_m[q_local][h];
+                if (mc == -FLT_MAX) {
+                    if ((lane64 & 1) == 0) S.pk.p[q_local][lane64 >> 1][h] = pa906_h2(0.0f, 0.0f);
+                    if (lane64 == 0) S.s_rescale[q_local][h] = 1.0f;
+                } else {
+                    const float m_new = fmaxf(m_old, mc);
+                    const float alpha = (m_old == -FLT_MAX) ? 0.0f : __expf(m_old - m_new);
+                    const float ea = cell_active ? __expf(sv - m_new) : 0.0f;
+                    const float eb = __shfl_xor(ea, 1, 64);
+                    if ((lane64 & 1) == 0) S.pk.p[q_local][lane64 >> 1][h] = pa906_h2(ea, eb);
+                    float lc = ea;
+#pragma unroll
+                    for (int o = 32; o > 0; o >>= 1) lc += __shfl_xor(lc, o, 64);
+                    if (lane64 == 0) {
+                        S.s_rescale[q_local][h] = alpha;
+                        S.s_m[q_local][h] = m_new;
+                        S.s_l[q_local][h] = fmaf(S.s_l[q_local][h], alpha, lc);
+                    }
+                }
+            }
+        }
+
+        // 4b + 5. Two 32-cell sub-passes: cooperative vectorized V load into S.kv.v + P*V fold (first sub-pass overlaps with softmax barrier!).
+        auto stage_v_sub = [&](int c_base, int n_sub) {
+            for (int idx = tid; idx < n_sub * 16; idx += NT) {
+                const int cs = idx >> 4;
+                const int hb = idx & 15;
+                const long long row = S.s_row[c_base + cs];
+                if constexpr (KV_V4) {
+                    constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+                    const int b = hb >> 1;
+                    const int hi = hb & 1;
+                    pa906_f16x2* const dst_lo = &S.kv.v[cs][b * 16 + hi * 4];
+                    pa906_f16x2* const dst_hi = &S.kv.v[cs][b * 16 + 8 + hi * 4];
+                    if (row >= 0) {
+                        const uint8_t* const bp = p.v_q4 + row * bytes_per_head + b * sizeof(block_q4_0);
+                        const float dd = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(bp)));
+                        const uint8_t* const qp = bp + 2 + hi * 8;
+                        const uint32_t qw[2] = {*reinterpret_cast<const pa906_u32a*>(qp),
+                                                *reinterpret_cast<const pa906_u32a*>(qp + 4)};
+#pragma unroll
+                        for (int k = 0; k < 2; ++k) {
+                            const uint32_t wv = qw[k];
+                            const int b0 = (int) (wv & 0xffu), b1 = (int) ((wv >> 8) & 0xffu);
+                            const int b2 = (int) ((wv >> 16) & 0xffu), b3 = (int) (wv >> 24);
+                            dst_lo[2 * k + 0] = pa906_h2((float) ((b0 & 15) - 8) * dd, (float) ((b1 & 15) - 8) * dd);
+                            dst_lo[2 * k + 1] = pa906_h2((float) ((b2 & 15) - 8) * dd, (float) ((b3 & 15) - 8) * dd);
+                            dst_hi[2 * k + 0] = pa906_h2((float) ((b0 >> 4) - 8) * dd, (float) ((b1 >> 4) - 8) * dd);
+                            dst_hi[2 * k + 1] = pa906_h2((float) ((b2 >> 4) - 8) * dd, (float) ((b3 >> 4) - 8) * dd);
+                        }
+                    } else {
+                        const pa906_f16x2 z2 = pa906_h2(0.0f, 0.0f);
+#pragma unroll
+                        for (int k = 0; k < 4; ++k) { dst_lo[k] = z2; dst_hi[k] = z2; }
+                    }
+                } else {
+                    pa906_f16x2* const dst = &S.kv.v[cs][hb * 8];
+                    if (row >= 0) {
+                        const float vsc = __half2float(__ushort_as_half(p.v_scale[row * 4 + (hb >> 2)]));
+                        const uint4 raw = *reinterpret_cast<const uint4*>(p.v_q + row * HD + hb * 16);
+                        const int8_t* const cc = reinterpret_cast<const int8_t*>(&raw);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) dst[k] = pa906_h2((float) cc[2 * k] * vsc, (float) cc[2 * k + 1] * vsc);
+                    } else {
+                        const pa906_f16x2 z2 = pa906_h2(0.0f, 0.0f);
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) dst[k] = z2;
+                    }
+                }
+            }
+        };
+        auto fold_pv_sub = [&](int c_base, int n_sub) {
+            if (!(q_valid && n_ids_my > 0)) return;
+            const int n_pairs = (n_sub + 1) >> 1;
+            const int p_base = c_base >> 1;
+#pragma unroll 1
+            for (int cp = 0; cp < n_pairs; ++cp) {
+                const int c0 = c_base + 2 * cp, c1 = c0 + 1;
+                const uint32_t m0 = S.s_mask[c0] & qbit;
+                const uint32_t m1 = (c1 < n_here) ? (S.s_mask[c1] & qbit) : 0u;
+                if ((m0 | m1) == 0u) continue;
+                const uint32_t r0 = m0 ? __builtin_bit_cast(uint32_t, S.kv.v[2 * cp][lane128]) : 0u;
+                const uint32_t r1 = m1 ? __builtin_bit_cast(uint32_t, S.kv.v[2 * cp + 1][lane128]) : 0u;
+                const pa906_f16x2 vp0 = __builtin_bit_cast(pa906_f16x2, __byte_perm(r0, r1, 0x5410));
+                const pa906_f16x2 vp1 = __builtin_bit_cast(pa906_f16x2, __byte_perm(r0, r1, 0x7632));
+                const uint4* const w4 = reinterpret_cast<const uint4*>(&S.pk.p[q_local][p_base + cp][0]);
+                auto fma2 = [&](int h, pa906_f16x2 ph) {
+                    acc[h][0] = pa906_fdot2(ph, vp0, acc[h][0]);
+                    acc[h][1] = pa906_fdot2(ph, vp1, acc[h][1]);
+                };
+                {
+                    const uint4 p0 = w4[0];
+                    const pa906_f16x2* const ph = reinterpret_cast<const pa906_f16x2*>(&p0);
+                    fma2(0, ph[0]); fma2(1, ph[1]); fma2(2, ph[2]); fma2(3, ph[3]);
+                }
+                {
+                    const uint4 p1 = w4[1];
+                    const pa906_f16x2* const ph = reinterpret_cast<const pa906_f16x2*>(&p1);
+                    fma2(4, ph[0]); fma2(5, ph[1]); fma2(6, ph[2]); fma2(7, ph[3]);
+                }
+                {
+                    const uint4 p2 = w4[2];
+                    const pa906_f16x2* const ph = reinterpret_cast<const pa906_f16x2*>(&p2);
+                    fma2(8, ph[0]); fma2(9, ph[1]); fma2(10, ph[2]); fma2(11, ph[3]);
+                }
+            }
+        };
+
+        const int n_sub0 = min(PA906G_VSUB, n_here);
+        stage_v_sub(0, n_sub0);
+        __syncthreads();
+
+        if (q_valid && n_ids_my > 0) {
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float rs = S.s_rescale[q_local][h];
+                acc[h][0] *= rs;
+                acc[h][1] *= rs;
+            }
+        }
+        fold_pv_sub(0, n_sub0);
+
+        if (n_here > PA906G_VSUB) {
+            const int n_sub1 = n_here - PA906G_VSUB;
+            __syncthreads();
+            stage_v_sub(PA906G_VSUB, n_sub1);
+            __syncthreads();
+            fold_pv_sub(PA906G_VSUB, n_sub1);
+        }
+        __syncthreads();
+    }
+
+    // 6. Epilogue: normalize + optional 256-pt FWHT (2x6 batches in dead S.kv.fwht) + optional gate + coalesced store.
+    const size_t qf_stride = (size_t) n_kv_heads * (size_t) G * (2 * HD);
+    const float* const qf_row = FUSE_GATE ? (qf + (size_t) qi * qf_stride) : nullptr;
+    const uint16_t* const qf_row16 = FUSE_GATE ? (reinterpret_cast<const uint16_t*>(qf) + (size_t) qi * (2 * qf_stride)) : nullptr;
+    uint16_t* const o_row = FUSE_GATE ? (o16 + (size_t) qi * (size_t) ld16) : nullptr;
+    float* const a_row = !FUSE_GATE ? (attn + (size_t) qi * (size_t) (n_kv_heads * G) * HD) : nullptr;
+    const bool active_out = q_valid && n_ids_my > 0;
+
+    if constexpr (FUSE_GATE && DO_FWHT) {
+        if (active_out) {
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float inv_l = (S.s_l[q_local][h] > 0.0f ? (1.0f / S.s_l[q_local][h]) : 0.0f) * 0.0625f;
+                float v0 = acc[h][0] * inv_l, v1 = acc[h][1] * inv_l;
+                const float a0 = v0 + v1, a1 = v0 - v1;
+                v0 = a0; v1 = a1;
+#pragma unroll
+                for (int sl = 1; sl < 64; sl <<= 1) {
+                    const bool lo_half = (lane64 & sl) == 0;
+                    const float u0 = __shfl_xor(v0, sl, 64), u1 = __shfl_xor(v1, sl, 64);
+                    v0 = lo_half ? (v0 + u0) : (u0 - v0);
+                    v1 = lo_half ? (v1 + u1) : (u1 - v1);
+                }
+                acc[h][0] = v0;
+                acc[h][1] = v1;
+            }
+        }
+        auto emit_fwht_batch = [&](int h0) {
+            if (active_out) {
+#pragma unroll
+                for (int hi = 0; hi < 6; ++hi) {
+                    float* const dst = S.kv.fwht + ((q_local * 6 + hi) * HD) + lane128 * 2;
+                    dst[0] = acc[h0 + hi][0];
+                    dst[1] = acc[h0 + hi][1];
+                }
+            }
+            __syncthreads();
+            if (active_out) {
+                const int partner = (lane128 ^ 64) * 2;
+#pragma unroll
+                for (int hi = 0; hi < 6; ++hi) {
+                    const float* const src = S.kv.fwht + ((q_local * 6 + hi) * HD) + partner;
+                    const float p0 = src[0], p1 = src[1];
+                    const float v0 = (hw == 0) ? (acc[h0 + hi][0] + p0) : (p0 - acc[h0 + hi][0]);
+                    const float v1 = (hw == 0) ? (acc[h0 + hi][1] + p1) : (p1 - acc[h0 + hi][1]);
+                    const int gh = kvh * G + h0 + hi;
+                    const size_t gidx = (size_t) gh * (2 * HD) + HD + lane128 * 2;
+                    float g0, g1;
+                    if constexpr (QF_F16) {
+                        const uint32_t gr = *reinterpret_cast<const uint32_t*>(qf_row16 + gidx);
+                        g0 = __half2float(__ushort_as_half((unsigned short) (gr & 0xffffu)));
+                        g1 = __half2float(__ushort_as_half((unsigned short) (gr >> 16)));
+                    } else {
+                        const float2 gf = *reinterpret_cast<const float2*>(qf_row + gidx);
+                        g0 = gf.x; g1 = gf.y;
+                    }
+                    const uint32_t u0 = __half_as_ushort(__float2half_rn(v0 * (1.0f / (1.0f + __expf(-g0)))));
+                    const uint32_t u1 = __half_as_ushort(__float2half_rn(v1 * (1.0f / (1.0f + __expf(-g1)))));
+                    *reinterpret_cast<uint32_t*>(o_row + (size_t) gh * HD + lane128 * 2) = u0 | (u1 << 16);
+                }
+            }
+            __syncthreads();
+        };
+        emit_fwht_batch(0);
+        emit_fwht_batch(6);
+    } else if (active_out) {
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const float inv_l = S.s_l[q_local][h] > 0.0f ? (1.0f / S.s_l[q_local][h]) : 0.0f;
+            const float v0 = acc[h][0] * inv_l, v1 = acc[h][1] * inv_l;
+            const int gh = kvh * G + h;
+            if constexpr (FUSE_GATE) {
+                const size_t gidx = (size_t) gh * (2 * HD) + HD + lane128 * 2;
+                float g0, g1;
+                if constexpr (QF_F16) {
+                    const uint32_t gr = *reinterpret_cast<const uint32_t*>(qf_row16 + gidx);
+                    g0 = __half2float(__ushort_as_half((unsigned short) (gr & 0xffffu)));
+                    g1 = __half2float(__ushort_as_half((unsigned short) (gr >> 16)));
+                } else {
+                    const float2 gf = *reinterpret_cast<const float2*>(qf_row + gidx);
+                    g0 = gf.x; g1 = gf.y;
+                }
+                const uint32_t u0 = __half_as_ushort(__float2half_rn(v0 * (1.0f / (1.0f + __expf(-g0)))));
+                const uint32_t u1 = __half_as_ushort(__float2half_rn(v1 * (1.0f / (1.0f + __expf(-g1)))));
+                *reinterpret_cast<uint32_t*>(o_row + (size_t) gh * HD + lane128 * 2) = u0 | (u1 << 16);
+            } else {
+                *reinterpret_cast<float2*>(a_row + (size_t) gh * HD + lane128 * 2) = make_float2(v0, v1);
+            }
+        }
+    }
+    if (q_valid && n_ids_my <= 0) {
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const int gh = kvh * G + h;
+            if constexpr (FUSE_GATE) {
+                *reinterpret_cast<uint32_t*>(o_row + (size_t) gh * HD + lane128 * 2) = 0u;
+            } else {
+                *reinterpret_cast<float2*>(a_row + (size_t) gh * HD + lane128 * 2) = make_float2(0.0f, 0.0f);
+            }
+        }
+    }
 }
+
+int pa906_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_QSA_PA_GFX906");
+        return (v != nullptr && v[0] != '\0') ? std::atoi(v) : 0;
+    }();
+    return mode;
+}
+
+bool pa906_enabled() { return pa906_mode() > 0; }
 
 bool pa906_fuse_epilogue_enabled() {
     static const bool on = [] {
@@ -2715,24 +3206,53 @@ bool pa906_fuse_epilogue_enabled() {
     return on;
 }
 
+template <bool KV_V4, bool QF_F16>
+void launch_gfx906_impl(int bq, const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                        int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st,
+                        const float* qf, uint16_t* o16, int64_t ld16, bool apply_fwht) {
+    const float scale = 1.0f / sqrtf((float) HD);
+    if (bq >= 2) {
+        const dim3 grid((unsigned) ((n_q + 1) / 2), (unsigned) s.n_head_kv);
+        if (qf != nullptr && o16 != nullptr) {
+            if (apply_fwht)
+                prompt_attn_gfx906_grouped_kernel<KV_V4, true, true, QF_F16><<<grid, 256, 0, st>>>(
+                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, nullptr, (int) cap, (int) n_q, qf, o16, ld16);
+            else
+                prompt_attn_gfx906_grouped_kernel<KV_V4, true, false, QF_F16><<<grid, 256, 0, st>>>(
+                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, nullptr, (int) cap, (int) n_q, qf, o16, ld16);
+        } else {
+            prompt_attn_gfx906_grouped_kernel<KV_V4, false, false, false><<<grid, 256, 0, st>>>(
+                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, attn, (int) cap, (int) n_q);
+        }
+    } else {
+        const dim3 grid((unsigned) n_q, (unsigned) s.n_head_kv);
+        if (qf != nullptr && o16 != nullptr) {
+            if (apply_fwht)
+                prompt_attn_gfx906_kernel<KV_V4, true, true, QF_F16><<<grid, PA906_THREADS, 0, st>>>(
+                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, nullptr, (int) cap, qf, o16, ld16);
+            else
+                prompt_attn_gfx906_kernel<KV_V4, true, false, QF_F16><<<grid, PA906_THREADS, 0, st>>>(
+                    q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, nullptr, (int) cap, qf, o16, ld16);
+        } else {
+            prompt_attn_gfx906_kernel<KV_V4, false, false, false><<<grid, PA906_THREADS, 0, st>>>(
+                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, attn, (int) cap);
+        }
+    }
+}
+
 template <bool KV_V4>
 bool launch_gfx906(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                    const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st,
-                   const float* qf = nullptr, uint16_t* o16 = nullptr, int64_t ld16 = 0, bool apply_fwht = false) {
+                   const float* qf = nullptr, uint16_t* o16 = nullptr, int64_t ld16 = 0, bool apply_fwht = false,
+                   bool qf_f16 = false) {
     if (n_q <= 0 || n_q > 65535) return false;
-    const float scale = 1.0f / sqrtf((float) HD);
-    const dim3 grid((unsigned) n_q, (unsigned) s.n_head_kv);
-    if (qf != nullptr && o16 != nullptr) {
-        if (apply_fwht)
-            prompt_attn_gfx906_kernel<KV_V4, true, true><<<grid, PA906_THREADS, 0, st>>>(
-                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, nullptr, (int) cap, qf, o16, ld16);
-        else
-            prompt_attn_gfx906_kernel<KV_V4, true, false><<<grid, PA906_THREADS, 0, st>>>(
-                q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, nullptr, (int) cap, qf, o16, ld16);
-    } else {
-        prompt_attn_gfx906_kernel<KV_V4, false, false><<<grid, PA906_THREADS, 0, st>>>(
-            q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, attn, (int) cap);
-    }
+    const int mode = pa906_mode();
+    int bq = 1;
+    if (mode >= 2) bq = (n_q >= 2) ? 2 : 1;
+    if (qf_f16 && qf != nullptr && o16 != nullptr)
+        launch_gfx906_impl<KV_V4, true>(bq, q, pools, ids, steps, cap, s, attn, n_q, st, qf, o16, ld16, apply_fwht);
+    else
+        launch_gfx906_impl<KV_V4, false>(bq, q, pools, ids, steps, cap, s, attn, n_q, st, qf, o16, ld16, apply_fwht);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_prompt_attn_batch (gfx906): %s\n", cudaGetErrorString(e));
@@ -2824,27 +3344,27 @@ bool qsa_hip_wmma_active() { return qsa_prompt_attn_matrix_cores_requested(); }
 
 bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                                  int64_t cap, const QsaShapes& s, const float* qf, uint16_t* o16, int64_t ld16, int64_t n_q,
-                                 void* stream, bool apply_fwht) {
+                                 void* stream, bool apply_fwht, bool qf_f16) {
 #if defined(STRATA_HIP_GFX906)
     if (n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
     if (pa906_enabled() && pa906_fuse_epilogue_enabled() && pools.k_q != nullptr && pools.k_scale != nullptr &&
         pools.k_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv && cap > 0 && ids && steps &&
         pools.page_table) {
         if (pools.v_q4 != nullptr)
-            return launch_gfx906<true>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16, apply_fwht);
+            return launch_gfx906<true>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16, apply_fwht, qf_f16);
         if (pools.v_q != nullptr && pools.v_scale != nullptr)
-            return launch_gfx906<false>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16, apply_fwht);
+            return launch_gfx906<false>(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16, apply_fwht, qf_f16);
     }
     return false;
 #elif defined(__HIPCC__)
-    if (apply_fwht || n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
+    if (qf_f16 || apply_fwht || n_q <= 0 || qf == nullptr || o16 == nullptr || ld16 < s.n_head * HD) return false;
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
         return launch_wmma(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);
     return false;
 #else
-    (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) qf; (void) o16; (void) ld16; (void) n_q; (void) stream; (void) apply_fwht;
+    (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) qf; (void) o16; (void) ld16; (void) n_q; (void) stream; (void) apply_fwht; (void) qf_f16;
     return false;
 #endif
 }

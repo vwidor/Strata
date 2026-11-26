@@ -7276,7 +7276,19 @@ void native_expert_i8_quantize(const float* x, int64_t n_rows, int64_t n_cols, v
     const long long n = (long long) n_rows * n_cols;
     if (n <= 0) return;
     if (n_cols % 32 != 0) { std::fprintf(stderr, "native_expert_i8_quantize: %lld columns\n", (long long) n_cols); std::exit(1); }
-    i8_quantize_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
+    static const bool qv2 = [] {
+        const char* v = std::getenv("STRATA_I8_QUANT_V2");
+        if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0;
+        const char* tm = std::getenv("STRATA_I8_TM");
+        return tm != nullptr && std::atoi(tm) >= 9;
+    }();
+    if (qv2 && ((reinterpret_cast<uintptr_t>(x) & 15) == 0)) {
+        const long long n4 = n >> 2;
+        i8_quantize_v2_kernel<<<(unsigned) ((n4 + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+            reinterpret_cast<const float4*>(x), (block_q8_1*) y, n4);
+    } else {
+        i8_quantize_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
+    }
     check("native_expert_i8_quantize");
 }
 
@@ -7332,10 +7344,15 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     if (tm == 5 && !h_ok) tm = 4;
 #if defined(STRATA_HIP_GFX906)
     const bool w_ok = b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type);
+    const bool w2_ok = b_ok;
+    if (tm == 9 && w2_ok) {
+        // Phase 6C-2 (P1b+P3) adaptive 4-bucket wave64 dispatch: BM=8/16/32/64 by average entries/expert.
+        tm = (avg <= 8) ? 10 : (avg <= 16) ? 11 : (avg <= 32) ? 12 : 13;
+    }
 #if STRATA_EXPERT_NIBBLE_BUILT
-    if (L.gu_nib && w_ok) tm = 7;
+    if (L.gu_nib && w_ok && !(tm >= 10 && tm <= 13)) tm = 7;
 #endif
-    if (tm != 5 && !(w_ok && (tm == 6 || tm == 7)))
+    if (tm != 5 && !(w_ok && (tm == 6 || tm == 7)) && !(w2_ok && tm >= 10 && tm <= 13))
         tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && w_ok ? 8 : 4;
 #else
     if (tm != 5) tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
@@ -7347,8 +7364,8 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
                                                                   i8_smem_bytes(L.gu_type, L.d_type, 4, gg), vo.smem_sm, vo.reserved);
     if (vo.on && !tm_set) tm = strata::kernels::i8_tile_volta(tm, avg, h_ok);   // the tensor-core form from kI8hMinAvg entries an expert (i8_expert_rule.hpp)
     const size_t smem_limit = i8_smem_limit();   // a tile that does not fit the device's shared memory per block falls to the next smaller one
-    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm, gg) > smem_limit) tm = (tm == 8 || tm == 5 || tm == 6 || tm == 7) ? 4 : tm - 1;
-    const int bm = tm == 8 ? 128 : (tm == 5 || tm == 6 || tm == 7) ? 64 : 16 * tm;
+    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm, gg) > smem_limit) tm = (tm >= 5) ? 4 : tm - 1;
+    const int bm = tm == 8 ? 128 : tm == 10 ? 8 : tm == 11 ? 16 : tm == 12 ? 32 : (tm == 5 || tm == 6 || tm == 7 || tm == 13) ? 64 : 16 * tm;
     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
     I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
              cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0), i8_n8_takes(i8_switch_parse(std::getenv("STRATA_I8_N8")), tm), gg};   // 8-entry slices: tile 2 by default, 2-4 with STRATA_I8_N8=1, none with 0

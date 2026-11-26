@@ -973,6 +973,12 @@ inline bool hc_upmix() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HC_UPMIX"); return e != nullptr && e[0] == '1'; }();
     return v;
 }
+// Phase 6C-2 (P6b, opt-in STRATA_PF_F16_OUT=1, HIP FP16 prompt path): skip widen_rows_f16 after FP16-out rocBLAS GEMMs
+// when the immediate downstream consumer reads raw FP16 rows directly (stride 2*ldy halves = ldy floats).
+inline bool pf_f16_out() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_F16_OUT"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
 // CUDA: the fused read only on chunks of 33+ tokens - below that cuBLAS's up GEMM takes another kernel, rounding-level
 // apart, so short chunks keep the default pair
 inline int64_t hc_upmix_min_t() {
@@ -3927,16 +3933,20 @@ struct ColdTrace {
 };
 ColdTrace g_cold;
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-                 std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
+                 std::string& err, int64_t ldy = 0, int64_t ldx = 0, bool raw_f16 = false, bool* did_raw = nullptr) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
+    const bool ask_raw = raw_f16 && gm.f16_io();
+    if (ask_raw) gm.set_skip_widen(true);
     const bool ct = g_cold.begin();
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
     if (ct) g_cold.end("native", name, T, w->ne1, w->ne0);
+    if (ask_raw) gm.set_skip_widen(false);
+    if (did_raw) *did_raw = ask_raw && gm.did_raw_f16();
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                std::string& err, int64_t ldy = 0, const uint16_t* X_lo = nullptr, int64_t ldx = 0,
-               void* stream = nullptr, bool x_f16 = false) {
+               void* stream = nullptr, bool x_f16 = false, bool raw_f16 = false, bool* did_raw = nullptr) {
     if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
     const uint16_t* wb = (const uint16_t*) w->data;
     if (w->q8_scale != nullptr) {
@@ -3953,9 +3963,13 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
         strata::kernels::hc_q8_to_bf16(w->data, w->q8_scale, scratch, (long long) w->elements, stream);
         wb = scratch;
     }
+    const bool ask_raw = raw_f16 && gm.f16_io() && !X_lo;
+    if (ask_raw) gm.set_skip_widen(true);
     const bool ct = g_cold.begin();
     gm.bf16(X, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 0.0f, ldx, x_f16);
     if (ct) g_cold.end("bf16", name, T, w->ne1, w->ne0);
+    if (ask_raw) gm.set_skip_widen(false);
+    if (did_raw) *did_raw = ask_raw && gm.did_raw_f16();
     if (X_lo) gm.bf16(X_lo, wb, Y, T, w->ne1 > 0 ? w->ne1 : 1, w->ne0, ldy, 1.0f);
     return true;
 }
@@ -5032,6 +5046,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 normed = false;   // the previous half's norm of R is stale once the input is replaced
             }
             for (int half = 0; half < 2; ++half) {
+                bool bo_raw = false;   // P6b: m.bo holds raw FP16 rows (stride 2*N halves)
                 if (kva_moe_only && half == 1) {
                     // KVA moe-skip: the attention half wrote its output into R; this layer's MoE half has no consumer
                     // left for an approximated chunk, so it (and its expert transfers) is skipped.  R is not normed for
@@ -5081,8 +5096,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     hcd = true;
                 }
-                if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
-                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                bool lo_raw = false;
+                if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16, pf_f16_out(), &lo_raw)) return false;
+                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo, lo_raw);
                 pt.mark(kPfHcUp, cs);
                 bool upmixed = false;
                 // on the FP16 prompt path (m.f16_io) lo16 holds FP16 bits (act16) and gr_upmix reads it on the FP16 matrix-core builtin (g_act_f16)
@@ -5112,7 +5128,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                            m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                     }
                 }
-                if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
+                bool gated_raw = false;
+                if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs, false, pf_f16_out() && !gr_unfused(), &gated_raw)) return false;
                 pt.mark(kPfHcInj, cs);
                 const bool inj_wave = !hcd && pf_tiny_wave() && wi->q8_scale == nullptr && !m.xn16_lo &&
                                       wi->kind == core::WeightKind::Bf16InF32 && wi->data != nullptr &&
@@ -5126,7 +5143,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, mh_dst, m.mixed_bf_lo);
                 } else {
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, mh_dst,
-                             m.mixed_bf_lo);
+                             m.mixed_bf_lo, gated_raw);
                 }
 
                 if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
@@ -5144,7 +5161,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    bool qkv_raw = false, z_raw = false;
+                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err, 0, 0, pf_f16_out(), &qkv_raw)) return false;
                     // KVA: the gate projection feeds only the output normalization, which a state-only layer skips
                     // (STRATA_KVA_GDN_NORM=1 keeps the full recurrence as the A/B control for the state-only one)
                     static const bool kva_gdn_norm = [] {
@@ -5152,7 +5170,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         return v != nullptr && std::atoi(v) != 0;
                     }();
                     if ((!kva_state_only || kva_gdn_norm) &&
-                        !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                        !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err, 0, 0, pf_f16_out(), &z_raw)) return false;
                     const bool ab_wave = pf_tiny_wave() && !m.mixed_bf_lo &&
                                          wa->kind == core::WeightKind::Bf16InF32 && wb->kind == core::WeightKind::Bf16InF32 &&
                                          wa->data != nullptr && wb->data != nullptr && wa->ne0 == N && wa->ne1 == HV &&
@@ -5172,21 +5190,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     bool fused_gdn = false;
 #if defined(STRATA_USE_HIP)
                     // gfx12, STRATA_GDN_CHUNKED=1: conv and recurrence together, the conv output as FP16 (their time then shows in "gdn conv+gates")
-                    if (!kva_state_only)
+                    if (!kva_state_only && !qkv_raw && !z_raw)
                         fused_gdn = gdn_conv_recurrence_fused(conv, m.qkv, (const float*) wc->data, m.hbuf, state, m.gate, m.beta, m.z,
                                                               (const float*) wnm->data, EPS, EPS, m.y, m.y_h, T, m.cs, ld_y);
 #endif
-                    if (!fused_gdn) gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                    if (!fused_gdn) gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs, qkv_raw);
                     pt.mark(kPfGdnRec, cs);
                     if (fused_gdn) {
                     } else if (kva_state_only && !kva_gdn_norm)   // KVA: the recurrence without the output normalization
                         gdn_recurrence_state_only(state, m.hbuf, m.gate, m.beta, m.y, T, m.cs);
                     else
                         gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
-                                       ld_y);
+                                       ld_y, z_raw);
                     pt.mark(kPfGdnOut, cs);
                     if (!kva_state_only)   // KVA: the out projection feeds only the residual write and the MoE half
-                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y, pf_f16_out(), &bo_raw)) return false;
                     ++gdn_index;
                     if (kva_state_only) {
                         // the layer consumed no expert: its stream entries must still be released, or the issuer
@@ -5210,7 +5228,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
                     // KVA: the query projections have no consumer when only the KV/indexer state advances
-                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    bool qf_raw = false;
+                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err, 0, 0, pf_f16_out() && qsa_fuse_nr(), &qf_raw)) return false;
                     pt.mark(kPfQsaIdxG, cs);   // STRATA_PREFILL_TIMING: "qsa proj" is the k, v and q projections
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
@@ -5283,7 +5302,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
                     if (qsa_fuse_nr()) {
-                        rms_rope_rows(m.Qf, kNHead * 2 * kHeadDim, 2 * kHeadDim, m.q, kQW, (const float*) wqn->data, T, kNHead, kHeadDim, EPS, p0, strata::kernels::rope_scaling(), m.cs);
+                        rms_rope_rows(m.Qf, kNHead * 2 * kHeadDim, 2 * kHeadDim, m.q, kQW, (const float*) wqn->data, T, kNHead, kHeadDim, EPS, p0, strata::kernels::rope_scaling(), m.cs, qf_raw);
                     } else {
                         split_q(m.Qf, m.q, T, m.cs);
                         rms_rows(m.q, (const float*) wqn->data, T * kNHead, kHeadDim, kHeadDim, EPS, m.cs);
@@ -5519,7 +5538,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool need_fwht = st.kv_rot || st.kv_hybrid;
                     const bool gated = !old_attn && qsa_fuse_gate() &&
                                        strata::kernels::qsa_prompt_attn_batch_gated(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.Qf,
-                                                                                    m.attn_h, ld_a > 0 ? ld_a : ZV, T, m.cs, need_fwht);
+                                                                                    m.attn_h, ld_a > 0 ? ld_a : ZV, T, m.cs, need_fwht, qf_raw);
                     {
                         static bool told = false;   // once: which of the two fusions this run took
                         if (!told) {
@@ -5548,8 +5567,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     if (!gated && need_fwht) strata::kernels::fwht256_inplace_cuda(m.attn, T * kNHead, m.cs);
                     pt.mark(kPfQsa, cs);
-                    if (!gated) gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
-                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
+                    if (!gated) gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a, qf_raw);
+                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a, pf_f16_out(), &bo_raw)) return false;
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {
@@ -5561,8 +5580,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
-                    if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
+                    bool lg_raw = false;
+                    const bool lg_f16_ok = pf_f16_out() && (m.g->n_expert == 512 || m.g->n_expert == 256);
+                    if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo, 0, nullptr, false, lg_f16_ok, &lg_raw)) return false;
+                    route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs, lg_raw);
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
                     // the routed ids + weights (and for the layers in STRATA_DBG_FEAT_LAYERS the router-input hidden state, bf16);
                     // STRATA_DBG_ROUTE_OVERRIDE=<file> replaces the routing of the layers listed in that file with the file's ids + weights.
@@ -5624,11 +5645,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     // the shared expert and its scalar gate
+                    bool sh_raw = false;
                     auto shared_expert = [&]() -> bool {
-                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                        bool sg_raw = false, su_raw = false;
+                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err, 0, 0, pf_f16_out(), &sg_raw)) return false;
+                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err, 0, 0, sg_raw, &su_raw)) return false;
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs, sg_raw && su_raw);
+                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err, 0, 0, pf_f16_out() && !m.pp && !pf_dm16(), &sh_raw)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                         const bool sg_wave = pf_tiny_wave() && !m.mixed_bf_lo && wgi->data != nullptr &&
                                              pf_shared_gate_bf16(m.mixed_bf, m.f16_io, (const uint16_t*) wgi->data, m.sg, T, N, m.cs);
@@ -7724,7 +7747,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine16(reinterpret_cast<const uint16_t*>(m.Dm), m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
-                                    use_mmq && !fused_l && !fz_staged_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);   // (fz_staged_l: the fused kernels applied s_down already)
+                                    use_mmq && !fused_l && !fz_staged_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr, sh_raw);   // (fz_staged_l: the fused kernels applied s_down already)
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
@@ -7781,12 +7804,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaMalloc(&Rc, (size_t) T * D * 4); cudaMalloc(&rc, (size_t) T * HC * 4);
                         cudaMalloc(&xc, (size_t) T * D * 2);
                         cudaMemcpyAsync(Rc, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToDevice, m.cs);
-                        gr_write(Rc, m.bo, m.inj, HC, T, m.cs);
+                        gr_write(Rc, m.bo, m.inj, HC, T, m.cs, bo_raw);
                         strata::kernels::cvec_apply(Rc, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
                         gr_norm_rs(Rc, (const float*) wnn->data, EPS, rc, xc, T, m.cs, nullptr, D, xf16);
                         gr_write_cvec_norm_rs(m.R, m.bo, m.inj, HC, cv_dir + l * N, cv_s + l, cv_on,
                                               strata::kernels::cvec().mode, (const float*) wnn->data, EPS, m.grs,
-                                              m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
+                                              m.xn16, T, m.cs, m.xn16_lo, ldx, xf16, bo_raw);
                         std::vector<float> a((size_t) T * D), b((size_t) T * D), ra((size_t) T * HC), rb((size_t) T * HC);
                         std::vector<uint16_t> xa((size_t) T * D), xb((size_t) T * D);
                         cudaMemcpyAsync(a.data(), m.R, a.size() * 4, cudaMemcpyDeviceToHost, m.cs);
@@ -7805,14 +7828,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     } else
                     gr_write_cvec_norm_rs(m.R, m.bo, m.inj, HC, cv_dir + l * N, cv_s + l, cv_on,
                                           strata::kernels::cvec().mode, (const float*) wnn->data, EPS, m.grs, m.xn16,
-                                          T, m.cs, m.xn16_lo, ldx, xf16);
+                                          T, m.cs, m.xn16_lo, ldx, xf16, bo_raw);
                     normed = true;
                 } else if (wnn) {
                     gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
-                                     m.xn16_lo, ldx, xf16);
+                                     m.xn16_lo, ldx, xf16, bo_raw);
                     normed = true;
                 } else {
-                    gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                    gr_write(m.R, m.bo, m.inj, HC, T, m.cs, bo_raw);
                 }
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);

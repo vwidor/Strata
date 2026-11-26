@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -64,6 +65,14 @@ public:
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
     void set_f16_io(bool on) { f16_io_ = on; }
+    bool f16_io() const { return f16_io_; }
+    /// Phase 6C-2 (STRATA_PF_F16_OUT=1): skip in-place widen_rows_f16 on HIP f16_io_ calls (beta=0) so consumers read
+    /// FP16 outputs directly from Y at row stride 2*ldy half-elements (100% bitwise identical to widening first).
+    void set_skip_widen(bool on) {
+        static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
+        skip_widen_ = on && !dbg_nan;
+    }
+    bool did_raw_f16() const { return last_raw_f16_; }
 
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
@@ -114,6 +123,8 @@ private:
     void* hipblaslt_state_ = nullptr;
     void* rocblas_state_ = nullptr;   // HIP: the rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING)
     bool f16_io_ = false;
+    bool skip_widen_ = false;
+    bool last_raw_f16_ = false;
     /// cuBLAS 12 answers the default FP16 algorithm of a few (N, K) shapes with CUBLAS_STATUS_INTERNAL_ERROR once
     /// another CUDA device in the process has initialized its context (issue #1650, Turing + Pascal).  A fixed
     /// algorithm (ALGO2) survives that state, but is markedly slower for the wide shapes, so only the shapes that

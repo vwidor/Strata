@@ -253,9 +253,12 @@ int main(int argc, char** argv) {
             return 77;
         }
 #if defined(__HIPCC__)
-        cudaDeviceProp prop;   // HIP: the gfx11 matrix-core kernel (gr_upmix refuses every other architecture)
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess || !strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName)) {
-            std::printf("gr_upmix_parity: not a gfx11 device, skipped\n");
+        cudaDeviceProp prop;   // HIP: gfx11 matrix-core or gfx906 wave64 fdot2 kernel
+        const bool ok_hip = cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+                            (strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName) ||
+                             (prop.major == 9 && prop.minor == 0));
+        if (!ok_hip) {
+            std::printf("gr_upmix_parity: not a gfx11 or gfx906 device, skipped\n");
             return 77;
         }
 #else
