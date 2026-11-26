@@ -365,6 +365,21 @@ With both MI50s dedicated to Strata (`--vram-reserve-later-mib` removed, `24,576
 
 *(Server-side `STRATA_ADMIT_SHORT_FIRST=1024` / `STRATA_ADMIT_MAX_WAIT_S=20` must be set in the server process environment, e.g., systemd drop-in, since `server.py` reads it from `os.environ` at startup.)*
 
+### 9.14 Phase 6A: Zero-Compile Config Tuning & Demand-Driven DPM Cooldown (measured, 2026-11-26)
+Applied on the existing Phase 5 `gfx906` binary (`180 W` cap, `layer_split=25`, 100% VRAM resident, `no loan`):
+- **Demand-driven DPM hold (`auto` ↔ `high`, `120 s` idle cooldown):** Measured Vega 20 idle power at `0%` busy is **`19–20 W/card`** under `auto` (`mclk=350 MHz`) and **`23–24 W/card`** under `high` (`mclk=1000 MHz`, CUs still power-gated to `sclk=925 MHz`, only `+8 W` pair). A lightweight local `/v1/status` watcher switches both MI50s to `high` on any active request and restores `auto` after `120 s` idle — preventing `350 MHz` HBM2 dips between stage handoffs with `0 W` extra overnight idle draw.
+- **Zero-compile config wins:** `STRATA_PIPED_READ_PIECE=16384` (restores full 2-GPU overlap on idle `>2k` prefills while keeping `STRATA_PIPED_DECODE_CHUNK=1024` when decoding), `STRATA_PF_W16_CACHE_MIB=2400` (`1,850 MiB` FP16 dense cache on GPU 0, keeping `2,048 MiB` free for elastic vision), `STRATA_DEQUANT_WIDE=1`, `STRATA_GDN_CONVL2=2`, `STRATA_PLE_COMPACT=1`, `STRATA_PLE_COPY_STREAM=1`, `STRATA_SLOT_CKPT_KV_DIRECT=1`, `STRATA_SLOT_CKPT_MOVE=1`, `STRATA_VERIFY_QDEDUP=1`, `STRATA_BATCH_GDN_GROUPS=1`, `STRATA_BATCH_ATTN_ROWS=1`, `STRATA_DF_PLE=1`, `STRATA_TOPK_REG_MIN_BLOCKS=22528`, contiguous `213 MiB` DFlash2 draft head (`STRATA_DF2_HEAD` unset), and dead flags removed.
+
+| Workload (`180 W`, `temp=0`, thinking off) | Phase 5 (`split=25`) | **Phase 6A (live)** | Gain |
+|---|---:|---:|---:|
+| **Cold Prefill `3.9k`** (`3,938` tok, 0% reuse) | `508–687 tok/s` | **`934.8 tok/s`** (`4.21 s`) | **`+36% to +84%`** |
+| **Cold Prefill `10.5k`** (`10,538` tok, 0% reuse) | `950.2 tok/s` *(Phase 4 `9.3k`)* | **`1,124.9 tok/s`** (`9.37 s`) | **`+18.4%`** *(first `>1.1k tok/s`!)* |
+| **First-Token `T=1` Window** | `29–30 ms` (`33.5 tok/s`) | **`24–25 ms`** (`41.2–41.8 tok/s`) | **`-17%` latency (`+23%`)** |
+| **Solo Prose** *(pure)* | `61.2 tok/s` | **`62.2 tok/s`** *(contended: `45.5` gen)* | `+1.6%` |
+| **Solo Code** *(pure / e2e)* | `81.0` / `72.7 tok/s` | **`83.7` / `75.2 tok/s`** | **`+3.3%`** / **`+3.4%`** |
+| **4× Batch Code** *(pure rows/s / incl. 4 admissions / e2e)* | — | **`~124.9 rows/s`** pure · `108.3` incl. adm · `104.2 e2e` (`26.1/slot`) | `28.2 ms`/stage-step |
+| **Post-Prefill Free VRAM** *(GPU 0 / GPU 1)* | `~3,907` / `1,906 MiB` | **`1,980` / `1,688 MiB`** (`1,850 MiB` `W16` on GPU 0) | Vision headroom intact |
+
 ## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
 The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.
 
