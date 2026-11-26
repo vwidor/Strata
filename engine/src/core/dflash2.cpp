@@ -4,6 +4,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -54,7 +55,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     fr(ctx_pos_);
     fr(rb_q_); fr(rb_d_); fr(rb_pos_);
     if (!blob_shared_) fr(blob_);
-    fr(landing_); if (dpend_) cudaFreeHost(dpend_); fr(tag_); fr(d_meta_); fr(xq_); fr(xil_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rope_inv_);
+    fr(landing_); if (dpend_) cudaFreeHost(dpend_); fr(tag_); fr(d_meta_); fr(xq_); fr(xil_); fr(xqp_); fr(xdp_); fr(xsump_); fr(xqc_); fr(xdc_); fr(xsumc_); fr(rt_ctx_); fr(rope_inv_);
     for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
     fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
@@ -261,6 +262,9 @@ bool Dflash2Drafter::alloc(std::string& err) {
               dev(&part_, (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
               dev(&hsel_, kDrafts * rank_) && dev(&topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
     ok = ok && dev(&landing_, (size_t) kRows * std::max<size_t>(taps_.size(), 1) * (size_t) N_);
+    if (ok && xsum_enabled()) {
+        ok = dev(&xsump_, (size_t) 5 * N_ / 16 * 8 + 128) && dev(&xsumc_, (size_t) 5 * N_ / 16 * 8 + 128);
+    }
     for (int l = 0; ok && l < L_; ++l) ok = dev(&kring_[l], (size_t) kRing * NKV_ * HD_) && dev(&vring_[l], (size_t) kRing * NKV_ * HD_);
     if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     void* hd = nullptr;
@@ -284,6 +288,8 @@ bool Dflash2Drafter::alloc(std::string& err) {
     cudaMemset(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
     cudaMemset(xqc_, 0, (size_t) 5 * N_ * 8 + 4096);
     cudaMemset(xdc_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
+    if (xsump_) cudaMemset(xsump_, 0, ((size_t) 5 * N_ / 16 * 8 + 128) * sizeof(int16_t));
+    if (xsumc_) cudaMemset(xsumc_, 0, ((size_t) 5 * N_ / 16 * 8 + 128) * sizeof(int16_t));
     for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); cudaMemset(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); }
     return cudaDeviceSynchronize() == cudaSuccess;
 }
@@ -348,11 +354,89 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
     }
     const bool head_indexed = Dflash2Drafter::head_indexed() && !head_native && same_dev && !vocab.empty() &&
                               kernels::native_mmvq_indexed_supported(head->type());
+    const bool head_q4 = Dflash2Drafter::head_q4_0() && !head_native && !head_indexed && !vocab.empty() &&
+                         kernels::dequant_bf16_supported(head->type());
     const void* hw = head->weights();
     const int64_t row_bytes = (int64_t) head->row_bytes();
+    int head_type = head->type();
+    int64_t eff_row_bytes = row_bytes;
     int64_t head_rows = row_bytes > 0 ? (int64_t) (head->weight_bytes() / (uint64_t) row_bytes) : 0;
+    auto gather_head_rows = [&](const int32_t* dv, int64_t cnt, uint8_t* dst, cudaStream_t st) {
+        if (head->type() == 14 && kernels::native_q6_k_gather_rows(hw, dv, cnt, dst, st)) return;
+        kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, cnt, dst, st);
+    };
+    auto copy_from_head_dev = [&](uint8_t* dst_on_dev, const uint8_t* src_on_head, size_t nbytes) -> bool {
+        if (same_dev) {
+            return cudaMemcpy(dst_on_dev, src_on_head, nbytes, cudaMemcpyDeviceToDevice) == cudaSuccess;
+        }
+        int can_peer = 0;
+        if (cudaDeviceCanAccessPeer(&can_peer, device_, head_device) == cudaSuccess && can_peer != 0) {
+            if (cudaMemcpyPeer(dst_on_dev, device_, src_on_head, head_device, nbytes) == cudaSuccess) return true;
+            (void) cudaGetLastError();
+        }
+        std::vector<uint8_t> hbuf(nbytes);
+        {
+            const OnDevice on_head(head_device);
+            if (cudaMemcpy(hbuf.data(), src_on_head, nbytes, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+        }
+        return cudaMemcpy(dst_on_dev, hbuf.data(), nbytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    };
     if (head_indexed) {
         head_indexed_ = true;
+        head_rows = (int64_t) vocab.size();
+    } else if (head_q4) {
+        // STRATA_DF2_HEAD=q4_0: gather draft vocab rows chunk-by-chunk on head_device, dequantize to F32, quantize to
+        // GGML Q4_0 (18 B / 32 elems), and copy (peer or host-bounce) onto device_. Peak temp VRAM ~46 MiB.
+        const int64_t q4_row_bytes = (int64_t) (N_ / 32) * 18;
+        const size_t total_q4 = (size_t) ((int64_t) vocab.size() * q4_row_bytes);
+        if (cudaMalloc((void**) &dhead_, total_q4) != cudaSuccess) {
+            err = "dflash2: the Q4_0 draft head does not fit";
+            return false;
+        }
+        const int64_t chunk_max = std::min<int64_t>(4096, (int64_t) vocab.size());
+        const int src_dev = same_dev ? device_ : head_device;
+        int32_t* dv = nullptr;
+        uint8_t *tmp_raw = nullptr, *tmp_q4 = nullptr;
+        float* tmp_f32 = nullptr;
+        bool ok_q4 = true;
+        {
+            const OnDevice on_head(src_dev);
+            ok_q4 = cudaMalloc((void**) &dv, vocab.size() * 4) == cudaSuccess &&
+                    cudaMalloc((void**) &tmp_raw, (size_t) (chunk_max * row_bytes)) == cudaSuccess &&
+                    cudaMalloc((void**) &tmp_f32, (size_t) (chunk_max * N_) * sizeof(float)) == cudaSuccess &&
+                    cudaMalloc((void**) &tmp_q4, (size_t) (chunk_max * q4_row_bytes)) == cudaSuccess &&
+                    cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        for (int64_t r0 = 0; ok_q4 && r0 < (int64_t) vocab.size(); r0 += chunk_max) {
+            const int64_t cnt = std::min<int64_t>(chunk_max, (int64_t) vocab.size() - r0);
+            {
+                const OnDevice on_head(src_dev);
+                gather_head_rows(dv + r0, cnt, tmp_raw, nullptr);
+                kernels::dequant_f32(head->type(), tmp_raw, 0, cnt, N_, tmp_f32, nullptr);
+                kernels::df2_f32_to_q4_0(tmp_f32, tmp_q4, cnt * (N_ / 32), nullptr);
+                if (cudaDeviceSynchronize() != cudaSuccess) ok_q4 = false;
+            }
+            if (ok_q4 && !copy_from_head_dev(dhead_ + (size_t) (r0 * q4_row_bytes), tmp_q4, (size_t) (cnt * q4_row_bytes))) {
+                ok_q4 = false;
+            }
+        }
+        {
+            const OnDevice on_head(src_dev);
+            if (dv) cudaFree(dv);
+            if (tmp_raw) cudaFree(tmp_raw);
+            if (tmp_f32) cudaFree(tmp_f32);
+            if (tmp_q4) cudaFree(tmp_q4);
+        }
+        if (!ok_q4) {
+            cudaFree(dhead_);
+            dhead_ = nullptr;
+            err = "dflash2: Q4_0 draft head conversion/copy failed";
+            return false;
+        }
+        vram_ += total_q4;
+        hw = dhead_;
+        head_type = 2;   // GGML Q4_0
+        eff_row_bytes = q4_row_bytes;
         head_rows = (int64_t) vocab.size();
     } else if (!vocab.empty() && shared_.rows != nullptr && !std::getenv("STRATA_DF2_SHARE_HEAD_OFF") && shared_.type == head->type() &&
         shared_.n == (int64_t) vocab.size() && shared_.vocab_host != nullptr && *shared_.vocab_host == vocab && shared_.vocab_dev != nullptr) {
@@ -362,7 +446,7 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         hw = dhead_;
         head_rows = (int64_t) vocab.size();
     } else if (!vocab.empty() && head_device >= 0 && head_device != device_) {
-        // the head is on another card: gather the subset's rows there, copy them over once
+        // the head is on another card: gather the subset's rows there (handling packed Q6_K), copy over (peer or host-bounce on P2P=0)
         const size_t bytes = (size_t) ((int64_t) vocab.size() * row_bytes);
         uint8_t* tmp = nullptr;
         int32_t* dv = nullptr;
@@ -374,7 +458,7 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
                 return false;
             }
             cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
-            kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), tmp, nullptr);
+            gather_head_rows(dv, (int64_t) vocab.size(), tmp, nullptr);
             cudaDeviceSynchronize();
             cudaFree(dv);
         }
@@ -383,9 +467,9 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
             err = "dflash2: the draft vocabulary's head rows do not fit";
             return false;
         }
-        const cudaError_t pe = cudaMemcpyPeer(dhead_, device_, tmp, head_device, bytes);
+        const bool ok_cp = copy_from_head_dev(dhead_, tmp, bytes);
         { const OnDevice on_head(head_device); cudaFree(tmp); }
-        if (pe != cudaSuccess) { err = std::string("dflash2: the head rows' copy to the drafter's card: ") + cudaGetErrorString(pe); return false; }
+        if (!ok_cp) { err = std::string("dflash2: the head rows' copy to the drafter's card failed: ") + cudaGetErrorString(cudaGetLastError()); return false; }
         vram_ += bytes;
         hw = dhead_;
         head_rows = (int64_t) vocab.size();
@@ -397,17 +481,17 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
             return false;
         }
         cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
-        kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, nullptr);
+        gather_head_rows(dv, (int64_t) vocab.size(), dhead_, nullptr);
         cudaDeviceSynchronize();
         cudaFree(dv);
         vram_ += (uint64_t) ((int64_t) vocab.size() * row_bytes);
         hw = dhead_;
         head_rows = (int64_t) vocab.size();
     }
-    if (!bind_raw(embed, hw, head->type(), head_rows, vocab, err)) return false;
+    if (!bind_raw(embed, hw, head_type, head_rows, vocab, err)) return false;
     std::fprintf(stderr, "strata dflash2: %lld-token draft head (%.1f MiB%s), drafter %.0f MiB of VRAM (%s weights)\n", (long long) n_dvocab_,
-                 head_indexed_ ? 0.0 : (double) (n_dvocab_ * row_bytes) / 1048576.0,
-                 head_indexed_ ? ", indexed into target head" : (dhead_shared_ ? ", the MTP drafter's copy, no second one" : ""),
+                 head_indexed_ ? 0.0 : (double) (n_dvocab_ * eff_row_bytes) / 1048576.0,
+                 head_indexed_ ? ", indexed into target head" : (head_q4 ? ", Q4_0" : (dhead_shared_ ? ", the MTP drafter's copy, no second one" : "")),
                  (double) vram_ / 1048576.0, q4_ ? "Q4_0" : "Q8_0");
     // the pack's selector codebooks as Q4_0 rows (tools/dflash2_pack.py --q4_0-selector; strata_control/drafting.py reads this text from the program to know it can use that pack)
     if (find("candidate_selector.predecessor_codebook").dtype == "q4_0")
@@ -416,7 +500,8 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
 }
 
 #endif  // STRATA_DF2_NO_BIND
-void Dflash2Drafter::gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd) {
+void Dflash2Drafter::gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd,
+                          const int16_t* xsum) {
     kernels::Df2Mat mats[3];
     int n = 0, n_in = 0;
     auto o = outs.begin();
@@ -426,18 +511,18 @@ void Dflash2Drafter::gemm(std::initializer_list<const char*> names, std::initial
         if (n == 0) n_in = (int) t.cols;
         ++n;
     }
-    kernels::df2_gemm(mats, n, xq, xd, n_in, ncols, cs);
+    kernels::df2_gemm(mats, n, xq, xd, n_in, ncols, cs, xsum);
 }
 
 // The part of a context update after the activations are quantized: per layer the keys and values (projection, k-norm, rope, ring write).  Also what a ring
 // rebuild runs over logged rows: `xq` / `xd` are then the log's codes and scales, `pos` the rows' positions (device), rt_ctx_ their rope table.
-bool Dflash2Drafter::record_kv(int n, cudaStream_t cs, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err) {
+bool Dflash2Drafter::record_kv(int n, cudaStream_t cs, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err, const int16_t* xsum) {
     using namespace kernels;
     try {
         for (int l = 0; l < L_; ++l) {
             const std::string p = "layers." + std::to_string(l) + ".";
             const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
-            gemm({kp.c_str(), vp.c_str()}, {kc_, vc_}, n, cs, xq, xd);
+            gemm({kp.c_str(), vp.c_str()}, {kc_, vc_}, n, cs, xq, xd, xsum);
             stamp("gemm:kp");
             df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), pos, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs, tag_, d_meta_ + 18);
             stamp("df2_kv_ring");
@@ -459,11 +544,11 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
         const int tap_n = (int) taps_.size() * N_;
         if (rope) df2_rope_table_inv(pdev, n, rope_inv_, rt_ctx_, cs);
         stamp("df2_rope_table");
-        df2_quant_rows(taps, tap_n, n, xqc_, xdc_, cs);
+        df2_quant_rows(taps, tap_n, n, xqc_, xdc_, cs, xsumc_);
         stamp("df2_quant_rows");
-        gemm({"fc.weight"}, {fcy_}, n, cs, xqc_, xdc_);
+        gemm({"fc.weight"}, {fcy_}, n, cs, xqc_, xdc_, xsumc_);
         stamp("gemm:fc");
-        df2_rms_quant(fcy_, f32("hidden_norm.weight"), nullptr, n, N_, eps_, xqc_, xdc_, cs);
+        df2_rms_quant(fcy_, f32("hidden_norm.weight"), nullptr, n, N_, eps_, xqc_, xdc_, cs, xsumc_);
         stamp("df2_rms_quant");
         if (log_on_) {   // the ring log: these codes and scales are all the K/V of the five layers are made from (see begin_request)
             int8_t* const lq = logq_dst != nullptr ? logq_dst : h_logq_;
@@ -471,7 +556,7 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
             cudaMemcpyAsync(lq, xqc_, (size_t) n * N_, cudaMemcpyDeviceToHost, cs);
             cudaMemcpyAsync(ld, xdc_, (size_t) n * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs);
         }
-        if (!record_kv(n, cs, xqc_, xdc_, pdev, err)) return false;
+        if (!record_kv(n, cs, xqc_, xdc_, pdev, err, xsumc_)) return false;
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -487,7 +572,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("df2_rope_table");
         embed_(d_meta_ + 24, B, h_, cs);
         stamp("embed_");
-        df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs);
+        df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs, xsump_);
         stamp("df2_rms_quant");
         for (int l = 0; l < L_; ++l) {
             const std::string p = "layers." + std::to_string(l) + ".";
@@ -497,43 +582,43 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
             const std::string qp = p + "self_attn.q_proj.weight", kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
             const std::string gp = p + "mlp.gate_proj.weight", up = p + "mlp.up_proj.weight";
             const std::string op = p + "self_attn.o_proj.weight";
-            if (!skip_part("tiny")) gemm({akp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
+            if (!skip_part("tiny")) gemm({akp.c_str()}, {dyn_}, B, cs, xqp_, xdp_, xsump_);
             stamp("gemm:akp");
-            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_a, B, N_, group_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_a, B, N_, group_, xqp_, xdp_, cs, xsump_);
             stamp("df2_conv_quant");
-            if (!skip_part("qkvo")) gemm({qp.c_str(), kp.c_str(), vp.c_str()}, {q_, k_, v_}, B, cs, xqp_, xdp_);
+            if (!skip_part("qkvo")) gemm({qp.c_str(), kp.c_str(), vp.c_str()}, {q_, k_, v_}, B, cs, xqp_, xdp_, xsump_);
             stamp("gemm:qp");
             if (!skip_part("small")) df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_, kblk_, B, NH_, NKV_, eps_, cs);
             stamp("df2_norm_rope_qk");
             if (fork_) cudaStreamWaitEvent(cs, ev_ctx_[l], 0);   // the context update has written this layer's ring
-            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs, tag_, d_meta_ + 18);
+            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs, tag_, d_meta_ + 18, xsump_);
             stamp("df2_attention");
-            if (!skip_part("qkvo")) gemm({op.c_str()}, {o_}, B, cs, xqp_, xdp_);
+            if (!skip_part("qkvo")) gemm({op.c_str()}, {o_}, B, cs, xqp_, xdp_, xsump_);
             stamp("gemm:o_proj");
-            if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, B, N_, group_, eps_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, B, N_, group_, eps_, xqp_, xdp_, cs, xsump_);
             stamp("df2_conv_rms_quant");
-            if (!skip_part("tiny")) gemm({mkp.c_str()}, {dyn_}, B, cs, xqp_, xdp_);
+            if (!skip_part("tiny")) gemm({mkp.c_str()}, {dyn_}, B, cs, xqp_, xdp_, xsump_);
             stamp("gemm:mkp");
-            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_m, B, N_, group_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_m, B, N_, group_, xqp_, xdp_, cs, xsump_);
             stamp("df2_conv_quant");
-            if (!skip_part("mlp")) gemm({gp.c_str(), up.c_str()}, {gate_, up_}, B, cs, xqp_, xdp_);
+            if (!skip_part("mlp")) gemm({gp.c_str(), up.c_str()}, {gate_, up_}, B, cs, xqp_, xdp_, xsump_);
             stamp("gemm:gp");
-            if (!skip_part("small")) df2_swiglu_quant(gate_, up_, B, I_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_swiglu_quant(gate_, up_, B, I_, xqp_, xdp_, cs, xsump_);
             stamp("df2_swiglu_quant");
-            if (!skip_part("mlp")) gemm({(p + "mlp.down_proj.weight").c_str()}, {mlp_}, B, cs, xqp_, xdp_);
+            if (!skip_part("mlp")) gemm({(p + "mlp.down_proj.weight").c_str()}, {mlp_}, B, cs, xqp_, xdp_, xsump_);
             stamp("gemm:mlp.down_proj");
             // the next layer's input norm, or after the last layer the final norm (-> fn_, the rows the head and the selector read)
             const std::string next_gamma = l + 1 < L_ ? "layers." + std::to_string(l + 1) + ".input_layernorm.weight" : std::string("norm.weight");
-            if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs);
+            if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs, xsump_);
             stamp("df2_conv_rms_quant");
         }
         native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
-        df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_, xdp_, cs);   // and the selector projection's
+        df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_, xdp_, cs, xsump_);   // and the selector projection's
         const bool hs_fork = fork_ && cs2_ != nullptr && ev_hs_[0] != nullptr;   // the selector's projection beside the head, the top-k and their launches
         if (hs_fork) {
             cudaEventRecord(ev_hs_[0], cs);
             cudaStreamWaitEvent(cs2_, ev_hs_[0], 0);
-            gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs2_, xqp_, xdp_);
+            gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs2_, xqp_, xdp_, xsump_);
             cudaEventRecord(ev_hs_[1], cs2_);
         }
         if (!skip_part("head")) {
@@ -551,7 +636,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         df2_topk(logits_, (int) n_dvocab_, dvocab_, ndraft_, topscratch_, topval_, toptok_, cs);
         stamp("df2_topk");
         if (hs_fork) cudaStreamWaitEvent(cs, ev_hs_[1], 0);
-        else gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs, xqp_, xdp_);
+        else gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs, xqp_, xdp_, xsump_);
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,

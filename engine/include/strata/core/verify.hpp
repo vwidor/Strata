@@ -717,6 +717,11 @@ private:
     float* tap_scratch_ = nullptr;                ///< one row's streams, [hc][n_embd]
     cudaStream_t tap_cs_ = nullptr;               ///< gather_taps: this stage's copies of its taps (lazily created on device_)
     cudaEvent_t tap_ev_ = nullptr;
+    float* tap_bounce_h_ = nullptr;               ///< P2P=0 pinned host bounce for cross-device tap gather
+    size_t tap_bounce_bytes_ = 0;
+    cudaStream_t tap_h2d_cs_ = nullptr;           ///< landing-device H2D stream for P2P=0 tap bounce
+    cudaEvent_t tap_h2d_ev_ = nullptr;
+    int tap_h2d_dev_ = -1;
     float* h_tap_ = nullptr;     float* m_tap_ = nullptr;       ///< the mapped copy of tap_dev_
     std::FILE* tap_file_ = nullptr;
     bool tap_split_ = false;                      ///< STRATA_TAP_FILE on a layer split - this (first) stage gathers the chain's taps to the host

@@ -3404,9 +3404,15 @@ std::string nibble_refusal(const Options& o) {
             (void) cudaGetLastError();
             return "cannot read CUDA" + std::to_string(d) + "'s properties";
         }
+#if defined(STRATA_HIP_GFX906)
+        if (p.major != 9 || p.minor != 0)
+            return "CUDA" + std::to_string(d) + " (" + p.name + ") is compute capability " + std::to_string(p.major) + "." +
+                   std::to_string(p.minor) + ": the gfx906 4-bit slots require gfx906 (cc 9.0)";
+#else
         if (p.major != 6 || p.minor != 0)
             return "CUDA" + std::to_string(d) + " (" + p.name + ") is compute capability " + std::to_string(p.major) + "." +
                    std::to_string(p.minor) + ": the 4-bit slots are for compute capability 6.0 (GP100) only";
+#endif
     }
     if (std::string e = nib::env_conflicts(); !e.empty()) return e;
     if (o.peer_device >= 1) return "--peer-device (its cache holds GGUF blobs)";
@@ -5646,9 +5652,14 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (native_pack) skip.insert("token_embd.weight");
-        // STRATA_HC_Q8=1 (single GPU): the layers' hyper-connection down / up projections live only as Q8_0 (NativeDense
-        // quantizes them from the pack file), so their bf16 copy is not loaded
-        if (!o.native_dense_gguf.empty() && !multi_gpu && strata::core::NativeDense::hc_q8_requested())
+        // STRATA_HC_Q8=1 (single GPU, or multi-GPU with opt-in STRATA_HC_Q8_SKIP_SPLIT=1): the layers'
+        // hyper-connection down / up projections live only as Q8_0 (NativeDense quantizes them from the pack file),
+        // so their bf16 copy is not loaded (~295 MiB/GPU saved on HIP multi-GPU).
+        static const bool hc_q8_skip_split = [] {
+            const char* v = std::getenv("STRATA_HC_Q8_SKIP_SPLIT");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (!o.native_dense_gguf.empty() && (!multi_gpu || hc_q8_skip_split) && strata::core::NativeDense::hc_q8_requested())
             strata::core::NativeDense::add_hc_skip(o.pack, skip);
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
@@ -8209,7 +8220,7 @@ int main(int argc, char** argv) {
     // (--draft-fallback none) the same formula from the vocabulary file, which that drafter never read)
     // DF-05: with the MTP loaded and the same draft-head subset (the plain gather: no --mtp-q4 head, no repack) the DFlash2 shares the MTP's copy at bind
     // (STRATA_DF2_SHARE_HEAD_OFF=1: its own copy, the A/B), and the cache is sized without that second copy
-    const bool df2_expect_share = !df2_solo && !strata::core::Dflash2Drafter::head_native() && !o.mtp.empty() && std::getenv("STRATA_DF2_SHARE_HEAD_OFF") == nullptr && o.mtp_q4 != "all" && o.mtp_q4 != "head" &&
+    const bool df2_expect_share = !df2_solo && !strata::core::Dflash2Drafter::head_native() && !strata::core::Dflash2Drafter::head_q4_0() && !o.mtp.empty() && std::getenv("STRATA_DF2_SHARE_HEAD_OFF") == nullptr && o.mtp_q4 != "all" && o.mtp_q4 != "head" &&
                                   std::getenv("STRATA_MTP_FULL_HEAD") == nullptr && std::getenv("STRATA_Q6_PACKED") == nullptr && std::getenv("STRATA_MTP_Q8_SM60") == nullptr &&
                                   std::filesystem::exists(df2_vocab_path());
     auto df2_offer_head = [&]() {   // after mtp.bind, before df2.bind
@@ -8237,13 +8248,16 @@ int main(int argc, char** argv) {
             }
             return bytes;
         }
-        if (!df2_solo) return (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab);
+        const int64_t rb = strata::core::Dflash2Drafter::head_q4_0()
+            ? (int64_t) (g.n_embd / 32) * 18
+            : (int64_t) h_ref.row_bytes();
+        if (!df2_solo && !strata::core::Dflash2Drafter::head_q4_0()) return (int64_t) mtp.bind_bytes((uint64_t) rb, n_vocab);
         int64_t bytes = (int64_t) std::min(o.spec, (int) strata::kernels::kVerifyNarrowT) * n_vocab * (int64_t) sizeof(float);
         if (FILE* f = std::fopen(df2_vocab_path().c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (int64_t) (size / 4) * (int64_t) native_head.row_bytes() + (int64_t) size;
+            if (size >= 4 && size % 4 == 0) bytes += (int64_t) (size / 4) * rb + (int64_t) size;
         }
         return bytes;
     };

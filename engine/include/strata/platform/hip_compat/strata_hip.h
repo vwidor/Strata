@@ -27,6 +27,8 @@
 #define cudaError_t hipError_t
 #define cudaSuccess hipSuccess
 #define cudaErrorNotReady hipErrorNotReady
+#define cudaErrorInvalidValue hipErrorInvalidValue
+#define cudaErrorInvalidDevice hipErrorInvalidDevice
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorStreamCaptureUnsupported hipErrorStreamCaptureUnsupported
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
@@ -36,6 +38,7 @@
 #define cudaGraphExec_t hipGraphExec_t
 #define cudaGraphNode_t hipGraphNode_t
 #define cudaDeviceProp hipDeviceProp_t
+#define cudaFuncAttributes hipFuncAttributes
 #define cudaMemcpyKind hipMemcpyKind
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -85,6 +88,7 @@
 #define cudaSetDevice hipSetDevice
 #define cudaGetDeviceCount hipGetDeviceCount
 #define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
 // The shared-memory opt-in limit: some HIP versions report 0 for it on GCN cards; the real ceiling there is
 // the plain per-block limit (64 KB of LDS on gfx906).
 inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, int dev) {
@@ -168,6 +172,16 @@ inline hipError_t cudaFuncGetName(const char** name, const void*) { *name = null
 template <typename Kernel>
 inline hipError_t cudaFuncSetAttribute(Kernel kernel, hipFuncAttribute attribute, int value) {
     return hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), attribute, value);
+}
+template <typename Kernel>
+inline hipError_t cudaFuncGetAttributes(hipFuncAttributes* attr, Kernel kernel) {
+    return hipFuncGetAttributes(attr, reinterpret_cast<const void*>(kernel));
+}
+template <typename Kernel>
+inline hipError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks, Kernel kernel, int blockSize,
+                                                                size_t dynamicSMemSize) {
+    return hipOccupancyMaxActiveBlocksPerMultiprocessor(numBlocks, reinterpret_cast<const void*>(kernel), blockSize,
+                                                        dynamicSMemSize);
 }
 #define cudaMemcpyToSymbol(sym, src, ...) hipMemcpyToSymbol(HIP_SYMBOL(sym), src, __VA_ARGS__)
 #define cudaMemcpyFromSymbol(dst, sym, ...) hipMemcpyFromSymbol(dst, HIP_SYMBOL(sym), __VA_ARGS__)

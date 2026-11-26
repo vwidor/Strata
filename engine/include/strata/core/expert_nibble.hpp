@@ -30,8 +30,8 @@
 #include <string>
 #include <vector>
 
-#if defined(STRATA_EXPERIMENTAL_SM60) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && \
-    !defined(STRATA_GPU_METAL)
+#if (defined(STRATA_EXPERIMENTAL_SM60) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && \
+     !defined(STRATA_GPU_METAL)) || defined(STRATA_HIP_GFX906)
 #define STRATA_EXPERT_NIBBLE_BUILT 1
 #else
 #define STRATA_EXPERT_NIBBLE_BUILT 0
@@ -284,8 +284,10 @@ inline std::string env_conflicts() {
         return "STRATA_MMQ_DIRECT (the prompt MMQ would read a converted slot in place as GGUF blocks)";
     v = set("STRATA_PREFILL_MMQ");
     if (v != nullptr && std::atoi(v) == 0) return "STRATA_PREFILL_MMQ=0 (the FP16 prompt path reads GGUF blocks)";
+#if !defined(STRATA_HIP_GFX906)
     v = set("STRATA_PF_FUSED");
     if (v != nullptr && v[0] == '1') return "STRATA_PF_FUSED=1 (the fused prompt kernels read GGUF blocks)";
+#endif
     v = set("STRATA_FS_SLOTS");
     if (v != nullptr && std::atoi(v) > 0) return "STRATA_FS_SLOTS (Foresight swaps GGUF blobs into slots)";
     v = set("STRATA_EXPERT_V2");
@@ -293,8 +295,13 @@ inline std::string env_conflicts() {
     v = set("STRATA_KV_GROW");
     if (v != nullptr && v[0] != '0') return "STRATA_KV_GROW (the elastic K/V moves slots at their GGUF size)";
     v = set("STRATA_EXP_MODE");
+#if defined(STRATA_HIP_GFX906)
+    if (v != nullptr && std::atoi(v) != 0 && std::atoi(v) != 8 && std::atoi(v) != 11 && std::atoi(v) != 12)
+        return "STRATA_EXP_MODE other than 0, 8, 11 or 12 (another layout's gate/up kernels)";
+#else
     if (v != nullptr && std::atoi(v) != 0 && std::atoi(v) != 8)
         return "STRATA_EXP_MODE other than 0 or 8 (another layout's gate/up kernels)";
+#endif
     return {};
 }
 

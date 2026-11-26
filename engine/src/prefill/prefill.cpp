@@ -3872,6 +3872,16 @@ bool Prefill::nibble_prompt_check(std::string& why) {
     for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
         if (!core::nibble::layer(l).on) continue;
         const auto& f = lay.fmt[(size_t) l];
+#if defined(STRATA_HIP_GFX906)
+        const auto nib_i8 = strata::kernels::native_expert_layout_nib(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        const char* const i8_env = std::getenv("STRATA_EXPERT_I8");
+        const bool i8_ok = (i8_env == nullptr || std::atoi(i8_env) != 0) &&
+                           strata::kernels::native_expert_i8_supported(nib_i8);
+        if (!i8_ok) {
+            why = "layer " + std::to_string(l) + ": gfx906 4-bit slots need native_expert_i8 support (STRATA_EXPERT_I8 != 0)";
+            return false;
+        }
+#else
         const char* w = !mmq_plan().any || (size_t) l >= mmq_plan().layer.size() || !mmq_plan().layer[(size_t) l]
                             ? "no prompt MMQ for it (the FP16 path dequantizes GGUF blocks)"
                         : mmq_plan().wmma_only[(size_t) l] ? "the WMMA tiles read GGUF blocks"
@@ -3884,6 +3894,7 @@ bool Prefill::nibble_prompt_check(std::string& why) {
             why = "layer " + std::to_string(l) + ": " + w;
             return false;
         }
+#endif
     }
     return true;
 }
@@ -5732,7 +5743,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.src_dev != nullptr && m.slot_dev != nullptr && m.ids_identity != nullptr &&
                         m.g->n_expert > 0 && m.g->n_expert <= 1024 &&
                         (i8_all_t_env || T * K >= m.g->n_expert * 5) &&
-#if STRATA_EXPERT_NIBBLE_BUILT
+#if STRATA_EXPERT_NIBBLE_BUILT && !defined(STRATA_HIP_GFX906)
                         !nib_l.on &&
 #endif
                         true) {
@@ -5745,9 +5756,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (stream_all || all_res) {
                             const auto& f = lay.fmt[(size_t) l];
+#if STRATA_EXPERT_NIBBLE_BUILT && defined(STRATA_HIP_GFX906)
+                            i8_gp_L = nib_l.on
+                                ? strata::kernels::native_expert_layout_nib(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                                : strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                            const bool i8_same = nib_l.on
+                                ? (i8_gp_L.down_off == nib_l.down_off && i8_gp_L.bytes == nib_l.slot_bytes && f.n_embd == N && f.n_ff == kFF && all_res)
+                                : (i8_gp_L.up_off == f.up_off && i8_gp_L.down_off == f.down_off &&
+                                   i8_gp_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF);
+#else
                             i8_gp_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                             const bool i8_same = i8_gp_L.up_off == f.up_off && i8_gp_L.down_off == f.down_off &&
                                                  i8_gp_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF;
+#endif
                             const int64_t avg_grp = (T * K) / std::max<int64_t>(1, (m.g->n_expert + MMQ_GROUP - 1) / MMQ_GROUP);
                             if (i8_same && strata::kernels::native_expert_i8_supported(i8_gp_L) &&
                                 (i8_all_t_env || strata::kernels::native_expert_i8_prompt(i8_gp_L, avg_grp))) {
@@ -6450,16 +6471,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             !(m.cache && mmq_plan().direct[(size_t) l]) && i8_group_env && (!order.empty() || !order_peer.empty()) &&
                             (!strata::kernels::native_expert_i8_floor_gated() || strata::kernels::i8_chunk_default_allows(-1, true, true, (int64_t) T, stream_all_min())) &&   // the P100 class rule: from the stream floor up the unset default is the FP16 path (i8_expert_rule.hpp)
                             m.GU != nullptr && m.Dm != nullptr && m.src_dev != nullptr && m.ids_identity != nullptr &&
-#if STRATA_EXPERT_NIBBLE_BUILT
+#if STRATA_EXPERT_NIBBLE_BUILT && !defined(STRATA_HIP_GFX906)
                             !nib_l.on &&
 #endif
                             true) {
                             const auto& f = lay.fmt[(size_t) l];
+#if STRATA_EXPERT_NIBBLE_BUILT && defined(STRATA_HIP_GFX906)
+                            i8_L = nib_l.on
+                                ? strata::kernels::native_expert_layout_nib(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                                : strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                            const int64_t i8_experts = (int64_t) order.size() + (int64_t) order_peer.size();
+                            const int64_t i8_rows = rows_local + rows_peer;
+                            const int64_t i8_groups = (i8_experts + MMQ_GROUP - 1) / MMQ_GROUP;
+                            const bool i8_same = nib_l.on
+                                ? (i8_L.down_off == nib_l.down_off && i8_L.bytes == nib_l.slot_bytes && f.n_embd == N && f.n_ff == kFF)
+                                : (i8_L.up_off == f.up_off && i8_L.down_off == f.down_off && i8_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF);
+#else
                             i8_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                             const int64_t i8_experts = (int64_t) order.size() + (int64_t) order_peer.size();
                             const int64_t i8_rows = rows_local + rows_peer;
                             const int64_t i8_groups = (i8_experts + MMQ_GROUP - 1) / MMQ_GROUP;
                             const bool i8_same = i8_L.up_off == f.up_off && i8_L.down_off == f.down_off && i8_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF;
+#endif
                             // The few-rows route (i8_expert_rule.hpp): with it, the size floor of the int8 kernel (256 entries a group) gives way to the crossing; a layer
                             // under it (average rows per expert, over the experts that have rows) runs on the grouped kernels in the same groups, from it up on the int8
                             // kernel.  A pair the grouped kernels do not have, or a group whose scratch would not fit the layer's GU rows, keeps the floor.
@@ -7263,6 +7296,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot, int32_t cslot) -> bool {
                             const int32_t e = order[j];
 #if STRATA_EXPERT_NIBBLE_BUILT
+#if defined(STRATA_HIP_GFX906)
+                            if (nib_l.on && (!i8_l || cslot < 0 || !lay.native))
+                                core::nibble::fatal(l, "the prompt path",
+                                                    !i8_l ? "no native_expert_i8 for the layer"
+                                                    : cslot < 0 ? "an expert not in this GPU's slots (streamed or the peer's)"
+                                                                : "non-native pack");
+#else
                             if (nib_l.on && (!use_mmq || direct || wmma_l || cslot < 0 || !lay.native ||
                                              mmq_gub != (size_t) core::nibble::kRows * nib_l.raw_gu_row ||
                                              mmq_db != nib_l.down_bytes))
@@ -7272,6 +7312,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                     : wmma_l ? "the WMMA tiles read GGUF blocks"
                                                     : cslot < 0 ? "an expert not in this GPU's slots (streamed or the peer's)"
                                                                 : "the MMQ group buffers are not the blob's [gate | up] and down");
+#endif
 #endif
                             pt.mark(kPfDequant, cs);
                             if (fz_staged) {   // P4-SMALL: the batch's experts where they are; its two products and SwiGLU at its last expert

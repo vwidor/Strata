@@ -661,6 +661,9 @@ long long grouped_parity(const Layer& Y, std::mt19937& rng, int plans, const voi
     const Var vars[] = { { -1, -1, false, "default, card" }, { 0, -1, false, "S, card" }, { 1, -1, false, "P, card" },
                          { -1, -1, true, "default, card, V1" }, { -1, 0, false, "default, mode 0" },
                          { 0, 0, false, "S, mode 0" }, { 1, 0, false, "P, mode 0" }, { -1, 0, true, "default, mode 0, V1" },
+#if defined(STRATA_HIP_GFX906)
+                         { -1, 11, false, "fused16 nib, mode 11" }, { -1, 12, false, "fused16 nib, mode 12" },
+#endif
                          // STRATA_NIB_GU_PROTO (nib_gu_proto.cuh): the staged-once kernel, id 31
                          { 31, -1, false, "gu-proto 31, card" }, { 31, 0, false, "gu-proto 31, mode 0" },
                          { 31, 0, true, "gu-proto 31, mode 0, V1" } };
@@ -668,10 +671,11 @@ long long grouped_parity(const Layer& Y, std::mt19937& rng, int plans, const voi
     long long rows[NV] = {}, bad[NV][5] = {}, total = 0;
     for (const Case& cs : cases)
         for (int64_t gy : { (int64_t) 0, (int64_t) 4 }) {
-            Outs ref[2][2];   // [mode 0][v1]
-            bool have[2][2] = {};
+            Outs ref[4][2];   // [mode bucket: 0=card, 1=mode0, 2=mode11, 3=mode12][v1]
+            bool have[4][2] = {};
             for (int vi = 0; vi < NV; ++vi) {
-                const int m0 = vars[vi].mode == 0 ? 1 : 0, r1 = vars[vi].v1 ? 1 : 0;
+                const int m0 = vars[vi].mode == 0 ? 1 : vars[vi].mode == 11 ? 2 : vars[vi].mode == 12 ? 3 : 0;
+                const int r1 = vars[vi].v1 ? 1 : 0;
                 K::native_grouped_set_v1(vars[vi].v1);
                 if (!have[m0][r1]) {
                     K::native_expert_nib_set_variant(-1);
@@ -681,8 +685,12 @@ long long grouped_parity(const Layer& Y, std::mt19937& rng, int plans, const voi
                 K::native_expert_nib_set_variant(vars[vi].v);
                 const Outs o = run(Y, cs.p, true, dx, scr, dout, gy, vars[vi].mode, 0x00);
                 rows[vi] += cs.p.ne;
-                // gate / up: written by both arms in the CUDA layout, and by every arm of a striding call (gy 4: mode 0)
-                const bool gu = vars[vi].mode == 0 || gy == 4;
+                // gate / up: written by both arms in the CUDA layout, and by every arm of a striding call (gy 4: mode 0 on CUDA)
+                const bool gu = vars[vi].mode == 0
+#if !defined(STRATA_HIP_GFX906)
+                    || gy == 4
+#endif
+                    ;
                 if (gu) {
                     bad[vi][0] += diff_rows(ref[m0][r1].gate, o.gate, kFf * 4);
                     bad[vi][1] += diff_rows(ref[m0][r1].up, o.up, kFf * 4);
@@ -823,11 +831,19 @@ int main(int argc, char** argv) {
     char bus[64] = {};
     CK(cudaDeviceGetPCIBusId(bus, sizeof bus, 0));
     std::printf("device 0: %s, bus %s, cc %d.%d, %d SMs\n", prop.name, bus, prop.major, prop.minor, prop.multiProcessorCount);
+#if defined(STRATA_HIP_GFX906)
+    if (prop.major != 9 || prop.minor != 0) {
+        std::fprintf(stderr, "iq_nibble_parity: the gfx906 4-bit kernels require cc 9.0; this GPU is cc %d.%d (skipped)\n",
+                     prop.major, prop.minor);
+        return 77;
+    }
+#else
     if (prop.major != 6 || prop.minor != 0) {
         std::fprintf(stderr, "iq_nibble_parity: the 4-bit kernels are the sm_60 build's; this GPU is cc %d.%d (skipped)\n",
                      prop.major, prop.minor);
         return 77;
     }
+#endif
     if (!STRATA_EXPERT_NIBBLE_BUILT || nib::prepare(nullptr) != 0) {
         std::fprintf(stderr, "iq_nibble_parity: no 4-bit kernels in this build, or the GGUF codebooks are not unique\n");
         return 2;

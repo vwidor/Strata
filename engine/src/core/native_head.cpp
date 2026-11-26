@@ -104,8 +104,12 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = (int) tensor->type;
-        if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
-            strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
+        if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled()) {   // STRATA_Q6_PACKED=1 or =2 (in-place)
+            if (strata::kernels::native_q6_k_packed_inplace())
+                strata::kernels::native_q6_k_pack_inplace(weights_, n_in_, n_out_, "output head");
+            else
+                strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
+        }
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
             strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
         if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: what the head holds and where

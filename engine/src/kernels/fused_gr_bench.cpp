@@ -153,7 +153,13 @@ int main(int argc, char** argv) {
                 if (!same) ++failures;
             }
     {   // the Q8_0 read against the bf16 read: relative RMS error of lo / mixed / R / inject, and the q8_1 image against mixed
-        const std::vector<uint8_t> qd = q8_0_of_bf16(wd, D), qu = q8_0_of_bf16(wu, LR);
+        std::vector<uint8_t> qd = q8_0_of_bf16(wd, D), qu = q8_0_of_bf16(wu, LR);
+        if (K::fused_gr_q8_planar_enabled()) {
+            std::vector<uint8_t> pd(qd.size()), pu(qu.size());
+            K::fused_gr_pack_q8_0_planar_host(qd.data(), pd.data(), (int64_t) (wd.size() / 32));
+            K::fused_gr_pack_q8_0_planar_host(qu.data(), pu.data(), (int64_t) (wu.size() / 32));
+            qd.swap(pd); qu.swap(pu);
+        }
         uint8_t *dqd, *dqu, *dqm; unsigned* dcnt;
         cudaMalloc((void**) &dqd, qd.size()); cudaMemcpy(dqd, qd.data(), qd.size(), cudaMemcpyHostToDevice);
         cudaMalloc((void**) &dqu, qu.size()); cudaMemcpy(dqu, qu.data(), qu.size(), cudaMemcpyHostToDevice);
@@ -214,7 +220,13 @@ int main(int argc, char** argv) {
     if (cold_sets > 1) {
         // the engine reads a different layer's weights every time: rotate over `cold_sets` copies (13 MB each)
         std::vector<uint16_t*> cwd(cold_sets), cwu(cold_sets), cwi(cold_sets);
-        const std::vector<uint8_t> qd = q8_0_of_bf16(wd, D), qu = q8_0_of_bf16(wu, LR);
+        std::vector<uint8_t> qd = q8_0_of_bf16(wd, D), qu = q8_0_of_bf16(wu, LR);
+        if (K::fused_gr_q8_planar_enabled()) {
+            std::vector<uint8_t> pd(qd.size()), pu(qu.size());
+            K::fused_gr_pack_q8_0_planar_host(qd.data(), pd.data(), (int64_t) (wd.size() / 32));
+            K::fused_gr_pack_q8_0_planar_host(qu.data(), pu.data(), (int64_t) (wu.size() / 32));
+            qd.swap(pd); qu.swap(pu);
+        }
         std::vector<uint8_t*> cqd(cold_sets), cqu(cold_sets);
         std::vector<float*> cwn(cold_sets);
         for (int c = 0; c < cold_sets; ++c) {

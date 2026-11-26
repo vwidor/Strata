@@ -104,11 +104,15 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 /// followed by a d plane (n_out x n_in / 32 fp16), the same bytes (34 per 32 values). A registered matrix's
 /// native_q8_0_mmvq calls (keyed by its GGUF-layout device pointer, which stays valid for the prompt path) read the
 /// packed copy instead; every output is bitwise equal to the GGUF-layout kernels.
+/// STRATA_Q8_PACKED=2 (opt-in): in-place planar repack (0 B extra VRAM; dequant_bf16 reads the registered SoA planes
+/// directly for prefill and unlocks n_in=6144 matrices).
 bool native_q8_0_packed_enabled();
+bool native_q8_0_packed_inplace();
 bool native_q8_0_packed_eligible(int n_in, int n_out);
 void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out);
 void native_q8_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out);
 void native_q8_0_packed_unregister(const void* gguf_weights);
+bool native_q8_0_packed_lookup(const void* weights, const int8_t** qs, const void** d, int* n_in, int* n_out);
 /// STRATA_Q8_SM60=1 (opt-in, Pascal GP100): every Q8_0 dense matrix is packed as above whatever its shape, and the
 /// Q8_0 decode GEMVs run a kernel written for compute capability 6.0 (q8_sm60.cuh; not bitwise the exact kernels).
 /// native_q8_0_sm60_pack packs a device matrix here (the head) and owns the copy until native_q8_0_sm60_release;
@@ -125,9 +129,13 @@ void native_q8_0_sm60_release(const void* weights);
 /// STRATA_Q6_PACKED=1 (opt-in): a packed copy of a Q6_K matrix (the output heads) - the same bytes as ql / qh /
 /// scales / d planes - that native_q6_k_mmvq calls on `weights` read instead (bitwise equal outputs). The copy is
 /// owned here: native_q6_k_pack builds it from the device matrix (false: not eligible or failed; nothing changes),
-/// native_q6_k_unpack frees it. STRATA_Q6P_SELFTEST=1 checks it bitwise and times it at load.
+/// native_q6_k_unpack frees it. STRATA_Q6_PACKED=2 packs in-place (0 B extra VRAM when plane alignment matches).
+/// STRATA_Q6P_SELFTEST=1 checks it bitwise and times it at load.
 bool native_q6_k_packed_enabled();
+bool native_q6_k_packed_inplace();
 bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what);
+bool native_q6_k_pack_inplace(void* weights, int n_in, int n_out, const char* what);
+bool native_q6_k_gather_rows(const void* weights, const int32_t* row_idx, int64_t n_rows, void* out_gguf, void* stream);
 void native_q6_k_unpack(const void* weights);
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,

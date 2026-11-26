@@ -56,6 +56,13 @@ public:
     static bool head_native() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'n'; }
     /// STRATA_DF2_HEAD=indexed (opt-in): runs the draft head directly against the target's resident head indexed by dvocab_ (no 213 MiB pruned copy, bitwise exact).
     static bool head_indexed() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'i'; }
+    /// STRATA_DF2_HEAD=q4_0 (opt-in): quantizes the pruned draft head rows to GGML Q4_0 (~31% smaller & faster on GPU 0).
+    static bool head_q4_0() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && (e[0] == 'q' || e[0] == '4'); }
+    /// STRATA_DF2_XSUM=1 (opt-in): precompute per-16-elem activation sums during quant_block for Q4_0 GEMM (bitwise exact).
+    static bool xsum_enabled() {
+        static const bool on = [] { const char* e = std::getenv("STRATA_DF2_XSUM"); return e != nullptr && e[0] != '\0' && e[0] != '0'; }();
+        return on;
+    }
     /// DF-05: before bind, the MTP drafter's gathered draft-head rows and vocabulary (device pointers it keeps owning) when they are the same bytes this
     /// drafter would gather; bind then uses them instead of a second copy (about 213 MiB on Flash-Next) and checks the vocabulary against the file.
     struct SharedHead { const uint8_t* rows = nullptr; const int32_t* vocab_dev = nullptr; const std::vector<int32_t>* vocab_host = nullptr; int64_t n = 0; int type = -1; };
@@ -176,7 +183,8 @@ private:
     const void* q8(const std::string& name) const { return blob_ + find(name).off; }
     const float* f32(const std::string& name) const { return reinterpret_cast<const float*>(blob_ + find(name).off); }
     /// planar Q8 matrices (1..3 of them, same input width) times the planar activations in xqp_ / xdp_ (ncols columns)
-    void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd);
+    void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd,
+              const int16_t* xsum = nullptr);
     bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope = true,
                         const int32_t* pos_dev = nullptr, int8_t* logq_dst = nullptr, float* logd_dst = nullptr);
     bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
@@ -231,8 +239,10 @@ private:
     uint8_t* xil_ = nullptr;        ///< their interleaved copy (the head's native_mmvq_il kernel, CUDA)
     uint8_t* xqp_ = nullptr;        ///< planar activations of the drafter's own GEMMs (kernels/dflash2.hpp)
     float* xdp_ = nullptr;
+    int16_t* xsump_ = nullptr;      ///< STRATA_DF2_XSUM=1: precomputed 16-elem half-block sums for block GEMMs
     uint8_t* xqc_ = nullptr;        ///< the same for the context update, which runs beside the block
     float* xdc_ = nullptr;
+    int16_t* xsumc_ = nullptr;      ///< STRATA_DF2_XSUM=1: precomputed 16-elem half-block sums for context GEMMs
     cudaStream_t cs2_ = nullptr;    ///< the context update's branch of the round graph
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr, ev_ctx_[8] = {};
     bool fork_ = false;             ///< recording the forked graph: layer l's attention waits for ev_ctx_[l]
@@ -281,7 +291,8 @@ private:
     bool rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err);
     void stash_push(Lineage&& l);
     void invalidate_ring();                    ///< a new epoch: every slot is stale, the shadow forgets them
-    bool record_kv(int n, cudaStream_t cs, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err);
+    bool record_kv(int n, cudaStream_t cs, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err,
+                   const int16_t* xsum = nullptr);
     int64_t ring_hi_ = 0;           ///< one past the highest position written in this epoch
     bool ctx_pending_ = false;      ///< context_async() queued rows nobody has waited for yet
     int32_t epoch_ = 0;             ///< stamped into the ring tags: a new epoch makes every older slot invalid

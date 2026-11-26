@@ -44,7 +44,8 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 /// s + i - j < window (j in [max(0, s - window + 1), s - 1], slot j % ring_slots) and every block key.  `s` is read from *anchor_pos
 /// on the device.  Partials in `part` ([kDf2MaxChunks][8][32][130] floats) are combined and the 8 output rows (4096 wide) written planar-quantized to xq / xd.
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
-                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
+                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr,
+                   int16_t* xsum = nullptr);
 
 /// The Q8 GEMM the drafter's matrices run on.  A weight matrix is TILED (see the layout note in dflash2.cu; df2_q8_tile makes it from GGUF Q8_0 blocks):
 /// the int8 plane at `w` (n_out * n_in bytes) then the fp16 scale plane.  Activations are planar (df2_quant_rows and the fused quantizers below):
@@ -63,24 +64,30 @@ void df2_attention_variant(int v);
 void df2_attention_chunk(int ck);
 /// q4: the weights are the Q4_0 nibble plane (n_out * n_in / 2 bytes, see gemm4_kernel in dflash2.cu) then the fp16 scale plane (df2_q4_tile); all matrices of a launch share the format.
 struct Df2Mat { const void* w; float* y; int n_out; bool q4 = false; };
-void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream);
+void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream,
+              const int16_t* xsum = nullptr);
 /// Planar quantization of rows x[ncols][K].
-void df2_quant_rows(const float* x, int K, int ncols, void* xq, float* xd, void* stream);
+void df2_quant_rows(const float* x, int K, int ncols, void* xq, float* xd, void* stream, int16_t* xsum = nullptr);
 /// RMS norm (weights gamma) of `rows` rows of N, written to xn (optional) and quantized.
-void df2_rms_quant(const float* h, const float* gamma, float* xn, int rows, int N, float eps, void* xq, float* xd, void* stream);
+void df2_rms_quant(const float* h, const float* gamma, float* xn, int rows, int N, float eps, void* xq, float* xd, void* stream,
+                   int16_t* xsum = nullptr);
 /// df2_conv without residual, then quantized.
-void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const float* base, int rows, int H, int group, void* xq, float* xd, void* stream);
+void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const float* base, int rows, int H, int group, void* xq, float* xd, void* stream,
+                    int16_t* xsum = nullptr);
 /// silu(gate) * up of `rows` rows of I, quantized.
-void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void* xq, float* xd, void* stream);
+void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void* xq, float* xd, void* stream,
+                      int16_t* xsum = nullptr);
 /// GGUF Q8_0 blocks (34 bytes) of a matrix with rows of n_in -> the tiled qs plane and the tiled d plane (count = rows * n_in / 32 blocks).
 void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
 /// ggml Q4_0 blocks (18 bytes) of a matrix with rows of n_in -> the tiled nibble plane (n_out * n_in / 2 bytes) and the tiled d plane (Df2Mat::q4).
 void df2_q4_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
+/// F32 [n_blocks * 32] -> GGML Q4_0 blocks (18 B each), for opt-in STRATA_DF2_HEAD=q4_0 draft head quantization.
+void df2_f32_to_q4_0(const float* src, void* out_q4, int64_t n_blocks, void* stream);
 
 /// h += conv(x) (the finish convolution with the residual), then the RMS norm of the new h (weights gamma) -> xn (optional) and the planar quantization.
 /// rows <= 8, H <= 3072 (H a multiple of 32).
 void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
-                        float eps, void* xq, float* xd, void* stream);
+                        float eps, void* xq, float* xd, void* stream, int16_t* xsum = nullptr);
 /// The block's q (q_heads x 128) and k (k_heads x 128) per row: RMS norm and rope with the table of the block's positions -> qo, ko (row-major).
 void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const float* gk, const float* table, float* qo, float* ko, int rows, int q_heads, int k_heads,
                       float eps, void* stream);

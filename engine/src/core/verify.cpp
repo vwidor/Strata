@@ -783,6 +783,14 @@ Verifier::~Verifier() {
 #endif
     if (tap_scratch_) cudaFree(tap_scratch_);
     if (h_tap_) cudaFreeHost(h_tap_);
+    if (tap_bounce_h_) cudaFreeHost(tap_bounce_h_);
+    if (tap_h2d_cs_ || tap_h2d_ev_) {
+        const OnDevice on_h2d(tap_h2d_dev_ >= 0 ? tap_h2d_dev_ : device_);
+        if (tap_h2d_cs_) cudaStreamDestroy(tap_h2d_cs_);
+        if (tap_h2d_ev_) cudaEventDestroy(tap_h2d_ev_);
+    }
+    if (tap_cs_) cudaStreamDestroy(tap_cs_);
+    if (tap_ev_) cudaEventDestroy(tap_ev_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     for (float* b : slot_bias_dev_) if (b) cudaFree(b);
     if (slot_hist_d_) cudaFree(slot_hist_d_);
@@ -858,6 +866,16 @@ bool Verifier::gather_taps_host(float* dst, int row0, int rows, std::string& err
     return true;
 }
 
+static bool tap_peer_ok(int dst_dev, int src_dev) {
+    if (dst_dev == src_dev) return true;
+    int can = 0;
+    if (cudaDeviceCanAccessPeer(&can, dst_dev, src_dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return can != 0;
+}
+
 bool Verifier::gather_taps(float* landing, int landing_device, int row0, int rows, int dst_row0, cudaStream_t wait_stream, std::string& err) {
     const int64_t N = g_->n_embd;
     const int nt_all = tap_total();
@@ -874,17 +892,49 @@ bool Verifier::gather_taps(float* landing, int landing_device, int row0, int row
             int slot0 = 0;
             for (int l : tap_req_) if (l >= 0 && l < g_->n_layers - 1 && l < v->lb_) ++slot0;
             const int64_t nv = (int64_t) v->tap_layers_.size();
-            for (int r = 0; r < rows; ++r) {
-                const float* src = v->tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N);
-                float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
-                const cudaError_t ce = v->device_ == landing_device
-                    ? cudaMemcpyAsync(dst, src, (size_t) (nv * N) * 4, cudaMemcpyDeviceToDevice, v->tap_cs_)
-                    : cudaMemcpyPeerAsync(dst, landing_device, src, v->device_, (size_t) (nv * N) * 4, v->tap_cs_);
-                if (ce != cudaSuccess) { err = std::string("verify: the tap gather copy: ") + cudaGetErrorString(ce); return false; }
+            const size_t row_bytes = (size_t) (nv * N) * 4;
+            if (v->device_ == landing_device || tap_peer_ok(landing_device, v->device_)) {
+                for (int r = 0; r < rows; ++r) {
+                    const float* src = v->tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N);
+                    float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
+                    const cudaError_t ce = v->device_ == landing_device
+                        ? cudaMemcpyAsync(dst, src, row_bytes, cudaMemcpyDeviceToDevice, v->tap_cs_)
+                        : cudaMemcpyPeerAsync(dst, landing_device, src, v->device_, row_bytes, v->tap_cs_);
+                    if (ce != cudaSuccess) { err = std::string("verify: the tap gather copy: ") + cudaGetErrorString(ce); return false; }
+                }
+                if (cudaEventRecord(v->tap_ev_, v->tap_cs_) != cudaSuccess) { err = "verify: the tap gather event"; return false; }
+                const OnDevice on_dst(landing_device);
+                if (cudaStreamWaitEvent(wait_stream, v->tap_ev_, 0) != cudaSuccess) { err = "verify: the drafter stream cannot wait on a stage's taps"; return false; }
+            } else {
+                // P2P=0 host-bounce: D2H on v->device_ -> event -> H2D on landing_device (zero host sync).
+                const size_t total_bytes = (size_t) rows * row_bytes;
+                if (v->tap_bounce_bytes_ < total_bytes) {
+                    if (v->tap_bounce_h_) { cudaFreeHost(v->tap_bounce_h_); v->tap_bounce_h_ = nullptr; v->tap_bounce_bytes_ = 0; }
+                    const size_t alloc_b = std::max(total_bytes, (size_t) strata::kernels::kVerifyLongT * row_bytes);
+                    if (cudaHostAlloc((void**) &v->tap_bounce_h_, alloc_b, cudaHostAllocPortable) != cudaSuccess) {
+                        err = "verify: P2P=0 tap bounce alloc failed";
+                        return false;
+                    }
+                    v->tap_bounce_bytes_ = alloc_b;
+                }
+                const float* src0 = v->tap_dev_ + (size_t) row0 * (size_t) (nv * N);
+                const cudaError_t ce0 = cudaMemcpyAsync(v->tap_bounce_h_, src0, total_bytes, cudaMemcpyDeviceToHost, v->tap_cs_);
+                if (ce0 != cudaSuccess || cudaEventRecord(v->tap_ev_, v->tap_cs_) != cudaSuccess) {
+                    err = std::string("verify: P2P=0 tap bounce D2H: ") + cudaGetErrorString(ce0 != cudaSuccess ? ce0 : cudaGetLastError());
+                    return false;
+                }
+                const OnDevice on_dst(landing_device);
+                if (cudaStreamWaitEvent(wait_stream, v->tap_ev_, 0) != cudaSuccess) {
+                    err = "verify: P2P=0 tap bounce wait failed";
+                    return false;
+                }
+                for (int r = 0; r < rows; ++r) {
+                    float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
+                    const cudaError_t ce1 = cudaMemcpyAsync(dst, v->tap_bounce_h_ + (size_t) r * (size_t) (nv * N), row_bytes,
+                                                            cudaMemcpyHostToDevice, wait_stream);
+                    if (ce1 != cudaSuccess) { err = std::string("verify: P2P=0 tap bounce H2D: ") + cudaGetErrorString(ce1); return false; }
+                }
             }
-            if (cudaEventRecord(v->tap_ev_, v->tap_cs_) != cudaSuccess) { err = "verify: the tap gather event"; return false; }
-            const OnDevice on_dst(landing_device);
-            if (cudaStreamWaitEvent(wait_stream, v->tap_ev_, 0) != cudaSuccess) { err = "verify: the drafter stream cannot wait on a stage's taps"; return false; }
         }
         if (v->le_ >= g_->n_layers) break;
     }
@@ -896,7 +946,7 @@ bool Verifier::gather_stage_taps(float* landing, int landing_device, int row0, i
     const int64_t N = g_->n_embd;
     const int nt_all = tap_total();
     const OnDevice on_stage(device_);
-    if (wait_stream != nullptr && tap_ev_ == nullptr &&
+    if (tap_ev_ == nullptr &&
         cudaEventCreateWithFlags(&tap_ev_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: the stage tap gather event could not be created";
         return false;
@@ -904,18 +954,97 @@ bool Verifier::gather_stage_taps(float* landing, int landing_device, int row0, i
     int slot0 = 0;
     for (int l : tap_req_) if (l >= 0 && l < g_->n_layers - 1 && l < lb_) ++slot0;
     const int64_t nv = (int64_t) tap_layers_.size();
-    for (int r = 0; r < rows; ++r) {
-        const float* src = tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N);
-        float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
-        const cudaError_t ce = device_ == landing_device
-            ? cudaMemcpyAsync(dst, src, (size_t) (nv * N) * 4, cudaMemcpyDeviceToDevice, cs_)
-            : cudaMemcpyPeerAsync(dst, landing_device, src, device_, (size_t) (nv * N) * 4, cs_);
-        if (ce != cudaSuccess) { err = std::string("verify: the stage tap gather copy: ") + cudaGetErrorString(ce); return false; }
+    const size_t row_bytes = (size_t) (nv * N) * 4;
+    if (device_ == landing_device || tap_peer_ok(landing_device, device_)) {
+        for (int r = 0; r < rows; ++r) {
+            const float* src = tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N);
+            float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
+            const cudaError_t ce = device_ == landing_device
+                ? cudaMemcpyAsync(dst, src, row_bytes, cudaMemcpyDeviceToDevice, cs_)
+                : cudaMemcpyPeerAsync(dst, landing_device, src, device_, row_bytes, cs_);
+            if (ce != cudaSuccess) { err = std::string("verify: the stage tap gather copy: ") + cudaGetErrorString(ce); return false; }
+        }
+        if (wait_stream != nullptr) {
+            if (cudaEventRecord(tap_ev_, cs_) != cudaSuccess) { err = "verify: the stage tap gather event"; return false; }
+            const OnDevice on_dst(landing_device);
+            if (cudaStreamWaitEvent(wait_stream, tap_ev_, 0) != cudaSuccess) { err = "verify: the drafter stream cannot wait on a stage's taps"; return false; }
+        }
+        return true;
     }
-    if (wait_stream != nullptr) {
-        if (cudaEventRecord(tap_ev_, cs_) != cudaSuccess) { err = "verify: the stage tap gather event"; return false; }
+    // P2P=0 host-bounce: D2H on cs_ -> tap_ev_ -> H2D on landing_device -> tap_h2d_ev_ -> wait on wait_stream (or cs_).
+    const size_t total_bytes = (size_t) rows * row_bytes;
+    if (tap_bounce_bytes_ < total_bytes) {
+        if (tap_bounce_h_) { cudaFreeHost(tap_bounce_h_); tap_bounce_h_ = nullptr; tap_bounce_bytes_ = 0; }
+        const size_t alloc_b = std::max(total_bytes, (size_t) strata::kernels::kVerifyLongT * row_bytes);
+        if (cudaHostAlloc((void**) &tap_bounce_h_, alloc_b, cudaHostAllocPortable) != cudaSuccess) {
+            err = "verify: P2P=0 stage tap bounce alloc failed";
+            return false;
+        }
+        tap_bounce_bytes_ = alloc_b;
+    }
+    const float* src0 = tap_dev_ + (size_t) row0 * (size_t) (nv * N);
+    const cudaError_t ce0 = cudaMemcpyAsync(tap_bounce_h_, src0, total_bytes, cudaMemcpyDeviceToHost, cs_);
+    if (ce0 != cudaSuccess || cudaEventRecord(tap_ev_, cs_) != cudaSuccess) {
+        err = std::string("verify: P2P=0 stage tap bounce D2H: ") + cudaGetErrorString(ce0 != cudaSuccess ? ce0 : cudaGetLastError());
+        return false;
+    }
+    {
         const OnDevice on_dst(landing_device);
-        if (cudaStreamWaitEvent(wait_stream, tap_ev_, 0) != cudaSuccess) { err = "verify: the drafter stream cannot wait on a stage's taps"; return false; }
+        if (wait_stream != nullptr) {
+            if (cudaStreamWaitEvent(wait_stream, tap_ev_, 0) != cudaSuccess) {
+                err = "verify: P2P=0 stage tap bounce wait failed";
+                return false;
+            }
+            for (int r = 0; r < rows; ++r) {
+                float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
+                const cudaError_t ce1 = cudaMemcpyAsync(dst, tap_bounce_h_ + (size_t) r * (size_t) (nv * N), row_bytes,
+                                                        cudaMemcpyHostToDevice, wait_stream);
+                if (ce1 != cudaSuccess) { err = std::string("verify: P2P=0 stage tap bounce H2D: ") + cudaGetErrorString(ce1); return false; }
+            }
+            if (tap_h2d_ev_ == nullptr || tap_h2d_dev_ != landing_device) {
+                if (tap_h2d_ev_) { const OnDevice on_old(tap_h2d_dev_); cudaEventDestroy(tap_h2d_ev_); tap_h2d_ev_ = nullptr; }
+                if (tap_h2d_cs_) { const OnDevice on_old(tap_h2d_dev_); cudaStreamDestroy(tap_h2d_cs_); tap_h2d_cs_ = nullptr; }
+                tap_h2d_dev_ = landing_device;
+                if (cudaEventCreateWithFlags(&tap_h2d_ev_, cudaEventDisableTiming) != cudaSuccess) {
+                    err = "verify: P2P=0 stage tap bounce h2d event failed";
+                    return false;
+                }
+            }
+            if (cudaEventRecord(tap_h2d_ev_, wait_stream) != cudaSuccess) {
+                err = "verify: P2P=0 stage tap bounce h2d event record failed";
+                return false;
+            }
+        } else {
+            if (tap_h2d_cs_ == nullptr || tap_h2d_dev_ != landing_device) {
+                if (tap_h2d_cs_) { const OnDevice on_old(tap_h2d_dev_); cudaStreamDestroy(tap_h2d_cs_); tap_h2d_cs_ = nullptr; }
+                if (tap_h2d_ev_) { const OnDevice on_old(tap_h2d_dev_); cudaEventDestroy(tap_h2d_ev_); tap_h2d_ev_ = nullptr; }
+                tap_h2d_dev_ = landing_device;
+                if (cudaStreamCreateWithFlags(&tap_h2d_cs_, cudaStreamNonBlocking) != cudaSuccess ||
+                    cudaEventCreateWithFlags(&tap_h2d_ev_, cudaEventDisableTiming) != cudaSuccess) {
+                    err = "verify: P2P=0 stage tap bounce stream/event failed";
+                    return false;
+                }
+            }
+            if (cudaStreamWaitEvent(tap_h2d_cs_, tap_ev_, 0) != cudaSuccess) {
+                err = "verify: P2P=0 stage tap bounce wait failed";
+                return false;
+            }
+            for (int r = 0; r < rows; ++r) {
+                float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
+                const cudaError_t ce1 = cudaMemcpyAsync(dst, tap_bounce_h_ + (size_t) r * (size_t) (nv * N), row_bytes,
+                                                        cudaMemcpyHostToDevice, tap_h2d_cs_);
+                if (ce1 != cudaSuccess) { err = std::string("verify: P2P=0 stage tap bounce H2D: ") + cudaGetErrorString(ce1); return false; }
+            }
+            if (cudaEventRecord(tap_h2d_ev_, tap_h2d_cs_) != cudaSuccess) {
+                err = "verify: P2P=0 stage tap bounce h2d event record failed";
+                return false;
+            }
+        }
+    }
+    // Keep cs_ ordered after H2D finishes so subsequent calls (or event records on cs_) never race with tap_bounce_h_.
+    if (cudaStreamWaitEvent(cs_, tap_h2d_ev_, 0) != cudaSuccess) {
+        err = "verify: P2P=0 stage tap bounce cs wait failed";
+        return false;
     }
     return true;
 }
@@ -2240,8 +2369,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                if (!(g_lfuse() && g_lfuse_pair() && wk->native_type == wv->native_type &&
+                      strata::kernels::native_mmvq_pair(wk->native_type, wk->native_data, wv->native_data, xq_,
+                                                        kcur_ + tb * NKV * HD, vcur_ + tb * NKV * HD, (int) N,
+                                                        (int) (NKV * HD), n, cs))) {
+                    mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                    mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)

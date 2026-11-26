@@ -62,6 +62,10 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 /// The inverse for a path with no Q8 kernel: bf16 (round to nearest even) of d * q for `n_blocks` Q8_0 blocks.
 void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, void* stream);
 void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream);
+/// gfx906 opt-in (STRATA_GR_SPLIT=5 with STRATA_HC_Q8=1): planar Q8_0 hyper-connection storage
+/// ([qs: n_blocks*32][d: n_blocks*2], same n_blocks*34 bytes) for wave64 v_dot4_i32_i8 kernels.
+bool fused_gr_q8_planar_enabled();
+void fused_gr_pack_q8_0_planar_host(const uint8_t* raw_q8, uint8_t* planar_out, int64_t n_blocks);
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four

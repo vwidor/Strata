@@ -5,6 +5,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/core/tc_sm75.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/sm120_series.hpp"
 
@@ -327,6 +328,39 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t 
     for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
 }
 
+// Q8_0 SoA ([qs][d], STRATA_Q8_PACKED=2 in-place): aligned 8-byte uint2 loads from qs plane + fp16 scale from d plane,
+// bitwise identical to dequant_q8_0_kernel and group32<8>, supporting arbitrary ld for prefill GEMM dequantization.
+template <typename T, bool VEC16>
+__global__ void dequant_q8_0_soa_kernel(const int8_t* __restrict__ qs, const uint16_t* __restrict__ dpl,
+                                        int64_t row0, int64_t rows, int64_t groups_per_row, int64_t ld,
+                                        T* __restrict__ out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * groups_per_row * 4) return;
+    const int64_t g = i >> 2, r = g / groups_per_row, gi = g % groups_per_row;
+    const int piece = (int) (i & 3);
+    const int64_t bidx = (row0 + r) * groups_per_row + gi;
+    const float d = __half2float(__ushort_as_half(dpl[bidx]));
+    const uint2 q2 = reinterpret_cast<const uint2*>(qs + bidx * 32)[piece];
+    __align__(16) T v[8];
+    put(v, 0, (float) (int8_t) (q2.x & 0xFFu) * d);
+    put(v, 1, (float) (int8_t) ((q2.x >> 8) & 0xFFu) * d);
+    put(v, 2, (float) (int8_t) ((q2.x >> 16) & 0xFFu) * d);
+    put(v, 3, (float) (int8_t) (q2.x >> 24) * d);
+    put(v, 4, (float) (int8_t) (q2.y & 0xFFu) * d);
+    put(v, 5, (float) (int8_t) ((q2.y >> 8) & 0xFFu) * d);
+    put(v, 6, (float) (int8_t) ((q2.y >> 16) & 0xFFu) * d);
+    put(v, 7, (float) (int8_t) (q2.y >> 24) * d);
+    T* dst = out + r * ld + gi * 32 + 8 * piece;
+    if constexpr (VEC16) {
+        uint4* o = (uint4*) dst;
+#pragma unroll
+        for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
+    } else {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) dst[k] = v[k];
+    }
+}
+
 bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
@@ -358,6 +392,22 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
+    if (type == 8) {
+        const int8_t* qs = nullptr;
+        const void* dpl = nullptr;
+        int p_nin = 0, p_nout = 0;
+        if (native_q8_0_packed_lookup(blocks, &qs, &dpl, &p_nin, &p_nout) && p_nin == cols) {
+            const bool vec16 = (reinterpret_cast<uintptr_t>(out) & 15) == 0 && ((size_t) ld * sizeof(T)) % 16 == 0;
+            const unsigned qgrid = (unsigned) ((4 * total + 255) / 256);
+            if (vec16)
+                dequant_q8_0_soa_kernel<T, true><<<qgrid, 256, 0, st>>>(qs, (const uint16_t*) dpl, row0, rows, gpr, ld, out);
+            else
+                dequant_q8_0_soa_kernel<T, false><<<qgrid, 256, 0, st>>>(qs, (const uint16_t*) dpl, row0, rows, gpr, ld, out);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch (q8_0 soa): %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return;
+        }
+    }
     if (type == 8 && ld == cols && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
         (reinterpret_cast<uintptr_t>(out) & 15) == 0) {   // contiguous rows only (the kernel writes out + g * 32)
         dequant_q8_0_kernel<T><<<(unsigned) ((4 * total + 255) / 256), 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out);
