@@ -369,6 +369,219 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* _
                                                   part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
 }
 
+#if defined(STRATA_HIP_GFX906)
+// D9 (opt-in STRATA_QSA_DEC_V2=1|2): gfx906 wave64 decode attention for ALL 4 KV modes (including k8v4 mode 3)
+// and single-launch batch_rows/slots. Bitwise identical to attn_chunk_body:
+//   - XOR query swizzle in LDS (eliminates 2-way bank conflicts on lane*8 float4 reads)
+//   - NC cells per step (NC=2 halves LDS query traffic; NC=1 minimizes VGPRs) + reduce12_gfx906 (16 vs 60 shuffles)
+//   - cell-major spt[CHUNK][G] aliasing dead sq (zero extra LDS -> 3-4 CTAs/CU)
+//   - 4-cell prefetched V fold with precomputed Q4_0 block offsets + broadcast float4 probability reads
+template <int KV_MODE>
+__device__ __forceinline__ float load_v1_gfx906(const QsaAttnPools& p, long long row, int t, int b, int j, bool hi) {
+    if constexpr (KV_MODE == 0) {
+        return __half2float(__ushort_as_half(p.v_pool[row * HD + t]));
+    } else if constexpr (KV_MODE == 1) {
+        const float sc = __half2float(__ushort_as_half(p.v_scale[row * (HD / KV_Q8_GROUP) + (t / KV_Q8_GROUP)]));
+        return (float) p.v_q[row * HD + t] * sc;
+    } else {
+        constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+        const float dd = __half2float(__ushort_as_half(blk->d));
+        const uint8_t byte = blk->qs[j];
+        const int nibble = hi ? ((byte >> 4) - 8) : ((byte & 0x0F) - 8);
+        return (float) nibble * dd;
+    }
+}
+
+template <int KV_MODE, int NC>
+__device__ __forceinline__ void attn_chunk_gfx906_v2_body(const float* __restrict__ q, QsaAttnPools p,
+                                                          const int32_t* __restrict__ ids,
+                                                          const int32_t* __restrict__ step, int n_kv_heads,
+                                                          int page_size, float scale, float* __restrict__ part_acc,
+                                                          float* __restrict__ part_m, float* __restrict__ part_l,
+                                                          int n_chunks, int cap, long long scratch_stride) {
+    q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
+    ids += (size_t) blockIdx.z * (size_t) cap;
+    step += (size_t) blockIdx.z * kStepCount;
+    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+    __shared__ __align__(16) float sq[G][HD];
+    __shared__ float sp[G][CHUNK];
+    __shared__ long long srow[CHUNK];
+    float (*const spt)[G] = reinterpret_cast<float (*)[G]>(&sq[0][0]);
+    static_assert(CHUNK * G <= G * HD, "spt must fit in sq");
+    const int n_ids = __ldg(step + kStepWidth);
+    const int chunk = blockIdx.x, kvh = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+        return;
+    }
+    for (int i = t; i < G * HD; i += THREADS) {
+        const int d = i % HD;
+        sq[i / HD][d ^ ((d >> 3) & 4)] = q[(size_t) (kvh * G) * HD + i];
+    }
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) p.page_table[cell / page_size];
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    __syncthreads();
+    const int qflip = lane & 4;
+    const int hd = reduce12_head_of_lane(lane);
+    if constexpr (NC == 2) {
+        for (int i = 0; i < CHUNK / WARPS; i += 2) {
+            const int c0_i = warp + WARPS * i;
+            const int c1_i = warp + WARPS * (i + 1);
+            const bool ok0 = c0_i < n_here && srow[c0_i] >= 0;
+            const bool ok1 = c1_i < n_here && srow[c1_i] >= 0;
+            if (ok0 && ok1) {
+                float k0[8], k1[8];
+                load8<KV_MODE>(p, false, srow[c0_i], lane * 8, k0);
+                load8<KV_MODE>(p, false, srow[c1_i], lane * 8, k1);
+                float p0[16], p1[16];
+#pragma unroll
+                for (int h = 0; h < G; ++h) {
+                    const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + qflip]);
+                    const float4 qb = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + (qflip ^ 4)]);
+                    p0[h] = k0[0] * qa.x + k0[1] * qa.y + k0[2] * qa.z + k0[3] * qa.w +
+                            k0[4] * qb.x + k0[5] * qb.y + k0[6] * qb.z + k0[7] * qb.w;
+                    p1[h] = k1[0] * qa.x + k1[1] * qa.y + k1[2] * qa.z + k1[3] * qa.w +
+                            k1[4] * qb.x + k1[5] * qb.y + k1[6] * qb.z + k1[7] * qb.w;
+                }
+#pragma unroll
+                for (int h = G; h < 16; ++h) { p0[h] = 0.0f; p1[h] = 0.0f; }
+                const float s0 = reduce12_gfx906(p0, lane);
+                const float s1 = reduce12_gfx906(p1, lane);
+                if ((lane & 1) == 0 && hd < G) {
+                    sp[hd][c0_i] = s0 * scale;
+                    sp[hd][c1_i] = s1 * scale;
+                }
+            } else {
+                const int cs_arr[2] = {c0_i, c1_i};
+                const bool oks[2] = {ok0, ok1};
+#pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    const int c = cs_arr[k];
+                    if (!oks[k]) {
+                        if (lane < G) sp[lane][c] = -FLT_MAX;
+                        continue;
+                    }
+                    float k8[8];
+                    load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+                    float part[16];
+#pragma unroll
+                    for (int h = 0; h < G; ++h) {
+                        const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + qflip]);
+                        const float4 qb = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + (qflip ^ 4)]);
+                        part[h] = k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
+                                  k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
+                    }
+#pragma unroll
+                    for (int h = G; h < 16; ++h) part[h] = 0.0f;
+                    const float s = reduce12_gfx906(part, lane);
+                    if ((lane & 1) == 0 && hd < G) sp[hd][c] = s * scale;
+                }
+            }
+        }
+    } else {
+        for (int c = warp; c < CHUNK; c += WARPS) {
+            if (c >= n_here || srow[c] < 0) {
+                if (lane < G) sp[lane][c] = -FLT_MAX;
+                continue;
+            }
+            float k8[8];
+            load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+            float part[16];
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const float4 qa = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + qflip]);
+                const float4 qb = *reinterpret_cast<const float4*>(&sq[h][lane * 8 + (qflip ^ 4)]);
+                part[h] = k8[0] * qa.x + k8[1] * qa.y + k8[2] * qa.z + k8[3] * qa.w +
+                          k8[4] * qb.x + k8[5] * qb.y + k8[6] * qb.z + k8[7] * qb.w;
+            }
+#pragma unroll
+            for (int h = G; h < 16; ++h) part[h] = 0.0f;
+            const float s = reduce12_gfx906(part, lane);
+            if ((lane & 1) == 0 && hd < G) sp[hd][c] = s * scale;
+        }
+    }
+    __syncthreads();
+    for (int h = warp; h < G; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(fmaxf(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
+        spt[lane][h] = ea;
+        spt[lane + 32][h] = eb;
+        const float l = warp_sum(ea + eb);
+        if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+    }
+    __syncthreads();
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    const int vb = t >> 5;
+    const int vrem = t & 31;
+    const int vj = vrem & 15;
+    const bool vhi = vrem >= 16;
+    int c = 0;
+    for (; c + 4 <= n_here; c += 4) {
+        const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
+        if ((r0 | r1 | r2 | r3) < 0) break;
+        const float v0 = load_v1_gfx906<KV_MODE>(p, r0, t, vb, vj, vhi);
+        const float v1 = load_v1_gfx906<KV_MODE>(p, r1, t, vb, vj, vhi);
+        const float v2 = load_v1_gfx906<KV_MODE>(p, r2, t, vb, vj, vhi);
+        const float v3 = load_v1_gfx906<KV_MODE>(p, r3, t, vb, vj, vhi);
+        fold_cell<G>(acc, spt[c], v0);
+        fold_cell<G>(acc, spt[c + 1], v1);
+        fold_cell<G>(acc, spt[c + 2], v2);
+        fold_cell<G>(acc, spt[c + 3], v3);
+    }
+    for (; c < n_here; ++c) {
+        if (srow[c] < 0) continue;
+        fold_cell<G>(acc, spt[c], load_v1_gfx906<KV_MODE>(p, srow[c], t, vb, vj, vhi));
+    }
+#pragma unroll
+    for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+}
+
+template <int KV_MODE, int NC>
+__global__ void __launch_bounds__(THREADS) attn_chunk_gfx906_v2_kernel(
+    const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
+    int n_kv_heads, int page_size, float scale, float* __restrict__ part_acc, float* __restrict__ part_m,
+    float* __restrict__ part_l, int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    attn_chunk_gfx906_v2_body<KV_MODE, NC>(q, p, ids, step, n_kv_heads, page_size, scale, part_acc, part_m, part_l,
+                                           n_chunks, cap, scratch_stride);
+}
+
+template <int KV_MODE, int NC>
+__global__ void __launch_bounds__(THREADS) attn_chunk_gfx906_v2_slots_kernel(
+    const float* __restrict__ q, QsaAttnSlotPools ps, const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
+    int n_kv_heads, int page_size, float scale, float* __restrict__ part_acc, float* __restrict__ part_m,
+    float* __restrict__ part_l, int n_chunks, int cap, long long scratch_stride) {
+    attn_chunk_gfx906_v2_body<KV_MODE, NC>(q, ps.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale, part_acc,
+                                           part_m, part_l, n_chunks, cap, scratch_stride);
+}
+
+template <int KV_MODE, int NC>
+__global__ void __launch_bounds__(THREADS) attn_chunk_gfx906_v2_rows_kernel(
+    const float* __restrict__ q, QsaAttnPoolsRows rows, const int32_t* __restrict__ ids,
+    const int32_t* __restrict__ step, int n_kv_heads, int page_size, float scale, float* __restrict__ part_acc,
+    float* __restrict__ part_m, float* __restrict__ part_l, int n_chunks, int cap, long long scratch_stride) {
+    attn_chunk_gfx906_v2_body<KV_MODE, NC>(q, rows.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale, part_acc,
+                                           part_m, part_l, n_chunks, cap, scratch_stride);
+}
+#endif
+
 #if !defined(__HIPCC__)
 // Turing (INT8 pools): attn_chunk_kernel<1> bit for bit, rearranged for the SM's shared-memory pipe, which the
 // default kernel saturates (its time grew with the queries even with the SMs half empty).  Three changes, none to an
@@ -857,6 +1070,16 @@ bool query_swizzle_gfx906_device() {
     }
     return cached_supported;
 }
+// D9 (opt-in STRATA_QSA_DEC_V2=1|2): 0 off (default), 1 NC=2, 2 NC=1.
+int qsa_dec_v2_mode() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_QSA_DEC_V2");
+        if (!v || !v[0]) return 0;
+        const int x = std::atoi(v);
+        return (x == 1 || x == 2) ? x : 0;
+    }();
+    return (env > 0 && query_swizzle_gfx906_device()) ? env : 0;
+}
 #endif
 
 // Fork (lab/upsync): STRATA_ATTN_DAILY=1 runs the Daily's (be4cf1c) decode attention on every CUDA card: the chunk
@@ -1005,6 +1228,7 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
         std::fprintf(stderr, "strata attn-query-swizzle: active=%d nq=%lld cap=%lld kv_mode=%d lane_cell=%d\n",
                      use_query_swizzle, (long long) n_q, (long long) cap, kv_mode, lane_cell);
     }
+    const int dec_v2 = (kernel < 0 && !lane_cell) ? qsa_dec_v2_mode() : 0;
 #endif
 #define STRATA_ATTN_LC(M) attn_chunk_kernel<M, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
     if (lane_cell) {
@@ -1015,6 +1239,22 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
     } else
 #undef STRATA_ATTN_LC
 #if defined(STRATA_HIP_GFX906)
+    if (dec_v2 > 0) {
+#define STRATA_ATTN_V2(M, NC_) attn_chunk_gfx906_v2_kernel<M, NC_><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, \
+        (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
+        if (dec_v2 == 1) {
+            if (kv_mode == 3) STRATA_ATTN_V2(3, 2);
+            else if (kv_mode == 2) STRATA_ATTN_V2(2, 2);
+            else if (kv_mode == 1) STRATA_ATTN_V2(1, 2);
+            else STRATA_ATTN_V2(0, 2);
+        } else {
+            if (kv_mode == 3) STRATA_ATTN_V2(3, 1);
+            else if (kv_mode == 2) STRATA_ATTN_V2(2, 1);
+            else if (kv_mode == 1) STRATA_ATTN_V2(1, 1);
+            else STRATA_ATTN_V2(0, 1);
+        }
+#undef STRATA_ATTN_V2
+    } else
     // Opt-in INT8 batched attention: prefill, verification and MTP (including n_q=1).
     // Other pool formats and lane-cell scoring keep their paths; qsa_decode_attn_step is unchanged.
     // A k8v4 model's MTP drafter uses INT8 pools and can therefore take this path.
@@ -1121,10 +1361,13 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
     if (!lane_cell && pre75_attn()) return false;
 #endif
 #if defined(STRATA_HIP_GFX906)
-    static const bool query_swizzle = [] {
-        const char* v = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE"); return v && v[0] == '1';
-    }();
-    if (query_swizzle && !lane_cell && kv_mode == 1 && query_swizzle_gfx906_device()) return false;
+    const int dec_v2 = !lane_cell ? qsa_dec_v2_mode() : 0;
+    if (dec_v2 == 0) {
+        static const bool query_swizzle = [] {
+            const char* v = std::getenv("STRATA_GFX906_ATTN_QUERY_SWIZZLE"); return v && v[0] == '1';
+        }();
+        if (query_swizzle && !lane_cell && kv_mode == 1 && query_swizzle_gfx906_device()) return false;
+    }
 #endif
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
@@ -1134,6 +1377,23 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     cudaStream_t st = (cudaStream_t) stream;
+#if defined(STRATA_HIP_GFX906)
+    if (dec_v2 > 0) {
+#define STRATA_ATTN_SLOTS_V2(M, NC_) attn_chunk_gfx906_v2_slots_kernel<M, NC_><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
+        if (dec_v2 == 1) {
+            if (kv_mode == 3) STRATA_ATTN_SLOTS_V2(3, 2);
+            else if (kv_mode == 2) STRATA_ATTN_SLOTS_V2(2, 2);
+            else if (kv_mode == 1) STRATA_ATTN_SLOTS_V2(1, 2);
+            else STRATA_ATTN_SLOTS_V2(0, 2);
+        } else {
+            if (kv_mode == 3) STRATA_ATTN_SLOTS_V2(3, 1);
+            else if (kv_mode == 2) STRATA_ATTN_SLOTS_V2(2, 1);
+            else if (kv_mode == 1) STRATA_ATTN_SLOTS_V2(1, 1);
+            else STRATA_ATTN_SLOTS_V2(0, 1);
+        }
+#undef STRATA_ATTN_SLOTS_V2
+    } else
+#endif
 #define STRATA_ATTN_SLOTS(M, LC) attn_chunk_slots_kernel<M, LC><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
     if (lane_cell) {
         if (kv_mode == 3) STRATA_ATTN_SLOTS(3, true);
@@ -1184,7 +1444,11 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
     per_row = per_row || pre75_attn();
 #endif
 #if defined(STRATA_HIP_GFX906)
-    per_row = true;
+    const int dec_v2 = !lane_cell_rows ? qsa_dec_v2_mode() : 0;
+    bool rows_same_mode = dec_v2 > 0;
+    for (int64_t r = 1; rows_same_mode && r < n_q; ++r)
+        if (attn_kv_mode(rows.p[r]) != kv_mode) rows_same_mode = false;
+    per_row = !rows_same_mode;
 #endif
     if (per_row) {
         for (int64_t r = 0; r < n_q; ++r)
@@ -1193,6 +1457,24 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
                                   attn + (size_t) r * s.n_head * HD, 1, stream);
         return;
     }
+#if defined(STRATA_HIP_GFX906)
+    if (dec_v2 > 0) {
+#define STRATA_ATTN_ROWS_V2(M, NC_) attn_chunk_gfx906_v2_rows_kernel<M, NC_><<<grid, THREADS, 0, st>>>(q, rows, ids, steps, \
+        (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
+        if (dec_v2 == 1) {
+            if (kv_mode == 3) STRATA_ATTN_ROWS_V2(3, 2);
+            else if (kv_mode == 2) STRATA_ATTN_ROWS_V2(2, 2);
+            else if (kv_mode == 1) STRATA_ATTN_ROWS_V2(1, 2);
+            else STRATA_ATTN_ROWS_V2(0, 2);
+        } else {
+            if (kv_mode == 3) STRATA_ATTN_ROWS_V2(3, 1);
+            else if (kv_mode == 2) STRATA_ATTN_ROWS_V2(2, 1);
+            else if (kv_mode == 1) STRATA_ATTN_ROWS_V2(1, 1);
+            else STRATA_ATTN_ROWS_V2(0, 1);
+        }
+#undef STRATA_ATTN_ROWS_V2
+    } else
+#endif
 #define STRATA_ATTN_ROWS(M) attn_chunk_rows_kernel<M><<<grid, THREADS, 0, st>>>(q, rows, ids, steps, (int) s.n_head_kv, \
         (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
     if (kv_mode == 3) STRATA_ATTN_ROWS(3);
@@ -1236,6 +1518,24 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
+#if defined(STRATA_HIP_GFX906)
+    const int dec_v2 = qsa_dec_v2_mode();
+    if (dec_v2 > 0) {
+#define STRATA_ATTN_STEP_V2(M, NC_) attn_chunk_gfx906_v2_kernel<M, NC_><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, 0, 0)
+        if (dec_v2 == 1) {
+            if (kv_mode == 3) STRATA_ATTN_STEP_V2(3, 2);
+            else if (kv_mode == 2) STRATA_ATTN_STEP_V2(2, 2);
+            else if (kv_mode == 1) STRATA_ATTN_STEP_V2(1, 2);
+            else STRATA_ATTN_STEP_V2(0, 2);
+        } else {
+            if (kv_mode == 3) STRATA_ATTN_STEP_V2(3, 1);
+            else if (kv_mode == 2) STRATA_ATTN_STEP_V2(2, 1);
+            else if (kv_mode == 1) STRATA_ATTN_STEP_V2(1, 1);
+            else STRATA_ATTN_STEP_V2(0, 1);
+        }
+#undef STRATA_ATTN_STEP_V2
+    } else
+#endif
 #if !defined(__HIPCC__)
     if (kv_mode == 1 && attn_v3_on())
         attn_chunk_q8_v3_kernel<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,

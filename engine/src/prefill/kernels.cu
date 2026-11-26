@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include "strata/core/geometry.hpp"
 
@@ -2267,6 +2268,372 @@ bool gdn_fused_impl(float* history, const float* qkv, const float* conv_w, float
     check("gdn_conv_recurrence_fused");
     return true;
 }
+
+// ---- P8 (opt-in STRATA_GDN_WY_GFX906=1|2): Wave64 Chunked WY GDN Recurrence (CH=16, NS=32, NT=128) for gfx906.
+// Replaces token-serial gdn_rec_quad2c_kernel with 16-token WY chunks in 2 launches (prep + scan):
+//   - gdn_wy16_prep_kernel: 1 CTA per (chunk, key_head), 192 threads (3 wave64s = 1/value head), 14.0 KiB LDS:
+//     computes K*K^T & Q*K^T ONCE via v_dot2_f32_f16 and solves T=(I+A)^{-1} + P in parallel across all chunks/heads.
+//   - gdn_wy16_scan_kernel<W_FDOT2>: 192 CTAs (4 slices of 32 cols x 48 heads), 128 threads (2 wave64s), 19.8 KiB LDS
+//     (3 CTAs/CU). Within each wave64: 16 cols x 4 K-row groups (32 rows/thread -> W[32] in VGPRs); U=K*W & qW=Q*W
+//     reduce across 4 K-groups via 2 wave64 shuffles (ZERO barriers), D=T*Y & O=P*D run in parallel across all 4
+//     K-groups (4 rows/thread), and W updates via v_dot2_f32_f16 (mode=1) or FP32 FMA (mode=2). 4 barriers/16 tokens.
+// Tail tokens (T % 16) run through gdn_rec_quad2c_kernel; output norm uses existing launch_gdn_out_norm_loop.
+constexpr int WY_CH = 16;
+constexpr int WY_NS = 32;
+constexpr int WY_NSE = S / WY_NS;   // 4 slices per head (192 CTAs total)
+constexpr int WY_SEG = 128;         // 128 chunks = 2048 tokens per segment (~12.0 MiB/GPU)
+
+typedef _Float16 wy_h2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ _Float16 wy_h1(float a) {
+    return (_Float16) fminf(fmaxf(a, -65504.0f), 65504.0f);
+}
+__device__ __forceinline__ float wy_fdot2(wy_h2 a, wy_h2 b, float c) {
+#if defined(__gfx906__)
+    return __builtin_amdgcn_fdot2(a, b, c, false);
+#else
+    return fmaf((float) a[0], (float) b[0], fmaf((float) a[1], (float) b[1], c));
+#endif
+}
+__device__ __forceinline__ wy_h2 wy_pack2(float a, float b) {
+    return wy_h2{wy_h1(a), wy_h1(b)};
+}
+
+__global__ void __launch_bounds__(192) gdn_wy16_prep_kernel(float* __restrict__ tp, const float* __restrict__ h,
+                                                            const float* __restrict__ gate,
+                                                            const float* __restrict__ beta) {
+    constexpr int VPK = HV / HK;   // 3
+    __shared__ __align__(16) wy_h2 Ks[WY_CH][S / 2];    // 4,096 B
+    __shared__ __align__(16) wy_h2 Qs[WY_CH][S / 2];    // 4,096 B
+    __shared__ float skk[WY_CH][WY_CH];                 // 1,024 B
+    __shared__ float sqk[WY_CH][WY_CH];                 // 1,024 B
+    __shared__ float sA[VPK][WY_CH][WY_CH + 1];         // 3,264 B
+    __shared__ float sg[VPK][WY_CH];                    //   192 B
+    __shared__ float sb[VPK][WY_CH];                    //   192 B (total 13,888 B -> 4 CTAs/CU)
+    const int ch = blockIdx.x, qh = blockIdx.y, tid = threadIdx.x;
+    const int w = tid >> 6, lane = tid & 63;
+    const int vh = qh + w * HK;
+    const int64_t base = (int64_t) ch * WY_CH;
+    const float* kh = h + base * C + (size_t) HK * S + (size_t) qh * S;
+    const float* qh_ = h + base * C + (size_t) qh * S;
+    for (int idx = tid; idx < WY_CH * (S / 4); idx += 192) {
+        const int t = idx >> 5, j2 = (idx & 31) * 2, j4 = (idx & 31) * 4;
+        const float4 kv = *reinterpret_cast<const float4*>(kh + (size_t) t * C + j4);
+        const float4 qv = *reinterpret_cast<const float4*>(qh_ + (size_t) t * C + j4);
+        Ks[t][j2 + 0] = wy_pack2(kv.x, kv.y);
+        Ks[t][j2 + 1] = wy_pack2(kv.z, kv.w);
+        Qs[t][j2 + 0] = wy_pack2(qv.x, qv.y);
+        Qs[t][j2 + 1] = wy_pack2(qv.z, qv.w);
+    }
+    if (lane < WY_CH) {
+        float g = gate[(base + lane) * HV + vh];
+#pragma unroll
+        for (int off = 1; off < WY_CH; off <<= 1) {
+            const float u = __shfl_up(g, off, WY_CH);
+            if (lane >= off) g += u;
+        }
+        sg[w][lane] = g;
+        sb[w][lane] = beta[(base + lane) * HV + vh];
+    }
+    __syncthreads();
+    // 136 lower-triangular pairs (0 <= s <= t < 16), 1 pair per thread on tid < 136
+    if (tid < 136) {
+        int t, s;
+        if (tid < 128) {
+            const int r = tid >> 4, c = tid & 15;
+            if (c <= r) { t = r; s = c; }
+            else { t = 15 - r; s = 15 - c; }
+        } else {
+            t = 8 + (tid - 128);
+            s = t;
+        }
+        float pq0 = 0.0f, pq1 = 0.0f, pq2 = 0.0f, pq3 = 0.0f;
+#pragma unroll 4
+        for (int j = 0; j < S / 2; j += 4) {
+            pq0 = wy_fdot2(Qs[t][j + 0], Ks[s][j + 0], pq0);
+            pq1 = wy_fdot2(Qs[t][j + 1], Ks[s][j + 1], pq1);
+            pq2 = wy_fdot2(Qs[t][j + 2], Ks[s][j + 2], pq2);
+            pq3 = wy_fdot2(Qs[t][j + 3], Ks[s][j + 3], pq3);
+        }
+        sqk[t][s] = (pq0 + pq1) + (pq2 + pq3);
+        float pk = 0.0f;
+        if (s < t) {
+            float pk0 = 0.0f, pk1 = 0.0f, pk2 = 0.0f, pk3 = 0.0f;
+#pragma unroll 4
+            for (int j = 0; j < S / 2; j += 4) {
+                pk0 = wy_fdot2(Ks[t][j + 0], Ks[s][j + 0], pk0);
+                pk1 = wy_fdot2(Ks[t][j + 1], Ks[s][j + 1], pk1);
+                pk2 = wy_fdot2(Ks[t][j + 2], Ks[s][j + 2], pk2);
+                pk3 = wy_fdot2(Ks[t][j + 3], Ks[s][j + 3], pk3);
+            }
+            pk = (pk0 + pk1) + (pk2 + pk3);
+        }
+        skk[t][s] = pk;
+    }
+    __syncthreads();
+    float* out_t = tp + ((size_t) ch * HV + vh) * (2 * WY_CH * WY_CH);
+    float* out_p = out_t + WY_CH * WY_CH;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const int i = lane + u * 64;
+        const int t = i >> 4, s = i & 15;
+        if (s <= t) {
+            const float dec = __expf(sg[w][t] - sg[w][s]);
+            out_p[i] = sqk[t][s] * dec;
+            sA[w][t][s] = (s < t) ? (skk[t][s] * dec * sb[w][t]) : 0.0f;
+        } else {
+            out_p[i] = 0.0f;
+            sA[w][t][s] = 0.0f;
+        }
+    }
+    __syncthreads();
+    if (lane < WY_CH) {
+        float tc[WY_CH];
+        for (int t = 0; t < WY_CH; ++t) {
+            float v = (t == lane) ? 1.0f : 0.0f;
+            for (int k = lane; k < t; ++k) v = fmaf(-sA[w][t][k], tc[k], v);
+            tc[t] = v;
+            out_t[t * WY_CH + lane] = v;
+        }
+    }
+}
+
+template <bool W_FDOT2>
+__global__ void __launch_bounds__(128) gdn_wy16_scan_kernel(float* __restrict__ state, float* __restrict__ oc,
+                                                               const float* __restrict__ h,
+                                                               const float* __restrict__ gate,
+                                                               const float* __restrict__ beta,
+                                                               const float* __restrict__ tp, int nchunks) {
+    __shared__ __align__(16) wy_h2 Ks[WY_CH][S / 2];          // 4,096 B
+    __shared__ __align__(16) union {
+        wy_h2 Qs[WY_CH][S / 2];                               // 4,096 B (Step 1)
+        wy_h2 Ks_T[WY_CH / 2][S];                             // 4,096 B (Step 2->4, Qs dead after Step 1)
+    } qk;
+    __shared__ __align__(16) float sT[WY_CH][WY_CH];          // 1,024 B
+    __shared__ __align__(16) float sP[WY_CH][WY_CH];          // 1,024 B
+    __shared__ __align__(16) float sV[WY_CH][WY_NS];          // 2,048 B (V, then D)
+    __shared__ __align__(16) float sY[WY_CH][WY_NS];          // 2,048 B
+    __shared__ __align__(16) wy_h2 sD16[WY_NS][WY_CH / 2 + 1];// 1,152 B
+    __shared__ float ex0[WY_CH], ex1[WY_CH], sbeta[WY_CH];    //   192 B (total 15,680 B -> 4 CTAs/CU = 1 wave!)
+
+    const int sl = blockIdx.x, hh = blockIdx.y;
+    const int j0 = sl * WY_NS, qh = hh % HK;
+    const int tid = threadIdx.x, wave = tid >> 6, lane = tid & 63;
+    const int c_in_w = lane & 15, kg = lane >> 4;
+    const int col = wave * 16 + c_in_w, gcol = j0 + col;
+    const int tbase = kg * 4;
+    float W[32];
+    {
+        const float* p = state + ((size_t) (kg * 32) * HV + hh) * S + gcol;
+#pragma unroll
+        for (int r = 0; r < 32; ++r) W[r] = p[(size_t) r * HV * S];
+    }
+    asm volatile("" : "+s"(state));   // recompute store addresses after loop (saves ~64 VGPRs)
+    const float rsqrt_S = rsqrtf((float) S);
+    for (int ch = 0; ch < nchunks; ++ch) {
+        const int64_t base = (int64_t) ch * WY_CH;
+        const float* kh = h + base * C + (size_t) HK * S + (size_t) qh * S;
+        const float* qh_ = h + base * C + (size_t) qh * S;
+#pragma unroll 1
+        for (int u = 0; u < 4; ++u) {
+            const int idx = tid + u * 128;
+            const int t = idx >> 5, j2 = (idx & 31) * 2, j4 = (idx & 31) * 4;
+            const float4 kv = *reinterpret_cast<const float4*>(kh + (size_t) t * C + j4);
+            const float4 qv = *reinterpret_cast<const float4*>(qh_ + (size_t) t * C + j4);
+            Ks[t][j2 + 0] = wy_pack2(kv.x, kv.y);
+            Ks[t][j2 + 1] = wy_pack2(kv.z, kv.w);
+            qk.Qs[t][j2 + 0] = wy_pack2(qv.x, qv.y);
+            qk.Qs[t][j2 + 1] = wy_pack2(qv.z, qv.w);
+        }
+        const float* vh = h + base * C + (size_t) 2 * HK * S + (size_t) hh * S + gcol;
+#pragma unroll 1
+        for (int u = 0; u < 4; ++u) sV[u * 4 + kg][col] = vh[(size_t) (u * 4 + kg) * C];
+        {
+            const float2* tp2 = reinterpret_cast<const float2*>(tp + ((size_t) ch * HV + hh) * (2 * WY_CH * WY_CH));
+            reinterpret_cast<float2*>(&sT[0][0])[tid] = tp2[tid];
+            reinterpret_cast<float2*>(&sP[0][0])[tid] = tp2[128 + tid];
+        }
+        if (tid < WY_CH) {
+            float g = gate[(base + tid) * HV + hh];
+#pragma unroll
+            for (int off = 1; off < WY_CH; off <<= 1) {
+                const float u = __shfl_up(g, off, WY_CH);
+                if (tid >= off) g += u;
+            }
+            const float gl = __shfl(g, WY_CH - 1, WY_CH);
+            ex0[tid] = __expf(g);
+            ex1[tid] = __expf(gl - g);
+            sbeta[tid] = beta[(base + tid) * HV + hh];
+        }
+        __syncthreads();
+
+        // Step 1: U = K * W_in, qW = Q * W_in (wave64 4-lane shuffle reduction, ZERO barriers)
+        float qw_own[4];
+        {
+            wy_h2 w16[16];
+#pragma unroll
+            for (int r = 0; r < 16; ++r) w16[r] = wy_pack2(W[2 * r], W[2 * r + 1]);
+#pragma unroll 1
+            for (int t = 0; t < WY_CH; t += 2) {
+                float u0 = 0.0f, u1 = 0.0f, q0 = 0.0f, q1 = 0.0f;
+                const wy_h2* kp0 = &Ks[t + 0][kg * 16];
+                const wy_h2* kp1 = &Ks[t + 1][kg * 16];
+                const wy_h2* qp0 = &qk.Qs[t + 0][kg * 16];
+                const wy_h2* qp1 = &qk.Qs[t + 1][kg * 16];
+#pragma unroll
+                for (int r = 0; r < 16; ++r) {
+                    const wy_h2 wv = w16[r];
+                    u0 = wy_fdot2(kp0[r], wv, u0);
+                    u1 = wy_fdot2(kp1[r], wv, u1);
+                    q0 = wy_fdot2(qp0[r], wv, q0);
+                    q1 = wy_fdot2(qp1[r], wv, q1);
+                }
+                u0 += __shfl_xor(u0, 16, 64); u0 += __shfl_xor(u0, 32, 64);
+                u1 += __shfl_xor(u1, 16, 64); u1 += __shfl_xor(u1, 32, 64);
+                q0 += __shfl_xor(q0, 16, 64); q0 += __shfl_xor(q0, 32, 64);
+                q1 += __shfl_xor(q1, 16, 64); q1 += __shfl_xor(q1, 32, 64);
+                if (kg == (t >> 2)) {
+                    qw_own[(t & 3) + 0] = q0;
+                    qw_own[(t & 3) + 1] = q1;
+                    sY[t + 0][col] = sbeta[t + 0] * (sV[t + 0][col] - ex0[t + 0] * u0);
+                    sY[t + 1][col] = sbeta[t + 1] * (sV[t + 1][col] - ex0[t + 1] * u1);
+                }
+            }
+        }
+        __syncthreads();
+
+        // Step 2: D = T * Y (all 128 threads, 4 rows/thread -> stored into dead sV + sD16)
+        // Also transpose Ks -> qk.Ks_T (Qs is dead after Step 1) before Barrier 3!
+        {
+            float d_own[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int t = tbase + i;
+                float acc = 0.0f;
+#pragma unroll 1
+                for (int s = 0; s <= t; ++s) acc = fmaf(sT[t][s], sY[s][col], acc);
+                d_own[i] = acc;
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) sV[tbase + i][col] = d_own[i];
+            if constexpr (W_FDOT2) {
+                sD16[col][kg * 2 + 0] = wy_pack2(d_own[0] * ex1[tbase + 0], d_own[1] * ex1[tbase + 1]);
+                sD16[col][kg * 2 + 1] = wy_pack2(d_own[2] * ex1[tbase + 2], d_own[3] * ex1[tbase + 3]);
+#pragma unroll 1
+                for (int i = tid; i < (WY_CH / 2) * S; i += 128) {
+                    const int k2 = i >> 7, r = i & 127;
+                    const wy_h2 a = Ks[2 * k2 + 0][r >> 1];
+                    const wy_h2 b = Ks[2 * k2 + 1][r >> 1];
+                    qk.Ks_T[k2][r] = (r & 1) ? wy_h2{a[1], b[1]} : wy_h2{a[0], b[0]};
+                }
+            }
+        }
+        __syncthreads();
+
+        // Step 3: O = (exp(g) * qW + P * D) * rsqrt(S)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int t = tbase + i;
+            float acc = ex0[t] * qw_own[i];
+#pragma unroll 1
+            for (int s = 0; s <= t; ++s) acc = fmaf(sP[t][s], sV[s][col], acc);
+            oc[((base + t) * HV + hh) * S + gcol] = acc * rsqrt_S;
+        }
+
+        // Step 4: W_out = exp(g_last) * W_in + K^T * (D * exp(g_last - g))
+        const float eg_last = ex0[WY_CH - 1];
+#pragma unroll
+        for (int r = 0; r < 32; ++r) W[r] *= eg_last;
+        if constexpr (W_FDOT2) {
+            // Outer loop over k2 (runtime), inner unrolled over r=0..31 (constant W[r] -> 0 spill!)
+#pragma unroll 1
+            for (int k2 = 0; k2 < WY_CH / 2; ++k2) {
+                const wy_h2 d2 = sD16[col][k2];
+                const wy_h2* kp = &qk.Ks_T[k2][kg * 32];
+#pragma unroll
+                for (int r = 0; r < 32; ++r) W[r] = wy_fdot2(kp[r], d2, W[r]);
+            }
+        } else {
+#pragma unroll 1
+            for (int s = 0; s < WY_CH; ++s) {
+                const float d = sV[s][col] * ex1[s];
+                const wy_h2* kp = &Ks[s][kg * 16];
+#pragma unroll
+                for (int r = 0; r < 16; ++r) {
+                    const wy_h2 kh2 = kp[r];
+                    W[2 * r + 0] = fmaf((float) kh2[0], d, W[2 * r + 0]);
+                    W[2 * r + 1] = fmaf((float) kh2[1], d, W[2 * r + 1]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    {
+        float* p = state + ((size_t) (kg * 32) * HV + hh) * S + gcol;
+#pragma unroll
+        for (int r = 0; r < 32; ++r) p[(size_t) r * HV * S] = W[r];
+    }
+}
+
+struct WyGfx906Ws {
+    float* tp = nullptr;
+    size_t cap = 0;
+    bool ensure(size_t chunks) {
+        if (chunks <= cap) return true;
+        if (tp) cudaFree(tp);
+        tp = nullptr;
+        cap = 0;
+        (void) cudaGetLastError();
+        const size_t n = chunks * HV * (2 * WY_CH * WY_CH);
+        if (cudaMalloc((void**) &tp, n * sizeof(float)) != cudaSuccess) {
+            tp = nullptr;
+            (void) cudaGetLastError();
+            return false;
+        }
+        cap = chunks;
+        return true;
+    }
+};
+
+bool gdn_rec_wy_gfx906(int mode, float* state, const float* h, const float* gate, const float* beta,
+                       float* oc, int64_t T, cudaStream_t s) {
+    if (mode <= 0 || T < WY_CH) return false;
+    static thread_local int last_dev = -1;
+    static thread_local bool is_906 = false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 8) return false;
+    if (dev != last_dev) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+        is_906 = strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx906") && prop.warpSize == 64;
+        last_dev = dev;
+    }
+    if (!is_906) return false;
+    static std::mutex ws_mu;
+    static WyGfx906Ws ws[8];
+    const int64_t T16 = T - (T % WY_CH);
+    const size_t want_ch = std::min<size_t>((size_t) (T16 / WY_CH), (size_t) WY_SEG);
+    float* tp = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(ws_mu);
+        if (!ws[dev].ensure(want_ch)) return false;
+        tp = ws[dev].tp;
+    }
+    for (int64_t t0 = 0; t0 < T16; t0 += (int64_t) WY_SEG * WY_CH) {
+        const int nch = (int) std::min<int64_t>((T16 - t0) / WY_CH, WY_SEG);
+        gdn_wy16_prep_kernel<<<dim3((unsigned) nch, HK), 192, 0, s>>>(tp, h + t0 * C, gate + t0 * HV, beta + t0 * HV);
+        if (mode == 2)
+            gdn_wy16_scan_kernel<false><<<dim3(WY_NSE, HV), 128, 0, s>>>(
+                state, oc + t0 * HV * S, h + t0 * C, gate + t0 * HV, beta + t0 * HV, tp, nch);
+        else
+            gdn_wy16_scan_kernel<true><<<dim3(WY_NSE, HV), 128, 0, s>>>(
+                state, oc + t0 * HV * S, h + t0 * C, gate + t0 * HV, beta + t0 * HV, tp, nch);
+    }
+    if (T > T16) {
+        gdn_rec_quad2c_kernel<<<HV * (S / C2CB), QTH, 0, s>>>(
+            state, h + T16 * C, gate + T16 * HV, beta + T16 * HV, oc + T16 * HV * S, T - T16);
+    }
+    return true;
+}
 #endif   // __HIPCC__
 template <bool Z_F16 = false>
 __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
@@ -3254,6 +3621,19 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
 #if defined(__HIPCC__)
     if (variant == 0 || variant == 1) {
+        // P8 (opt-in STRATA_GDN_WY_GFX906=1|2): wave64 chunked WY recurrence (CH=32) on gfx906, supporting z_f16 & NOY
+        static const int wy_906 = [] {
+            const char* v = std::getenv("STRATA_GDN_WY_GFX906");
+            return v && v[0] ? std::atoi(v) : 0;
+        }();
+        if (wy_906 > 0 && !serial && T >= WY_CH &&
+            gdn_rec_wy_gfx906(wy_906, state, h, gate, beta, y, T, (cudaStream_t) stream)) {
+            static const bool noy = [] { const char* v = std::getenv("STRATA_GDN_NOY"); return v && std::atoi(v) != 0; }();
+            if (with_out)
+                launch_gdn_out_norm_loop(!noy, z, gamma, eps, y, y16, T, stream, ld16, z_f16);
+            check("gdn_recurrence (wy32 gfx906)");
+            return;
+        }
         // STRATA_GDN_CHUNKED=1 (opt-in): the chunked recurrence on the gfx11 matrix cores, FP16 operands (other bits;
         // a shorter chunk or another part takes the kernels below)
         static const bool chunked = gdn_chunked_env() != 0;   // (unset: gdn_rec_wmma applies the gfx12 length gate)

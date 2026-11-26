@@ -1974,6 +1974,10 @@ class StrataEngine:
                     lines_q, sq = self.lines, self.slot_q           # (it holds no slot of the engine before: nothing to lose)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
+                if alone and COALESCE_PREFILL > 1 and COALESCE_WAIT_MS > 0 and not embeddings and len(prompt) >= 64:
+                    time.sleep(min(COALESCE_WAIT_MS, 10) / 1000.0)
+                    with self.slot_cv:
+                        alone = not any(self.slot_busy) and self.waiting == 0
                 solo_max1 = os.environ.get("STRATA_SOLO_MAX1", "0") not in ("", "0")
                 if alone and (left > 1 or solo_max1) and not (not embeddings and self._turn_in_slot(prompt)):
                     pf = self.pen_from_key(orig_len, len(prompt))

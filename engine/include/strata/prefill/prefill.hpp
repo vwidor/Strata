@@ -356,6 +356,10 @@ private:
     bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     struct LmSub { int seg = 0; int64_t c0 = 0, T = 0, t0 = 0; };   ///< a sub-chunk: prompt, first token, tokens, row in the super-chunk
     bool lm_run(const std::vector<Seg>& segs, int depth, const std::vector<LmSub>* given_super, std::string& err);
+    struct PackedSlice { int seg = 0; int64_t c0 = 0, n = 0, pos0 = 0, row_off = 0; };
+    bool can_packed_multi(const std::vector<Seg>& segs, int depth) const;
+    bool run_packed_multi(const std::vector<Seg>& segs, int depth, const std::vector<PackedSlice>* given_chunk,
+                          std::string& err);
     void lm_release();
     bool lm_mid_ = false;
     bool lm_force_ = false;        ///< run_multi: the walk even for a short total

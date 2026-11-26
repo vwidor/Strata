@@ -8536,6 +8536,783 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     return lm_run(std::vector<Seg>{one}, 0, nullptr, err);
 }
 
+// T1 (opt-in STRATA_PF_COALESCE=1): true multi-prompt coalesced prefill reusing run_impl's chunk buffers
+// (zero extra LmBufs VRAM) with 2-stage HIP pipeline, on-GPU i8_gpu_plan, and DFlash2 prompt taps on segment 0.
+// Packs 2..N prompts into shared chunks of <= min_stage(m.T) tokens so dense projections, HC, router, shared expert,
+// and all 512 routed experts execute ONCE across all packed tokens while embeddings, PLE, GDN, and QSA slice per segment.
+static bool pf_coalesce_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_COALESCE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+bool Prefill::can_packed_multi(const std::vector<Seg>& segs, int depth) const {
+    if (!impl_ || segs.size() < 2 || embd_rows != nullptr) return false;
+    if (depth == 0 && hand_in_ != nullptr) return false;
+    if (next_run_.valid()) return false;
+    const Impl& m = *impl_;
+    const core::ModelGeometry& g = *m.g;
+    if (m.pp != nullptr || m.fused_bufs || m.group_cap != 0 || m.host_res == nullptr || m.cache == nullptr ||
+        m.GU == nullptr || m.Dm == nullptr || m.src_dev == nullptr || m.slot_dev == nullptr ||
+        m.ids_identity == nullptr || m.T <= 0 || g.n_expert <= 0 || g.n_expert > 1024)
+        return false;
+    if (strata::kernels::cvec().loaded()) return false;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return false;
+    const int64_t LB = stage_lb_, LE = stage_le_ < 0 ? g.n_layers : stage_le_;
+    auto ss_of = [&](size_t i) -> core::SessionState* {
+        const Seg& sg = segs[i];
+        return (size_t) depth < sg.stage_ss.size() && sg.stage_ss[(size_t) depth] != nullptr
+                   ? sg.stage_ss[(size_t) depth]
+                   : m.ss;
+    };
+    int64_t qsa_idx0 = 0;
+    for (int64_t l = 0; l < LB; ++l)
+        if (core::is_qsa_layer(g, l)) ++qsa_idx0;
+    int64_t qsa_idx = qsa_idx0;
+    const size_t gu_cap = (size_t) m.T * (size_t) K * (size_t) kFF2 * sizeof(float);
+    for (int64_t l = LB; l < LE; ++l) {
+        if (core::is_qsa_layer(g, l)) {
+            for (size_t si = 0; si < segs.size(); ++si) {
+                const core::SessionState* ssq = ss_of(si);
+                if (!ssq || ssq->qsa_states == nullptr) return false;
+                const core::QsaState& st = ssq->qsa_states[(size_t) qsa_idx];
+                if (st.kv_mode == 1 || st.max_cells < segs[si].pos0 + segs[si].n) return false;
+            }
+            ++qsa_idx;
+        }
+        const auto& f = lay.fmt[(size_t) l];
+        if (f.had_gu || f.had_d || f.tail_off) return false;
+        const int32_t* lr = m.host_res + (size_t) l * (size_t) g.n_expert;
+        for (int32_t e = 0; e < g.n_expert; ++e)
+            if (lr[e] < 0) return false;
+#if STRATA_EXPERT_NIBBLE_BUILT && defined(STRATA_HIP_GFX906)
+        const core::nibble::LayerVram& nib_l = core::nibble::layer(l);
+        const strata::kernels::NativeExpertLayout i8_L = nib_l.on
+            ? strata::kernels::native_expert_layout_nib(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+            : strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        const bool i8_same = nib_l.on
+            ? (i8_L.down_off == nib_l.down_off && i8_L.bytes == nib_l.slot_bytes && f.n_embd == N && f.n_ff == kFF)
+            : (i8_L.up_off == f.up_off && i8_L.down_off == f.down_off && i8_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF);
+#else
+#if STRATA_EXPERT_NIBBLE_BUILT
+        if (core::nibble::layer(l).on) return false;
+#endif
+        const strata::kernels::NativeExpertLayout i8_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+        const bool i8_same = i8_L.up_off == f.up_off && i8_L.down_off == f.down_off &&
+                             i8_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF;
+#endif
+        if (!i8_same || !strata::kernels::native_expert_i8_supported(i8_L)) return false;
+        const size_t i8_scr = (strata::kernels::native_expert_i8_scratch_bytes(m.T * K, g.n_expert, kFF) + 255) & ~(size_t) 255;
+        const size_t grp_b = (fused::group_bytes(m.T * K, (int) g.n_expert) + 255) & ~(size_t) 255;
+        const size_t ptr_b = (size_t) g.n_expert * sizeof(unsigned long long) + 256;
+        if (i8_scr + grp_b + ptr_b > gu_cap) return false;
+    }
+    if (next_ != nullptr && !next_->can_packed_multi(segs, depth + 1)) return false;
+    return true;
+}
+
+bool Prefill::run_packed_multi(const std::vector<Seg>& segs, int depth, const std::vector<PackedSlice>* given_chunk,
+                               std::string& err) {
+    err.clear();
+    Impl& m = *impl_;
+    const core::OnDevice on_device(m.device);
+    const core::WatchedStream watched("the packed multi-prompt GPU work", (void*) m.cs, m.device);
+    const core::ModelGeometry& g = *m.g;
+    const int64_t LB = stage_lb_, LE = stage_le_ < 0 ? g.n_layers : stage_le_;
+    const cudaStream_t cs = (cudaStream_t) m.cs;
+    strata::kernels::QsaShapes s = core::qsa_shapes(g);
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    auto ss_of = [&](size_t i) -> core::SessionState* {
+        const Seg& sg = segs[i];
+        return (size_t) depth < sg.stage_ss.size() && sg.stage_ss[(size_t) depth] != nullptr
+                   ? sg.stage_ss[(size_t) depth]
+                   : m.ss;
+    };
+    if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, (int64_t) mmq_ids_rows((size_t) m.T), m.cs);
+    if (depth == 0) stopped_at_ = -1;
+    kva_floor_ = 0;
+
+    // Build chunk packing plan (depth 0 packs across min_stage(m.T); later stages run the given chunk).
+    int64_t tsub = m.T;
+    if (given_chunk == nullptr)
+        for (const Prefill* q = this; q != nullptr; q = q->next_) tsub = std::min(tsub, q->impl_->T);
+    std::vector<std::vector<PackedSlice>> chunks;
+    if (given_chunk != nullptr) {
+        chunks.push_back(*given_chunk);
+    } else {
+        std::vector<PackedSlice> cur;
+        int64_t cur_rows = 0;
+        for (size_t si = 0; si < segs.size(); ++si) {
+            int64_t off = 0;
+            while (off < segs[si].n) {
+                if (cur_rows == tsub) {
+                    chunks.push_back(std::move(cur));
+                    cur.clear();
+                    cur_rows = 0;
+                }
+                const int64_t take = std::min(tsub - cur_rows, segs[si].n - off);
+                PackedSlice ps;
+                ps.seg = (int) si;
+                ps.c0 = off;
+                ps.n = take;
+                ps.pos0 = segs[si].pos0 + off;
+                ps.row_off = cur_rows;
+                cur.push_back(ps);
+                cur_rows += take;
+                off += take;
+            }
+        }
+        if (!cur.empty()) chunks.push_back(std::move(cur));
+    }
+
+    // PLE setup (shared read-only table/consts on m.ss; per-segment conv history on ss_of(si)->ple.hist).
+    const bool ple_on = m.ss->ple.ready() && LB <= 1 && 1 < LE;
+    const bool ple_batch_env = ple_batch_enabled();
+    const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+                           (m.ss->ple.w.key_bf16 != nullptr || m.ss->ple.w.key_native_data != nullptr) &&
+                           m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
+    std::vector<std::vector<std::array<int32_t, 2>>> prev_snap;
+    std::vector<std::array<int32_t, 2>> prevs(segs.size());
+    for (size_t i = 0; i < segs.size(); ++i) prevs[i] = {ss_of(i)->ple_prev[0], ss_of(i)->ple_prev[1]};
+    if (ple_on) {
+        prev_snap.resize(chunks.size());
+        auto pv_walk = prevs;
+        for (size_t ci = 0; ci < chunks.size(); ++ci) {
+            prev_snap[ci] = pv_walk;
+            for (const PackedSlice& sl : chunks[ci]) {
+                auto& pv = pv_walk[(size_t) sl.seg];
+                const int64_t* toks = segs[(size_t) sl.seg].tokens;
+                for (int64_t t = 0; t < sl.n; ++t) { pv[0] = pv[1]; pv[1] = (int32_t) toks[sl.c0 + t]; }
+            }
+        }
+        prevs = std::move(pv_walk);
+    } else if (depth == 0) {
+        for (size_t ci = 0; ci < chunks.size(); ++ci)
+            for (const PackedSlice& sl : chunks[ci]) {
+                auto& pv = prevs[(size_t) sl.seg];
+                const int64_t* toks = segs[(size_t) sl.seg].tokens;
+                for (int64_t t = 0; t < sl.n; ++t) { pv[0] = pv[1]; pv[1] = (int32_t) toks[sl.c0 + t]; }
+            }
+    }
+    auto ple_gather = [&m, &segs, &chunks, &prev_snap](size_t ci, int buf, std::string& e) -> bool {
+        int64_t T = 0;
+        for (const PackedSlice& sl : chunks[ci]) {
+            T += sl.n;
+            const int64_t* toks = segs[(size_t) sl.seg].tokens;
+            int32_t pv[2] = {prev_snap[ci][(size_t) sl.seg][0], prev_snap[ci][(size_t) sl.seg][1]};
+            for (int64_t t = 0; t < sl.n; ++t) {
+                const int32_t tok = (int32_t) toks[sl.c0 + t];
+                strata::kernels::ngram_rows(&tok, pv, 1, m.ss->ple.consts,
+                                            m.ple_rows[buf].data() + (sl.row_off + t) * strata::kernels::PLE_N_HEADS);
+                pv[0] = pv[1];
+                pv[1] = tok;
+            }
+        }
+        if (ple_compact_on() && m.ple_pageable[buf].empty() && m.ple_raw_dev != nullptr &&
+            m.ss->ple.table->gather_raw_iq4nl(m.ple_rows[buf].data(), (size_t) T, (uint8_t*) m.ple_emb_host[buf])) {
+            m.ple_compact[buf] = true;
+            return true;
+        }
+        m.ple_compact[buf] = false;
+        return m.ss->ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+    };
+    struct PleDrain {
+        cudaStream_t stream;
+        ~PleDrain() { if (stream) cudaStreamSynchronize(stream); }
+    } ple_drain{m.ple_copy};
+    std::string ple_next_err;
+    std::future<bool> ple_next;
+    int ple_buf = 0;
+
+#if defined(STRATA_HAVE_DFLASH2)
+    std::vector<int> tap_slot;
+    tap_local_.clear();
+    for (int l : tap_layers_) if (l >= LB && l < LE && l < g.n_layers - 1) tap_local_.push_back(l);
+    if (!tap_local_.empty()) {
+        if (tap_dev_ == nullptr &&
+            cudaMalloc((void**) &tap_dev_, (size_t) tap_cap_ * tap_local_.size() * (size_t) g.n_embd * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            tap_dev_ = nullptr;
+            err = "prefill (coalesced): the DFlash2 tap staging does not fit in VRAM";
+            return false;
+        }
+        tap_slot.assign((size_t) g.n_layers, -1);
+        for (size_t i = 0; i < tap_local_.size(); ++i) tap_slot[(size_t) tap_local_[i]] = (int) i;
+    }
+#endif
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        if (should_stop && should_stop()) { err = "cancelled"; return false; }
+        const std::vector<PackedSlice>& slices = chunks[ci];
+        int64_t T = 0;
+        int64_t seg0_off = 0, seg0_n = 0, seg0_p0 = 0;
+        for (const PackedSlice& sl : slices) {
+            T += sl.n;
+            if (sl.seg == 0) { seg0_off = sl.row_off; seg0_n = sl.n; seg0_p0 = sl.pos0; }
+        }
+        ++stats_.chunks;
+#if defined(STRATA_HAVE_DFLASH2)
+        const int64_t tap_t0_rel = (tap_dev_ != nullptr && !tap_local_.empty() && seg0_n > 0)
+                                       ? std::min<int64_t>(seg0_n, std::max<int64_t>(0, tap_first_ - seg0_p0))
+                                       : seg0_n;
+        const int64_t tap_rows = seg0_n - tap_t0_rel;
+        const int64_t tap_t0 = seg0_off + tap_t0_rel;
+        if (tap_rows > tap_cap_) { err = "prefill (coalesced): DFlash2 tap staging smaller than tapped rows"; return false; }
+#endif
+        // ---- Embeddings or previous-stage handoff upload
+        if (depth > 0) {
+            if (hand_in_ != nullptr && hand_ev_ != nullptr && hand_pieces_ > 0) {
+                const auto* ev = static_cast<const cudaEvent_t*>(hand_ev_);
+                bool ok = true;
+                for (int i = 0; ok && i < hand_pieces_; ++i) {
+                    int64_t r0 = 0, nr = 0;
+                    handoff_piece(T, hand_pieces_, i, r0, nr);
+                    ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
+                    if (ok && nr > 0)
+                        ok = cudaMemcpyAsync(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
+                                             cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
+                }
+                if (!ok) { err = "prefill (coalesced): handoff pipe upload failed"; return false; }
+            } else if (hand_in_ != nullptr && hand_in_ == m.R && hand_ev_ != nullptr) {
+                const auto* ev = static_cast<const cudaEvent_t*>(hand_ev_);
+                if (cudaStreamWaitEvent(m.cs, *ev, 0) != cudaSuccess) {
+                    err = "prefill (coalesced): P2P handoff wait failed"; return false;
+                }
+            } else if (hand_in_ != nullptr && hand_in_ != m.R) {
+                if (cudaMemcpyAsync(m.R, hand_in_, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                    err = "prefill (coalesced): handoff upload failed"; return false;
+                }
+            }
+        } else {
+            bool batched = m.tok_dev != nullptr;
+            const core::NativeEmbed* nemb = core::native_embed();
+            const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+            if (batched && nemb == nullptr &&
+                (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
+                 (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+                batched = false;
+            for (const PackedSlice& sl : slices) {
+                const int64_t* toks = segs[(size_t) sl.seg].tokens;
+                for (int64_t t = 0; batched && t < sl.n; ++t) {
+                    const int64_t tok = toks[sl.c0 + t];
+                    if (tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+                    else m.tok_host[(size_t) (sl.row_off + t)] = (int32_t) tok;
+                }
+            }
+            if (batched) {
+                if (!m.tok_up.upload(m.tok_dev, m.tok_host.data(), (size_t) T, m.cs)) {
+                    err = "prefill (coalesced): token id upload failed"; return false;
+                }
+                if (nemb) {
+                    nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
+                } else {
+                    const auto* codes = (const uint8_t*) wemb->data;
+                    const auto* scales = (const float*) (codes + wemb->codes_bytes);
+                    const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes) : nullptr;
+                    strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
+                                                          wemb->code_bits, wemb->code_bias, wemb->group_elems,
+                                                          (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
+                                                          (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
+                }
+            } else {
+                for (const PackedSlice& sl : slices) {
+                    const int64_t* toks = segs[(size_t) sl.seg].tokens;
+                    for (int64_t t = 0; t < sl.n; ++t)
+                        if (!core::embed_row(*m.wt, g, toks[sl.c0 + t], m.emb + (sl.row_off + t) * N, m.cs, err)) return false;
+                }
+            }
+            gr_broadcast(m.emb, m.R, T, m.cs);
+        }
+
+        if (ple_on && !ple_next.valid())
+            ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, ci, b = ple_buf] {
+                strata::aux_cpus::pin_current_thread();
+                return ple_gather(ci, b, ple_next_err);
+            });
+        bool ple_pending = ple_on;
+        auto ple_land = [&]() -> bool {
+            if (!ple_pending) return true;
+            ple_pending = false;
+            if (!ple_next.get()) { err = ple_next_err; return false; }
+            const size_t raw_bytes = (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES;
+            const bool ple_side = m.ple_compact[ple_buf] && m.ple_copy != nullptr;
+            const cudaStream_t ple_up = ple_side ? m.ple_copy : m.cs;
+            if ((ple_side && cudaStreamWaitEvent(m.ple_copy, m.ple_raw_free, 0) != cudaSuccess) ||
+                (m.ple_compact[ple_buf]
+                     ? cudaMemcpyAsync(m.ple_raw_dev, m.ple_emb_host[ple_buf], raw_bytes, cudaMemcpyHostToDevice, ple_up)
+                     : m.ple_pageable[ple_buf].empty()
+                     ? cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs)
+                     : m.up_ring.h2d(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs)) != cudaSuccess ||
+                cudaEventRecord(m.ple_copied[ple_buf], ple_up) != cudaSuccess ||
+                (ple_side && cudaStreamWaitEvent(m.cs, m.ple_copied[ple_buf], 0) != cudaSuccess)) {
+                err = "prefill (coalesced): PLE upload failed"; return false;
+            }
+            if (m.ple_compact[ple_buf]) {
+                strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
+                if (ple_side && cudaEventRecord(m.ple_raw_free, m.cs) != cudaSuccess) {
+                    err = "prefill (coalesced): PLE raw_free event failed"; return false;
+                }
+            }
+            if (ci + 1 < chunks.size()) {
+                if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
+                    err = "prefill (coalesced): PLE sync failed"; return false;
+                }
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, ci1 = ci + 1, b = ple_buf ^ 1] {
+                    strata::aux_cpus::pin_current_thread();
+                    return ple_gather(ci1, b, ple_next_err);
+                });
+            }
+            ple_buf ^= 1;
+            return true;
+        };
+
+        // QSA step records per slice
+        for (const PackedSlice& sl : slices)
+            for (int64_t t = 0; t < sl.n; ++t)
+                strata::kernels::qsa_step_fill(m.steps_host.data() + (sl.row_off + t) * strata::kernels::kStepCount, sl.pos0 + t, s);
+        if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
+            err = "prefill (coalesced): QSA steps upload failed"; return false;
+        }
+
+        int64_t qsa_index = 0, gdn_index = 0;
+        for (int64_t l = 0; l < LB; ++l) (core::is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        bool normed = false;
+
+        for (int64_t l = LB; l < LE; ++l) {
+            core::progress_beat();
+            const core::LayerView v(*m.wt, l);
+            if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;
+            if (l == 1 && ple_on) {
+                for (const PackedSlice& sl : slices) {
+                    core::SessionState* ssq = ss_of((size_t) sl.seg);
+                    float* sl_ple_hist = ssq->ple_hist ? ssq->ple_hist : ssq->ple.hist;
+                    if (ple_batch) {
+                        const strata::kernels::PleWeights& pw = m.ss->ple.w;
+                        constexpr int64_t HD = strata::kernels::NG_HC_DIM;
+                        const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
+                        const int64_t SB = std::min<int64_t>(sl.n, (int64_t) (m.region_bytes / per_token));
+                        for (int64_t s0 = 0; s0 < sl.n; s0 += SB) {
+                            const int64_t nb = std::min(SB, sl.n - s0);
+                            uint8_t* q = m.region;
+                            auto carve_f = [&](size_t n) { float* p = (float*) q; q += (n * 4 + 255) & ~(size_t) 255; return p; };
+                            float* key = carve_f((size_t) nb * HD);
+                            float* qn = carve_f((size_t) nb * HD);
+                            float* gated = carve_f((size_t) nb * HD);
+                            float* val = carve_f((size_t) nb * N);
+                            float* gate = carve_f((size_t) nb * 4);
+                            uint16_t* e16 = (uint16_t*) carve_f((size_t) nb * N / 2);
+                            uint16_t* e16_lo = bf16x2(m.f16_io) ? (uint16_t*) carve_f((size_t) nb * N / 2) : nullptr;
+                            const float* emb = m.ple_emb + (sl.row_off + s0) * N;
+                            if (pw.key_bf16 != nullptr) {
+                                to_bf16(emb, e16, nb * N, m.cs, e16_lo);
+                                m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
+                                if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, 1.0f);
+                            } else {
+                                to_f16(emb, e16, nb * N, m.cs);
+                                m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
+                                to_bf16(emb, e16, nb * N, m.cs, e16_lo);
+                            }
+                            m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
+                            if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
+                            try {
+                                strata::kernels::native_ple_postops_batch(key, m.R + (sl.row_off + s0) * D, val,
+                                                                          sl_ple_hist, pw, qn, gated, gate, (int) nb, m.cs);
+                            } catch (const std::exception& e) { err = std::string("prefill (coalesced) PLE: ") + e.what(); return false; }
+                        }
+                    } else {
+                        for (int64_t t = 0; t < sl.n; ++t) {
+                            strata::kernels::PleOut po;
+                            po.normalized = m.ple_norm;
+                            po.result = m.R + (sl.row_off + t) * D;
+                            try {
+                                strata::kernels::ple_block(m.ple_emb + (sl.row_off + t) * N, m.R + (sl.row_off + t) * D,
+                                                           sl_ple_hist, m.ss->ple.w, po, m.ss->ple.scratch, m.cs);
+                            } catch (const std::exception& e) { err = std::string("prefill (coalesced) PLE: ") + e.what(); return false; }
+                            strata::kernels::ple_history_advance(sl_ple_hist, m.ple_norm, m.cs);
+                        }
+                    }
+                }
+            }
+
+            for (int half = 0; half < 2; ++half) {
+                bool bo_raw = false;
+                const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
+                const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
+                                  su = std::string(pre) + "up.weight", si = std::string(pre) + "inject.weight";
+                const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
+                                      *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
+                if (!wn || !wd || !wu || !wi) return false;
+                core::WeightRef wd_q8, wu_q8;
+                if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
+                    wd_q8 = *wd; wu_q8 = *wu;
+                    wd_q8.data = core::NativeDense::hc_bf16_view(*wd, m.cs, 0, 0);
+                    wu_q8.data = core::NativeDense::hc_bf16_view(*wu, m.cs, 1, 0);
+                    if (!wd_q8.data || !wu_q8.data) { err = "prefill (coalesced): Q8 HC dequant failed"; return false; }
+                    wd = &wd_q8; wu = &wu_q8;
+                }
+                const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() && !m.xn16_lo
+                                        ? D + XN_PAD : D;
+                const bool xf16 = m.xn_f16 && !m.xn16_lo && ldx == D;
+                if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, xf16);
+                else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
+                normed = false;
+                bool lo_raw = false;
+                if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16, pf_f16_out(), &lo_raw)) return false;
+                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo, lo_raw);
+                bool upmixed = false;
+                if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) &&
+                    !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
+                    wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D)
+                    upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
+                                       m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
+                bool gated_raw = false;
+                if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs, false, pf_f16_out() && !gr_unfused(), &gated_raw)) return false;
+                const bool inj_wave = pf_tiny_wave() && wi->q8_scale == nullptr && !m.xn16_lo &&
+                                      wi->kind == core::WeightKind::Bf16InF32 && wi->data != nullptr &&
+                                      wi->ne0 == D && wi->ne1 == HC &&
+                                      pf_hc_inject_bf16(m.xn16, ldx, m.f16_io || xf16, (const uint16_t*) wi->data, m.inj, T, D, m.cs);
+                if (!inj_wave && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                uint16_t* const mh_dst = (m.mixed_h == m.mixed_bf) ? nullptr : m.mixed_h;
+                if (upmixed) {
+                } else if (gr_unfused()) {
+                    gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, mh_dst, m.mixed_bf_lo);
+                } else {
+                    gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, mh_dst,
+                             m.mixed_bf_lo, gated_raw);
+                }
+                if (wd_q8.data) {
+                    core::NativeDense::hc_bf16_release(m.cs, 0, 0);
+                    core::NativeDense::hc_bf16_release(m.cs, 1, 0);
+                }
+
+                if (half == 0 && !core::is_qsa_layer(g, l)) {
+                    const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
+                                          *wo = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
+                                          *wb = need(v, "ssm_beta.weight", err), *wc = need(v, "ssm_conv1d.weight", err),
+                                          *wnm = need(v, "ssm_norm.weight", err), *wdt = need(v, "ssm_dt.bias", err),
+                                          *wsa = need(v, "ssm_a", err);
+                    if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
+                    bool qkv_raw = false, z_raw = false;
+                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err, 0, 0, pf_f16_out(), &qkv_raw)) return false;
+                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err, 0, 0, pf_f16_out(), &z_raw)) return false;
+                    const bool ab_wave = pf_tiny_wave() && !m.mixed_bf_lo &&
+                                         wa->kind == core::WeightKind::Bf16InF32 && wb->kind == core::WeightKind::Bf16InF32 &&
+                                         wa->data != nullptr && wb->data != nullptr && wa->ne0 == N && wa->ne1 == HV &&
+                                         wb->ne0 == N && wb->ne1 == HV &&
+                                         pf_gdn_ab_gates_bf16(m.mixed_bf, m.f16_io, (const uint16_t*) wa->data,
+                                                              (const uint16_t*) wb->data, (const float*) wdt->data,
+                                                              (const float*) wsa->data, m.gate, m.beta, T, N, HV, m.cs);
+                    if (!ab_wave) {
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    }
+                    const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
+                    const int64_t y_stride = ld_y > 0 ? ld_y : ZV;
+                    for (const PackedSlice& sl : slices) {
+                        core::SessionState* ssq = ss_of((size_t) sl.seg);
+                        float* state = ssq->gdn_state + (size_t) (gdn_index - ssq->gdn_ord0) * gdn_floats;
+                        float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        const float* qkv_sl = m.qkv + (size_t) sl.row_off * C;
+                        const float* z_sl = m.z + (size_t) sl.row_off * ZV;
+                        gdn_conv(conv, qkv_sl, (const float*) wc->data, m.hbuf + (size_t) sl.row_off * C, sl.n, EPS, m.cs, qkv_raw);
+                        gdn_recurrence(state, m.hbuf + (size_t) sl.row_off * C, m.gate + (size_t) sl.row_off * HV,
+                                       m.beta + (size_t) sl.row_off * HV, z_sl, (const float*) wnm->data, EPS,
+                                       m.y + (size_t) sl.row_off * ZV, m.y_h + (size_t) sl.row_off * y_stride, sl.n,
+                                       m.cs, ld_y, z_raw);
+                    }
+                    if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y, pf_f16_out(), &bo_raw)) return false;
+                    ++gdn_index;
+                } else if (half == 0) {
+                    const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
+                                          *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
+                                          *wik = need(v, "indexer.k_proj.weight", err),
+                                          *wiq = need(v, "indexer.q_proj.weight", err),
+                                          *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
+                                          *wiqn = need(v, "indexer.q_norm.weight", err),
+                                          *wikn = need(v, "indexer.k_norm.weight", err);
+                    if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    bool qf_raw = false;
+                    if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err, 0, 0, pf_f16_out() && qsa_fuse_nr(), &qf_raw)) return false;
+                    if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
+                    const int64_t a_stride = ld_a > 0 ? ld_a : ZV;
+                    static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
+                    static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                    for (const PackedSlice& sl : slices) {
+                        core::SessionState* ssq = ss_of((size_t) sl.seg);
+                        const core::QsaState& st = ssq->qsa_states[(size_t) qsa_index];
+                        float* Kc_sl = m.Kc + (size_t) sl.row_off * kKvW;
+                        float* Vc_sl = m.Vc + (size_t) sl.row_off * kKvW;
+                        const float* Qf_sl = m.Qf + (size_t) sl.row_off * (kNHead * 2 * kHeadDim);
+                        float* q_sl = m.q + (size_t) sl.row_off * kQW;
+                        float* q_idx_sl = m.q_idx + (size_t) sl.row_off * kIdxQW;
+                        float* idx_raw_sl = m.idx_raw + (size_t) sl.row_off * 128;
+                        int32_t* steps_sl = m.steps_dev + (size_t) sl.row_off * strata::kernels::kStepCount;
+                        int32_t* ids_sl = m.sel_ids + (size_t) sl.row_off * m.cap;
+                        float* attn_sl = m.attn + (size_t) sl.row_off * kQW;
+                        uint16_t* attn_h_sl = m.attn_h + (size_t) sl.row_off * a_stride;
+                        if (qsa_fuse_nr()) {
+                            rms_rope_rows(Kc_sl, kKvW, kHeadDim, Kc_sl, kKvW, (const float*) wkn->data, sl.n, kNKv, kHeadDim, EPS, sl.pos0, strata::kernels::rope_scaling(), m.cs);
+                        } else {
+                            rms_rows(Kc_sl, (const float*) wkn->data, sl.n * 2, 256, 256, EPS, m.cs);
+                            rope(Kc_sl, sl.n, kNKv, kHeadDim, kKvW, sl.pos0, strata::kernels::rope_scaling(), m.cs);
+                        }
+                        if (st.kv_hybrid) {
+                            strata::kernels::fwht256_inplace_cuda(Vc_sl, sl.n * 2, m.cs);
+                            const strata::kernels::KvHostPools hk = strata::kernels::kv_hybrid_k_half(st.host),
+                                                               hv = strata::kernels::kv_hybrid_v_half(st.host);
+                            const bool mirror = st.host.present();
+                            kv_append(Kc_sl, Kc_sl, sl.n, sl.pos0, st.page_table, s.page_size, nullptr, nullptr,
+                                      st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, mirror ? &hk : nullptr, nullptr);
+                            strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, sl.pos0, sl.n, Vc_sl, Vc_sl, s, m.cs,
+                                                          mirror ? &hv : nullptr, nullptr);
+                        } else {
+                            if (st.kv_rot) {
+                                strata::kernels::fwht256_inplace_cuda(Kc_sl, sl.n * 2, m.cs);
+                                strata::kernels::fwht256_inplace_cuda(Vc_sl, sl.n * 2, m.cs);
+                            }
+                            if (st.kv_q4)
+                                strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, sl.pos0, sl.n, Kc_sl, Vc_sl, s, m.cs, &st.host, nullptr);
+                            else
+                                kv_append(Kc_sl, Vc_sl, sl.n, sl.pos0, st.page_table, s.page_size,
+                                          st.kv_int8 ? nullptr : st.k_pool, st.kv_int8 ? nullptr : st.v_pool,
+                                          st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host, nullptr);
+                        }
+                        if (qsa_fuse_nr()) {
+                            rms_rope_rows(Qf_sl, kNHead * 2 * kHeadDim, 2 * kHeadDim, q_sl, kQW, (const float*) wqn->data, sl.n, kNHead, kHeadDim, EPS, sl.pos0, strata::kernels::rope_scaling(), m.cs, qf_raw);
+                        } else {
+                            split_q(Qf_sl, q_sl, sl.n, m.cs);
+                            rms_rows(q_sl, (const float*) wqn->data, sl.n * kNHead, kHeadDim, kHeadDim, EPS, m.cs);
+                            rope(q_sl, sl.n, kNHead, kHeadDim, kQW, sl.pos0, strata::kernels::rope_scaling(), m.cs);
+                        }
+                        if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(q_sl, sl.n * kNHead, m.cs);
+                        if (qsa_fuse_nr()) {
+                            rms_rope_rows(q_idx_sl, kIdxQW, kIdxK, q_idx_sl, kIdxQW, (const float*) wiqn->data, sl.n, kIdxQHeads, kIdxK, EPS, sl.pos0, strata::kernels::rope_scaling(), m.cs);
+                        } else {
+                            rms_rows(q_idx_sl, (const float*) wiqn->data, sl.n * 4, 128, 128, EPS, m.cs);
+                            rope(q_idx_sl, sl.n, kIdxQHeads, kIdxK, kIdxQW, sl.pos0, strata::kernels::rope_scaling(), m.cs);
+                        }
+                        const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                        try {
+                            strata::kernels::native_qsa_indexer_append_batch(idx_raw_sl, sl.n, sl.pos0, 0,
+                                                                             (const float*) wikn->data, EPS, ib, s,
+                                                                             st.max_cells, strata::kernels::rope_scaling(), m.cs);
+                        } catch (const std::exception& e) { err = std::string("prefill (coalesced) indexer: ") + e.what(); return false; }
+                        for (int64_t t0 = 0; t0 < sl.n; t0 += m.sel_batch) {
+                            const int64_t nb = std::min(m.sel_batch, sl.n - t0);
+                            const int32_t* steps0 = steps_sl + t0 * strata::kernels::kStepCount;
+                            const int64_t active = (int64_t) m.steps_host[(size_t) ((sl.row_off + t0 + nb - 1) * strata::kernels::kStepCount + strata::kernels::kStepNBid)] + 1;
+                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, q_idx_sl + t0 * kIdxQW,
+                                                                                 steps0, nb, m.max_blocks, s, m.sel_scores, m.cs, active))
+                                strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, q_idx_sl + t0 * kIdxQW, steps0, nb,
+                                                                  m.max_blocks, s, m.sel_scores, m.cs, active);
+                            strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                            ids_sl + t0 * m.cap, m.cs, active);
+                        }
+                        const strata::kernels::QsaAttnPools pools = core::qsa_attn_pools(st);
+                        const bool need_fwht = st.kv_rot || st.kv_hybrid;
+                        const bool gated = !old_attn && qsa_fuse_gate() &&
+                                           strata::kernels::qsa_prompt_attn_batch_gated(q_sl, pools, ids_sl, steps_sl, m.cap, s,
+                                                                                        Qf_sl, attn_h_sl, a_stride, sl.n, m.cs,
+                                                                                        need_fwht, qf_raw);
+                        if (!gated && (old_attn || !strata::kernels::qsa_prompt_attn_batch(q_sl, pools, ids_sl, steps_sl, m.cap, s,
+                                                                                           attn_sl, sl.n, m.cs))) {
+                            for (int64_t t0 = 0; t0 < sl.n; t0 += m.attn_batch) {
+                                const int64_t nb = std::min(m.attn_batch, sl.n - t0);
+                                strata::kernels::qsa_decode_attn_batch(q_sl + t0 * kQW, pools, ids_sl + t0 * m.cap,
+                                                                       steps_sl + t0 * strata::kernels::kStepCount, m.cap,
+                                                                       s, m.attn_scratch, attn_sl + t0 * kQW, nb, m.cs);
+                            }
+                        }
+                        if (!gated && need_fwht) strata::kernels::fwht256_inplace_cuda(attn_sl, sl.n * kNHead, m.cs);
+                        if (!gated) gate_attn(attn_sl, Qf_sl, attn_h_sl, sl.n, m.cs, ld_a, qf_raw);
+                    }
+                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a, pf_f16_out(), &bo_raw)) return false;
+                    ++qsa_index;
+                } else {
+                    // ======================= MoE (SINGLE sweep across ALL packed tokens!) =======================
+                    const core::WeightRef *wr = need(v, "ffn_gate_inp.weight", err),
+                                          *wgi = need(v, "ffn_gate_inp_shexp.weight", err),
+                                          *wsg = need(v, "ffn_gate_shexp.weight", err),
+                                          *wsu = need(v, "ffn_up_shexp.weight", err),
+                                          *wsd = need(v, "ffn_down_shexp.weight", err);
+                    if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
+                    bool lg_raw = false;
+                    const bool lg_f16_ok = pf_f16_out() && (g.n_expert == 512 || g.n_expert == 256);
+                    if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo, 0, nullptr, false, lg_f16_ok, &lg_raw)) return false;
+                    route(m.logits, m.ids, m.w, T, g.n_expert, m.cs, lg_raw);
+                    bool sg_raw = false, su_raw = false, sh_raw = false;
+                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err, 0, 0, pf_f16_out(), &sg_raw)) return false;
+                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err, 0, 0, sg_raw, &su_raw)) return false;
+                    swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs, sg_raw && su_raw);
+                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err, 0, 0, pf_f16_out() && !pf_dm16(), &sh_raw)) return false;
+                    const bool sg_wave = pf_tiny_wave() && !m.mixed_bf_lo && wgi->data != nullptr &&
+                                         pf_shared_gate_bf16(m.mixed_bf, m.f16_io, (const uint16_t*) wgi->data, m.sg, T, N, m.cs);
+                    if (!sg_wave) {
+                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                    }
+                    if (m.fr_xq == nullptr || m.fr_xq_rows < T) {
+                        if (m.fr_xq) cudaFree(m.fr_xq);
+                        m.fr_xq = nullptr; m.fr_xq_rows = 0;
+                        if (cudaMalloc(&m.fr_xq, (size_t) T * (size_t) (N / 32) * 36) != cudaSuccess) {
+                            err = "prefill (coalesced): no VRAM for int8 activations"; return false;
+                        }
+                        m.fr_xq_rows = T;
+                    }
+                    const auto& f = lay.fmt[(size_t) l];
+#if STRATA_EXPERT_NIBBLE_BUILT && defined(STRATA_HIP_GFX906)
+                    const core::nibble::LayerVram& nib_l = core::nibble::layer(l);
+                    const strata::kernels::NativeExpertLayout i8_L = nib_l.on
+                        ? strata::kernels::native_expert_layout_nib(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                        : strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+#else
+                    const strata::kernels::NativeExpertLayout i8_L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+#endif
+                    const size_t i8_scr_al = (strata::kernels::native_expert_i8_scratch_bytes(T * K, g.n_expert, kFF) + 255) & ~(size_t) 255;
+                    void* const tab_buf = (uint8_t*) m.GU + i8_scr_al;
+                    fused::group(m.ids, T * K, (int) K, (int) g.n_expert, tab_buf, m.slot_dev, m.src_dev, m.cs);
+                    const int32_t* const off_dev = fused::group_offsets(tab_buf, (int) g.n_expert);
+                    strata::kernels::native_expert_i8_quantize(m.mixed, T, N, m.fr_xq, m.cs);
+                    const int64_t nl_all = g.n_layers, ne_all = g.n_expert;
+                    if (m.i8_res_ptrs == nullptr || m.i8_res_layers != nl_all || m.i8_res_experts != ne_all) {
+                        if (m.i8_res_ptrs) cudaFree(m.i8_res_ptrs);
+                        if (m.i8_res_ng) cudaFree(m.i8_res_ng);
+                        m.i8_res_ptrs = nullptr; m.i8_res_ng = nullptr; m.i8_res_snap.clear();
+                        const int32_t ne32 = (int32_t) ne_all;
+                        if (cudaMalloc((void**) &m.i8_res_ptrs, (size_t) nl_all * (size_t) ne_all * sizeof(unsigned long long)) != cudaSuccess ||
+                            cudaMalloc((void**) &m.i8_res_ng, sizeof(int32_t)) != cudaSuccess ||
+                            cudaMemcpy(m.i8_res_ng, &ne32, sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                            err = "prefill (coalesced): failed to allocate static expert pointers"; return false;
+                        }
+                        m.i8_res_layers = nl_all; m.i8_res_experts = ne_all;
+                        m.i8_res_snap.assign((size_t) nl_all * (size_t) ne_all, -2);
+                    }
+                    const int32_t* const lr = m.host_res + (size_t) l * (size_t) ne_all;
+                    int32_t* const snap = m.i8_res_snap.data() + (size_t) l * (size_t) ne_all;
+                    if (std::memcmp(snap, lr, (size_t) ne_all * sizeof(int32_t)) != 0) {
+                        std::vector<unsigned long long> ptrs((size_t) ne_all);
+                        for (int32_t e = 0; e < (int32_t) ne_all; ++e)
+                            ptrs[(size_t) e] = (unsigned long long) (uintptr_t) m.cache->device_slot(lr[e]);
+                        if (cudaMemcpy(m.i8_res_ptrs + (size_t) l * (size_t) ne_all, ptrs.data(),
+                                       (size_t) ne_all * sizeof(unsigned long long), cudaMemcpyHostToDevice) != cudaSuccess) {
+                            err = "prefill (coalesced): failed to upload static expert pointers"; return false;
+                        }
+                        std::memcpy(snap, lr, (size_t) ne_all * sizeof(int32_t));
+                    }
+                    stats_.experts_resident += (int64_t) ne_all;
+                    strata::kernels::native_expert_i8(i8_L, m.i8_res_ptrs + (size_t) l * (size_t) ne_all,
+                                                      off_dev, m.i8_res_ng, m.ids_identity, m.src_dev,
+                                                      g.n_expert, T * K, m.fr_xq, m.GU, m.Dm, m.cs);
+                    moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs, nullptr, sh_raw);
+                }
+
+                // ---- HC write + next half fused norm
+                const int64_t nl = half == 0 ? l : l + 1;
+                const bool fuse = !gr_unfused() && nl < LE && !(half == 1 && nl == 1 && ple_on);
+                const core::WeightRef* wnn = nullptr;
+                if (fuse) {
+                    const core::LayerView vn(*m.wt, nl);
+                    wnn = need(vn, half == 0 ? "hc_ffn_norm.weight" : "hc_attn_norm.weight", err);
+                    if (!wnn) return false;
+                }
+                if (wnn) {
+                    gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
+                                     m.xn16_lo, ldx, xf16, bo_raw);
+                    normed = true;
+                } else {
+                    gr_write(m.R, m.bo, m.inj, HC, T, m.cs, bo_raw);
+                }
+#if defined(STRATA_HAVE_DFLASH2)
+                if (half == 1 && tap_rows > 0 && tap_slot[(size_t) l] >= 0)
+                    strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D, tap_dev_ + (size_t) tap_slot[(size_t) l] * N,
+                                                  (int64_t) tap_local_.size() * N, N, (int) HC, (int) tap_rows, m.cs);
+#endif
+            }
+        }
+        if (!ple_land()) return false;
+        stats_.tokens += T;
+
+        // ---- Handoff to next stage (pipelined!) or final reporting (segment 0 only)
+        if (next_ != nullptr) {
+            float* h = m.hand[hand_buf_];
+            const int hp = m.hand_pieces;
+            if (hp > 0) {
+                bool ok = cudaEventRecord(m.hand_done[hand_buf_], m.cs) == cudaSuccess;
+                for (int i = 0; ok && i < hp; ++i) {
+                    int64_t r0 = 0, nr = 0;
+                    handoff_piece(T, hp, i, r0, nr);
+                    if (nr > 0)
+                        ok = cudaMemcpyAsync(h + (size_t) r0 * D, m.R + (size_t) r0 * D, (size_t) nr * D * 4,
+                                             cudaMemcpyDeviceToHost, m.cs) == cudaSuccess;
+                    ok = ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.cs) == cudaSuccess;
+                }
+                if (!ok || cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
+                    err = "prefill (coalesced): handoff pipe download failed"; return false;
+                }
+            } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                       cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                err = "prefill (coalesced): handoff download failed"; return false;
+            }
+            if (seg0_n > 0 && on_stage_chunk && !on_stage_chunk(seg0_p0 + seg0_n, err)) return false;
+#if defined(STRATA_HAVE_DFLASH2)
+            if (tap_rows > 0 && on_taps && !on_taps(tap_dev_, tap_rows, seg0_p0 + tap_t0_rel, err)) return false;
+#endif
+            if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+            next_err_.clear();
+            next_->hand_in_ = h;
+            next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
+            next_->hand_pieces_ = hp;
+            auto slice_copy = std::make_shared<std::vector<PackedSlice>>(slices);
+            if (handoff_pipe_worker()) {
+                if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
+                next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, &segs, depth, slice_copy] {
+                    const bool r = next_->run_packed_multi(segs, depth + 1, slice_copy.get(), next_err_);
+                    (void) cudaGetLastError();
+                    return r;
+                }));
+            } else {
+                next_run_ = std::async(std::launch::async, [this, &segs, depth, slice_copy] {
+                    strata::aux_cpus::pin_current_thread();
+                    return next_->run_packed_multi(segs, depth + 1, slice_copy.get(), next_err_);
+                });
+            }
+            hand_buf_ ^= 1;
+            continue;
+        }
+#if defined(STRATA_HAVE_DFLASH2)
+        if (tap_rows > 0 && on_taps) {
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) { err = "prefill (coalesced): tap sync failed"; return false; }
+            if (!on_taps(tap_dev_, tap_rows, seg0_p0 + tap_t0_rel, err)) return false;
+        }
+#endif
+        if (seg0_n > 0 && (on_chunk || on_stage_chunk)) {
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) { err = "prefill (coalesced): chunk sync failed"; return false; }
+            if (on_stage_chunk && !on_stage_chunk(seg0_p0 + seg0_n, err)) return false;
+            if (on_chunk && !on_chunk(m.R + (size_t) seg0_off * D, seg0_n, seg0_p0, err)) return false;
+        }
+    }
+    if (depth == 0) {
+        for (size_t i = 0; i < segs.size(); ++i) {
+            ss_of(i)->ple_prev[0] = prevs[i][0];
+            ss_of(i)->ple_prev[1] = prevs[i][1];
+        }
+    }
+    if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+        err = std::string("prefill (coalesced): ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
 // Several prompts in ONE layer-major pass (PAR-H, 2026-10-30): the super-chunk is a list of sub-chunks, each from one
 // prompt ("segment") with its own sessions; a layer's attention halves run per sub-chunk against that segment's
 // session (GDN / QSA / PLE state), and the layer's experts are staged ONCE for every sub-chunk of the super-chunk -
@@ -8547,6 +9324,20 @@ bool Prefill::run_multi(const std::vector<Seg>& segs, std::string& err) {
     for (const Seg& sg : segs) total += sg.n;
     std::string why;
     if (hand_in_ != nullptr || !impl_) { err = "prefill: multi-prompt read declined (chunk hand-off in use)"; return false; }
+    // T1 (opt-in STRATA_PF_COALESCE=1): fast packed single-pass coalesced prefill reusing chunk buffers (supports
+    // 2-stage HIP + i8_gpu_plan + DFlash2 prompt taps on segment 0 with zero extra LmBufs VRAM).
+    if (pf_coalesce_enabled() && can_packed_multi(segs, 0)) {
+        for (Prefill* p = next_; p != nullptr; p = p->next_) {
+            p->hand_in_ = nullptr; p->hand_ev_ = nullptr; p->hand_pieces_ = 0;
+        }
+        bool ok = run_packed_multi(segs, 0, nullptr, err);
+        std::string drain_err;
+        if (!drain_pipeline(drain_err) && ok) {
+            ok = false;
+            err = drain_err;
+        }
+        return ok;
+    }
     if (!tap_layers_.empty()) { err = "prefill: multi-prompt read declined (the DFlash2 prompt taps are for one prompt)"; return false; }
     for (Prefill* q = this; q != nullptr; q = q->next_) q->lm_force_ = true;
     struct ForceOff { Prefill* h; ~ForceOff() { for (Prefill* q = h; q != nullptr; q = q->next_) q->lm_force_ = false; } } force_off{this};
