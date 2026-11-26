@@ -169,6 +169,7 @@ struct VramKvSlot {
     std::vector<Part> parts;
 };
 struct VramKv {
+    std::mutex mu;
     std::vector<std::unique_ptr<VramKvSlot>> slots;
     uint64_t next_tag = 1;   // slot and layer tags, never reused
 };
@@ -180,6 +181,25 @@ size_t park_vram_budget() {
         return mib > 0 ? (size_t) mib << 20 : (size_t) 0;
     }();
     return b;
+}
+size_t park_vram_reserve_bytes(int dev) {
+    // Optional per-device headroom floor in MiB (e.g. STRATA_PARK_VRAM_RESERVE_MIB=1300,350); default 1536 MiB (3 << 29).
+    const char* rv = std::getenv("STRATA_PARK_VRAM_RESERVE_MIB");
+    if (rv == nullptr || rv[0] == '\0') return (size_t) 3 << 29;
+    size_t chosen = (size_t) 3 << 29;
+    int idx = 0;
+    const char* p = rv;
+    while (*p) {
+        char* end = nullptr;
+        const long long val = std::strtoll(p, &end, 10);
+        if (end == p) break;
+        if (idx <= dev) chosen = val > 0 ? ((size_t) val << 20) : (size_t) 0;
+        if (idx == dev) break;
+        ++idx;
+        while (*end == ',' || *end == ' ') ++end;
+        p = end;
+    }
+    return chosen;
 }
 bool park_trace() { static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr; return on; }
 void vram_kv_free(VramKvSlot& s) {
@@ -194,9 +214,10 @@ void vram_kv_free(VramKvSlot& s) {
 void vram_kv_release(VramKvSlot& s) { s.tag = 0; s.used = 0; s.parts.clear(); }   // free, kept for reuse
 // A slot of `need` bytes on `dev`: the best-fitting free one, else (the free ones freed first) a new one, rounded up
 // to 64 MiB so a growing conversation's next parks reuse it, while the slots' total stays within the budget and
-// 1.5 GB of VRAM stays free beside it.  nullptr, with `why`, otherwise.
+// park_vram_reserve_bytes(dev) stays free beside it.  nullptr, with `why`, otherwise.
 VramKvSlot* vram_kv_take(size_t need, int dev, const char*& why) {
     VramKv& v = vram_kv();
+    std::lock_guard<std::mutex> lk(v.mu);
     const size_t budget = park_vram_budget();
     if (budget == 0) { why = "off"; return nullptr; }
     VramKvSlot* best = nullptr;
@@ -212,7 +233,8 @@ VramKvSlot* vram_kv_take(size_t need, int dev, const char*& why) {
         const size_t want = (need + ((size_t) 64 << 20) - 1) & ~(((size_t) 64 << 20) - 1);
         if (held > budget || want > budget - held) { why = "budget"; return nullptr; }
         size_t fr = 0, tot = 0;
-        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || fr < want + ((size_t) 3 << 29)) {
+        const size_t res = park_vram_reserve_bytes(dev);
+        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || fr < want + res) {
             (void) cudaGetLastError();
             why = "vram";
             return nullptr;
@@ -234,7 +256,9 @@ const VramKvSlot* vram_kv_find(uint64_t tag) {
     if (tag == 0) return nullptr;
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return nullptr; }
-    for (const auto& s : vram_kv().slots) {
+    VramKv& v = vram_kv();
+    std::lock_guard<std::mutex> lk(v.mu);
+    for (const auto& s : v.slots) {
         if (s->tag == 0 || s->dev != dev) continue;
         for (const auto& p : s->parts)
             if (p.tag == tag) return s.get();
@@ -265,10 +289,19 @@ struct ParkAsync {
     VramKvSlot* slot = nullptr;   // STRATA_PARK_VRAM_MIB: the begun park's slot (the stage is not used then)
     uint64_t slot_tag = 0;        // its tag, kept past launch for the image's and its layers' tokens
 };
-ParkAsync& park_async() { static ParkAsync a; return a; }
+constexpr int kParkMaxDevs = 8;
+ParkAsync& park_async_for(int dev) {
+    static ParkAsync a[kParkMaxDevs];
+    return a[std::clamp(dev, 0, kParkMaxDevs - 1)];
+}
+ParkAsync& park_async() {
+    int dev = 0;
+    (void) cudaGetDevice(&dev);
+    return park_async_for(dev);
+}
 constexpr size_t kParkPiece = (size_t) 4 << 20;
 bool park_async_on() {
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+#if defined(STRATA_GPU_METAL)
     return false;
 #else
     static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
@@ -276,9 +309,13 @@ bool park_async_on() {
 #endif
 }
 bool on_device(const void* p) {
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
-    (void) p;   // (no pointer-attribute query in the shims: the slot takes no part, as when the query fails)
+#if defined(STRATA_GPU_METAL)
+    (void) p;
     return false;
+#elif defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    hipPointerAttribute_t at{};
+    if (hipPointerGetAttributes(&at, p) != hipSuccess) { (void) hipGetLastError(); return false; }
+    return at.type == hipMemoryTypeDevice;
 #else
     cudaPointerAttributes at{};
     if (cudaPointerGetAttributes(&at, p) != cudaSuccess) { cudaGetLastError(); return false; }
@@ -350,7 +387,12 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     // STRATA_PARK_VRAM_MIB: this layer's parts go into the park's slot under a fresh tag (0: no slot this park)
-    image.dev_tag = park_async().slot != nullptr ? vram_kv().next_tag++ : 0;
+    if (park_async().slot != nullptr) {
+        std::lock_guard<std::mutex> lk(vram_kv().mu);
+        image.dev_tag = vram_kv().next_tag++;
+    } else {
+        image.dev_tag = 0;
+    }
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
@@ -746,11 +788,13 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
 }
 
 void conversation_park_join() {
-    ParkAsync& a = park_async();
-    std::lock_guard<std::mutex> lk(a.mu);
-    if (a.pending.valid()) {
-        const cudaError_t e = a.pending.get();
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", cudaGetErrorString(e));
+    for (int d = 0; d < kParkMaxDevs; ++d) {
+        ParkAsync& a = park_async_for(d);
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (a.pending.valid()) {
+            const cudaError_t e = a.pending.get();
+            if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", cudaGetErrorString(e));
+        }
     }
 }
 
@@ -763,16 +807,22 @@ long conversation_kv_save_trace_faults() { return kv_save_trace().resize_faults;
 
 bool conversation_park_async_begin(size_t need) {
     if (park_trace_on()) kv_save_trace() = {};   // (the sums cover this park's saves)
-    conversation_park_join();   // (the stage is reused)
-    ParkAsync& a = park_async();
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    ParkAsync& a = park_async_for(dev);
+    {
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (a.pending.valid()) {
+            const cudaError_t e = a.pending.get();
+            if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", cudaGetErrorString(e));
+        }
+    }
     a.active = false;
     a.items.clear();
     a.used = 0;
     a.slot = nullptr;
     a.slot_tag = 0;
     if (!park_async_on() || need == 0) return false;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
     // STRATA_PARK_VRAM_MIB: a slot of the whole K/V instead of the stage, while the budget allows - taken before the
     // stage would be re-allocated, so a growing conversation's park pays no cudaFree (a device sync) when it gets one
     const char* why = "";
@@ -816,7 +866,8 @@ bool conversation_park_async_begin(size_t need) {
         // synchronizes the device, and the checkpoint DMA is in flight at this point)
         const size_t want = (need + ((size_t) 64 << 20) - 1) & ~(((size_t) 64 << 20) - 1);
         size_t fr = 0, tot = 0;
-        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || fr < want + ((size_t) 3 << 29) ||
+        const size_t res = park_vram_reserve_bytes(dev);
+        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || fr < want + res ||
             cudaMalloc((void**) &a.stage, want) != cudaSuccess) {
             a.stage = nullptr;
             (void) cudaGetLastError();
@@ -899,31 +950,43 @@ uint64_t conversation_park_slot_tag() { return park_async().slot_tag; }
 
 void conversation_park_slot_release(uint64_t tag) {
     if (tag == 0) return;
-    for (auto& s : vram_kv().slots)
+    VramKv& v = vram_kv();
+    std::lock_guard<std::mutex> lk(v.mu);
+    for (auto& s : v.slots)
         if (s->tag == tag) { vram_kv_release(*s); return; }
 }
 
 size_t conversation_park_vram_release_all() {
     if (park_vram_budget() == 0) return 0;   // off: nothing was taken, and the stage stays as it was
     conversation_park_join();   // the background copy may be reading a slot or the stage
-    ParkAsync& a = park_async();
     VramKv& v = vram_kv();
     size_t freed = 0;
-    for (size_t i = 0; i < v.slots.size();) {
-        if (a.active && v.slots[i].get() == a.slot) { ++i; continue; }   // a park in progress keeps its own
-        freed += v.slots[i]->cap;
-        vram_kv_free(*v.slots[i]);
-        v.slots.erase(v.slots.begin() + (std::ptrdiff_t) i);
+    {
+        std::lock_guard<std::mutex> lk(v.mu);
+        for (size_t i = 0; i < v.slots.size();) {
+            bool busy = false;
+            for (int d = 0; d < kParkMaxDevs; ++d) {
+                ParkAsync& a = park_async_for(d);
+                if (a.active && v.slots[i].get() == a.slot) { busy = true; break; }
+            }
+            if (busy) { ++i; continue; }   // a park in progress keeps its own
+            freed += v.slots[i]->cap;
+            vram_kv_free(*v.slots[i]);
+            v.slots.erase(v.slots.begin() + (std::ptrdiff_t) i);
+        }
     }
-    if (a.stage != nullptr && !a.active) {
-        int cur = a.dev;
-        (void) cudaGetDevice(&cur);
-        if (cur != a.dev) (void) cudaSetDevice(a.dev);
-        (void) cudaFree(a.stage);
-        if (cur != a.dev) (void) cudaSetDevice(cur);
-        (void) cudaGetLastError();
-        freed += a.cap;
-        a.stage = nullptr; a.cap = 0;
+    for (int d = 0; d < kParkMaxDevs; ++d) {
+        ParkAsync& a = park_async_for(d);
+        if (a.stage != nullptr && !a.active) {
+            int cur = a.dev;
+            (void) cudaGetDevice(&cur);
+            if (cur != a.dev) (void) cudaSetDevice(a.dev);
+            (void) cudaFree(a.stage);
+            if (cur != a.dev) (void) cudaSetDevice(cur);
+            (void) cudaGetLastError();
+            freed += a.cap;
+            a.stage = nullptr; a.cap = 0;
+        }
     }
     return freed;
 }

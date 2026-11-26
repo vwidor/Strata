@@ -1644,6 +1644,11 @@ struct Prefill::Impl {
     // OWN-I8 (STRATA_EXPERT_I8=1, native_expert_i8): kI8RecBytes of device memory - the group tables of one launch (blob pointers, row bounds, the
     // group count); the layer's tokens as q8_1 rows live in fr_xq (the same rows the few-row path quantizes), its scratch is the group's GU rows
     uint8_t* i8_rec = nullptr;
+    // STRATA_PF_I8_ALL_T=1: cached resident device-pointer table [n_layers][n_expert] + static ng_dev = n_expert
+    unsigned long long* i8_res_ptrs = nullptr;
+    int32_t* i8_res_ng = nullptr;
+    int64_t i8_res_layers = 0, i8_res_experts = 0;
+    std::vector<int32_t> i8_res_snap;
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // THE PROMPT ROOM's resolved counts for this layout (carve): the rule's ring, the room's first slot (past the
@@ -1837,6 +1842,8 @@ void Prefill::release() {
     if (impl_->fr_rec) cudaFree(impl_->fr_rec);
     if (impl_->fr_scr) cudaFree(impl_->fr_scr);
     if (impl_->i8_rec) cudaFree(impl_->i8_rec);
+    if (impl_->i8_res_ptrs) cudaFree(impl_->i8_res_ptrs);
+    if (impl_->i8_res_ng) cudaFree(impl_->i8_res_ng);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->ple_copy) (void) cudaStreamDestroy(impl_->ple_copy);
     if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
@@ -5672,6 +5679,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const char* v = std::getenv("STRATA_PF_I8_GPU_PLAN");
                         return v != nullptr && std::atoi(v) != 0;
                     }();
+                    // STRATA_PF_I8_ALL_T=1 (opt-in): unblock on-GPU routing plan for small chunks (T < 820) and cache
+                    // static resident expert device pointers [n_layers][n_expert] to eliminate per-layer put_record launches.
+                    static const bool i8_all_t_env = [] {
+                        const char* v = std::getenv("STRATA_PF_I8_ALL_T");
+                        return v != nullptr && v[0] != '\0' && v[0] != '0';
+                    }();
                     strata::kernels::NativeExpertLayout i8_gp_L{};
                     size_t i8_gp_scr_al = 0, i8_gp_grp_al = 0;
                     bool i8_gpu_plan = false;
@@ -5683,7 +5696,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.cache != nullptr && m.host_res != nullptr && m.GU != nullptr && m.Dm != nullptr &&
                         m.src_dev != nullptr && m.slot_dev != nullptr && m.ids_identity != nullptr &&
                         m.g->n_expert > 0 && m.g->n_expert <= 1024 &&
-                        T * K >= m.g->n_expert * 5 &&
+                        (i8_all_t_env || T * K >= m.g->n_expert * 5) &&
 #if STRATA_EXPERT_NIBBLE_BUILT
                         !nib_l.on &&
 #endif
@@ -5702,13 +5715,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                  i8_gp_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF;
                             const int64_t avg_grp = (T * K) / std::max<int64_t>(1, (m.g->n_expert + MMQ_GROUP - 1) / MMQ_GROUP);
                             if (i8_same && strata::kernels::native_expert_i8_supported(i8_gp_L) &&
-                                strata::kernels::native_expert_i8_prompt(i8_gp_L, avg_grp)) {
+                                (i8_all_t_env || strata::kernels::native_expert_i8_prompt(i8_gp_L, avg_grp))) {
                                 const size_t i8_scr = strata::kernels::native_expert_i8_scratch_bytes(T * K, m.g->n_expert, kFF);
                                 const size_t grp_b = fused::group_bytes(T * K, (int) m.g->n_expert);
                                 const size_t ptr_b = (size_t) m.g->n_expert * sizeof(unsigned long long) + 256;
                                 i8_gp_scr_al = (i8_scr + 255) & ~(size_t) 255;
                                 i8_gp_grp_al = (grp_b + 255) & ~(size_t) 255;
-                                const size_t gu_cap = (size_t) T * (size_t) K * (size_t) kFF2 * sizeof(float);
+                                const int64_t gu_t = i8_all_t_env ? std::max<int64_t>(T, m.T) : T;
+                                const size_t gu_cap = (size_t) gu_t * (size_t) K * (size_t) kFF2 * sizeof(float);
                                 i8_gpu_plan = (i8_gp_scr_al + i8_gp_grp_al + ptr_b <= gu_cap);
                             }
                         }
@@ -5837,6 +5851,58 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t per = (size_t) std::max(1, m.ring / 3);
                         size_t k = stream_all ? seq_start[(size_t) l] : 0;
                         const size_t kend = stream_all ? seq_start[(size_t) l + 1] : 0;
+                        if (i8_all_t_env && k == kend) {
+                            // 100% resident layer: maintain static [n_layers][n_expert] device pointer table with zero put_record launches.
+                            const int64_t nl_all = m.g->n_layers;
+                            const int64_t ne_all = m.g->n_expert;
+                            if (m.i8_res_ptrs == nullptr || m.i8_res_layers != nl_all || m.i8_res_experts != ne_all) {
+                                if (m.i8_res_ptrs) cudaFree(m.i8_res_ptrs);
+                                if (m.i8_res_ng) cudaFree(m.i8_res_ng);
+                                m.i8_res_ptrs = nullptr;
+                                m.i8_res_ng = nullptr;
+                                m.i8_res_snap.clear();
+                                if (cudaMalloc((void**) &m.i8_res_ptrs, (size_t) nl_all * (size_t) ne_all * sizeof(unsigned long long)) == cudaSuccess &&
+                                    cudaMalloc((void**) &m.i8_res_ng, sizeof(int32_t)) == cudaSuccess) {
+                                    const int32_t ne32 = (int32_t) ne_all;
+                                    if (cudaMemcpy(m.i8_res_ng, &ne32, sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess) {
+                                        m.i8_res_layers = nl_all;
+                                        m.i8_res_experts = ne_all;
+                                        m.i8_res_snap.assign((size_t) nl_all * (size_t) ne_all, -2);
+                                    } else {
+                                        cudaFree(m.i8_res_ptrs); cudaFree(m.i8_res_ng);
+                                        m.i8_res_ptrs = nullptr; m.i8_res_ng = nullptr;
+                                    }
+                                } else {
+                                    if (m.i8_res_ptrs) cudaFree(m.i8_res_ptrs);
+                                    if (m.i8_res_ng) cudaFree(m.i8_res_ng);
+                                    m.i8_res_ptrs = nullptr; m.i8_res_ng = nullptr;
+                                }
+                                (void) cudaGetLastError();
+                            }
+                            if (m.i8_res_ptrs != nullptr && m.i8_res_ng != nullptr) {
+                                const int32_t* const lr = m.host_res + (size_t) l * (size_t) ne_all;
+                                int32_t* const snap = m.i8_res_snap.data() + (size_t) l * (size_t) ne_all;
+                                if (std::memcmp(snap, lr, (size_t) ne_all * sizeof(int32_t)) != 0) {
+                                    std::vector<unsigned long long> ptrs((size_t) ne_all);
+                                    for (int32_t e = 0; e < (int32_t) ne_all; ++e)
+                                        ptrs[(size_t) e] = (unsigned long long) (uintptr_t) m.cache->device_slot(lr[e]);
+                                    if (cudaMemcpy(m.i8_res_ptrs + (size_t) l * (size_t) ne_all, ptrs.data(),
+                                                   (size_t) ne_all * sizeof(unsigned long long), cudaMemcpyHostToDevice) != cudaSuccess) {
+                                        err = "prefill: int8 gpu-plan: failed to upload static expert pointers";
+                                        return false;
+                                    }
+                                    std::memcpy(snap, lr, (size_t) ne_all * sizeof(int32_t));
+                                }
+                                stats_.experts_resident += (int64_t) ne_all;
+                                pt.mark(kPfGemmGU, cs);
+                                strata::kernels::native_expert_i8(i8_gp_L, m.i8_res_ptrs + (size_t) l * (size_t) ne_all,
+                                                                  off_dev, m.i8_res_ng,
+                                                                  m.ids_identity, m.src_dev,
+                                                                  m.g->n_expert, T * K, m.fr_xq, m.GU, m.Dm, m.cs);
+                                goto i8_gp_done;
+                            }
+                        }
+                        {
                         std::vector<unsigned long long> ptrs((size_t) m.g->n_expert);
                         for (int32_t e = 0; e < m.g->n_expert;) {
                             const int32_t e0 = e;
@@ -5884,6 +5950,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 give_back(consumed);
                             }
                         }
+                        }
+                        i8_gp_done:;
                     } else {
                         // group the (token, k) pairs by expert on the host
                         pt.mark(kPfHostGroup, cs);

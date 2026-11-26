@@ -1755,6 +1755,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
             if (multi_write) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
             if (ple_post) {
+                static const bool dc_dir_env = [] {
+                    const char* v = std::getenv("STRATA_BATCH_DC_DIRECT");
+                    return v != nullptr && v[0] != '\0' && v[0] != '0';
+                }();
+                float* const hsnap = (dc_dir_env && batch_rec_ && staging_deferred_ && dc_rows_ > 0)
+                                         ? (dc_hist_ + (size_t) (row_base_ + tb) * HS)
+                                         : (hist_snap_ + (size_t) tb * HS);
                 float* qn = parts_ + (size_t) tb * K * N;           // n x 10240 (K * N = 25600 per row)
                 float* gated = hit_out_ + (size_t) tb * K * N;      // n x 10240
                 float* pgate = lo_ + (size_t) tb * g.hc_lr;         // n x 4
@@ -1765,13 +1772,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else
                         for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                     native_ple_postops_batch_snap(xn_ + (size_t) tb * HC * N, Rt(tb), z_ + (size_t) tb * N, ss.ple.hist,
-                                                  ss.ple.w, qn, gated, pgate, n, hist_snap_ + (size_t) tb * HS, cs);
+                                                  ss.ple.w, qn, gated, pgate, n, hsnap, cs);
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE (window): ") + e.what();
                     return false;
                 }
             } else
             for (int t = tb; t < te; ++t) {
+                static const bool dc_dir_env = [] {
+                    const char* v = std::getenv("STRATA_BATCH_DC_DIRECT");
+                    return v != nullptr && v[0] != '\0' && v[0] != '0';
+                }();
                 if (batched) { pw.pre_key = ple_key_ + (size_t) t * NG_HC_DIM; pw.pre_value = ple_val_ + t * N; }
                 if (!multi_write) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
                 PleOut po;
@@ -1790,7 +1801,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     err = std::string("verify PLE: ") + e.what();
                     return false;
                 }
-                if (!keep_rows) copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
+                if (!keep_rows) {
+                    float* const hdst = (dc_dir_env && batch_rec_ && staging_deferred_ && dc_rows_ > 0)
+                                            ? (dc_hist_ + (size_t) (row_base_ + t) * HS)
+                                            : (hist_snap_ + (size_t) t * HS);
+                    copy_from_mapped(hdst, hist, HS, cs);
+                }
             }
             pending = false;
         }
@@ -1873,10 +1889,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const int64_t gil = gi - gdn_off_;
                 float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                float* qkv = qkv_L_ + (size_t) gil * MT * C;
-                float* hb = h_L_ + (size_t) gil * MT * C;
-                float* gate = gate_L_ + (size_t) gil * MT * HV;
-                float* beta = beta_L_ + (size_t) gil * MT * HV;
+                static const bool dc_dir_env = [] {
+                    const char* v = std::getenv("STRATA_BATCH_DC_DIRECT");
+                    return v != nullptr && v[0] != '\0' && v[0] != '0';
+                }();
+                const bool dc_dir = dc_dir_env && batch_rec_ && staging_deferred_ && dc_rows_ > 0;
+                float* qkv = dc_dir ? (dc_qkv_ + (size_t) (gil * dc_rows_ + row_base_) * C) : (qkv_L_ + (size_t) gil * MT * C);
+                float* hb = dc_dir ? (dc_h_ + (size_t) (gil * dc_rows_ + row_base_) * C) : (h_L_ + (size_t) gil * MT * C);
+                float* gate = dc_dir ? (dc_gate_ + (size_t) (gil * dc_rows_ + row_base_) * HV) : (gate_L_ + (size_t) gil * MT * HV);
+                float* beta = dc_dir ? (dc_beta_ + (size_t) (gil * dc_rows_ + row_base_) * HV) : (beta_L_ + (size_t) gil * MT * HV);
                 if (sidem) {   // the gates (a few blocks, latency-bound) beside the projections, joined below
                     if (!branch(mfork_, cs, side_, "fork")) return false;
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -2025,7 +2046,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     norm_rope_on(data, norm, rows, cols, pos, cs);
                 };
-                float* idx_raw = idx_raw_L_ + (size_t) (qi - qsa_off_) * MT * ID;
+                static const bool dc_dir_env = [] {
+                    const char* v = std::getenv("STRATA_BATCH_DC_DIRECT");
+                    return v != nullptr && v[0] != '\0' && v[0] != '0';
+                }();
+                const bool dc_dir = dc_dir_env && batch_rec_ && staging_deferred_ && dc_rows_ > 0;
+                float* idx_raw = dc_dir ? (dc_idx_ + (size_t) ((qi - qsa_off_) * dc_rows_ + row_base_) * ID)
+                                        : (idx_raw_L_ + (size_t) (qi - qsa_off_) * MT * ID);
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 // STRATA_DF_QB_Q4 (default on since 0.1.45; STRATA_DF_QB_Q4=0 gives the old token-by-token path): a Q4_0 KV cache
@@ -4517,17 +4544,26 @@ bool Verifier::init_deferred_commit(int rows, std::string& err) {
         return false;
     }
     dc_rows_ = rows;
+    static const bool dc_dir_env = [] {
+        const char* v = std::getenv("STRATA_BATCH_DC_DIRECT");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
     std::fprintf(stderr, "strata verify: pipelined batch windows commit after the verdict (layers [%lld, %lld), %d rows, "
-                         "%.1f MiB saved rows)\n", (long long) lb_, (long long) le_, rows, (double) bytes / 1048576.0);
+                         "%.1f MiB saved rows%s)\n", (long long) lb_, (long long) le_, rows, (double) bytes / 1048576.0,
+                 dc_dir_env ? ", STRATA_BATCH_DC_DIRECT=1 zero-copy" : "");
     return true;
 }
 
 bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& err) {
     using namespace strata::kernels;
+    static const bool dc_dir_env = [] {
+        const char* v = std::getenv("STRATA_BATCH_DC_DIRECT");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
     const auto key = bkey(rows, S, hbase);
     cudaGraphExec_t& sex = save_bm_[key];
     cudaGraphExec_t& cex = dcommit_bm_[key];
-    if (sex != nullptr && cex != nullptr) return true;
+    if ((dc_dir_env || sex != nullptr) && cex != nullptr) return true;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
@@ -4554,7 +4590,8 @@ bool Verifier::capture_deferred(const int* rows, int S, int hbase, std::string& 
         return made;
     };
     // the save: the window's rows [0, S) of the scratch the commit replays -> the group's saved rows [hbase, +S)
-    if (sex == nullptr) {
+    // (skipped when STRATA_BATCH_DC_DIRECT=1: record_window already wrote directly to dc_* + hbase)
+    if (!dc_dir_env && sex == nullptr) {
         if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
             err = "verify: begin save capture failed";
             return false;
@@ -4671,8 +4708,12 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
     staging_deferred_ = false;
     if (!staged || !capture_deferred(rows, S, hbase, err)) return false;
     const auto key = bkey(rows, S, hbase);
+    static const bool dc_dir_env = [] {
+        const char* v = std::getenv("STRATA_BATCH_DC_DIRECT");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
     cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
-    if (le == cudaSuccess) le = cudaGraphLaunch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
+    if (le == cudaSuccess && !dc_dir_env) le = cudaGraphLaunch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     b_k_ = 0;

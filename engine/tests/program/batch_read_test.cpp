@@ -83,9 +83,11 @@ int main() {
     CHECK(!piped_read_lead_in(true, true, -1.0, 400.0));
     CHECK(!piped_read_lead_in(false, true, 0.0, 400.0));
     CHECK(!piped_read_lead_in(true, false, 0.0, 400.0));
-    // piped_fair_piece: full chunks when idle, capped to decode_chunk while slots decode
+    // piped_fair_piece: full chunks when idle (or 0 when idle_full=true), capped to decode_chunk while slots decode
     CHECK(piped_fair_piece(0, 2048, true, 1024) == 0);
     CHECK(piped_fair_piece(2048, 2048, false, 1024) == 2048);
+    CHECK(piped_fair_piece(2048, 2048, false, 1024, true) == 0);
+    CHECK(piped_fair_piece(2048, 2048, true, 1024, true) == 1024);
     CHECK(piped_fair_piece(2048, 2048, true, 1024) == 1024);
     CHECK(piped_fair_piece(2048, 2048, true, 0) == 2048);
     CHECK(piped_fair_piece(2048, 2048, true, 4096) == 2048);

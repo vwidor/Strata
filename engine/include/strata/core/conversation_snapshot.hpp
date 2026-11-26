@@ -188,6 +188,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& session, const ModelGeometry& g,
-                                                          const QsaState* draft, std::string& error);
+                                                          const QsaState* draft, std::string& error,
+                                                          bool allow_split = false);
 
 } // namespace strata::core

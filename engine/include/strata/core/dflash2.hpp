@@ -103,7 +103,8 @@ public:
     ///   - a parked lineage (kept in the stash when another conversation took over) agrees: it is swapped in and the window rebuilt from its log;
     ///   - neither: the ring starts over and `*cold` is set (the drafts are poor for the first rounds, never wrong: the verify decides).
     /// `*cold` is also set when some of the window's rows could not be rebuilt (never logged).
-    bool begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold);
+    /// `skip_rebuild`: keep lineage tracking/stashing intact but defer VRAM ring rebuild (used for max_tokens=1).
+    bool begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold, bool skip_rebuild = false);
     /// RING LOG (STRATA_DF2_RING_LOG=0 turns it off, which restores the pre-log behaviour for A/Bs).  Every context update copies the activation rows the K/V of all
     /// five layers are computed from (the int8 codes and block scales after hidden_norm: 2560 + 320 bytes a position, 2.9 KB, against 40 KB of K/V and 51 KB of taps)
     /// into a host log of the lineage; a rebuild runs the layers' K/V projections, norms, rope and ring writes over the logged rows, with the same kernels, so the
@@ -176,7 +177,8 @@ private:
     const float* f32(const std::string& name) const { return reinterpret_cast<const float*>(blob_ + find(name).off); }
     /// planar Q8 matrices (1..3 of them, same input width) times the planar activations in xqp_ / xdp_ (ncols columns)
     void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd);
-    bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope = true);
+    bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope = true,
+                        const int32_t* pos_dev = nullptr, int8_t* logq_dst = nullptr, float* logd_dst = nullptr);
     bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
     bool capture(int n, const float* taps, std::string& err);
     bool alloc(std::string& err);
@@ -268,6 +270,11 @@ private:
     float* rb_d_ = nullptr;
     int32_t* rb_pos_ = nullptr;
     uint64_t rb_bytes_ = 0;
+    // STRATA_DF2_FAST_CTX=1: batched 1-sync context() staging (allocated lazily on first multi-row context update)
+    int32_t* ctx_pos_ = nullptr;        ///< device positions [kRing2048]
+    int32_t* h_ctx_pos_ = nullptr;      ///< pinned host positions [kRing2048]
+    int8_t* h_logq_bulk_ = nullptr;     ///< pinned host bulk log codes [kRing2048][2560]
+    float* h_logd_bulk_ = nullptr;      ///< pinned host bulk log scales [kRing2048][80]
     void log_stage(int64_t pos0, int n);       ///< an update of rows [pos0, pos0 + n) is queued: remember where its h_log* rows go, mark the slots
     void log_flush();                          ///< after the stream sync: move the staged rows into the lineage's log
     bool log_row(int64_t pos, const int8_t** q, const float** d) const;

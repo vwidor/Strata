@@ -85,9 +85,11 @@ inline bool piped_read_lead_in(bool enabled, bool beside_slots, double ms_since_
 }
 
 /// STRATA_PIPED_FAIR=1 + STRATA_PIPED_DECODE_CHUNK=N (opt-in): keep full `piped_read_piece` chunks when the server is
-/// idle (zero throughput penalty), and cap the piece to `decode_chunk` tokens while slots are actively decoding so
-/// worst-case decode pauses stay bounded and BYIELD is checked sooner.
-inline int64_t piped_fair_piece(int64_t piece_tokens, int64_t chunk, bool beside_slots, int64_t decode_chunk) {
+/// idle (or 0 for one continuous pipelined run when `idle_full` is set), and cap the piece to `decode_chunk` tokens
+/// while slots are actively decoding so worst-case decode pauses stay bounded and BYIELD is checked sooner.
+inline int64_t piped_fair_piece(int64_t piece_tokens, int64_t chunk, bool beside_slots, int64_t decode_chunk,
+                                bool idle_full = false) {
+    if (!beside_slots && idle_full) return 0;
     const int64_t base = piped_read_piece(piece_tokens, chunk);
     if (base <= 0) return 0;
     if (beside_slots && decode_chunk > 0 && decode_chunk < base) return std::clamp<int64_t>(decode_chunk, 1, base);

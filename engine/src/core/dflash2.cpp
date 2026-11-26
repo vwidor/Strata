@@ -48,6 +48,10 @@ Dflash2Drafter::~Dflash2Drafter() {
     auto fr = [](void* p) { if (p) cudaFree(p); };
     if (h_logq_) cudaFreeHost(h_logq_);
     if (h_logd_) cudaFreeHost(h_logd_);
+    if (h_logq_bulk_) cudaFreeHost(h_logq_bulk_);
+    if (h_logd_bulk_) cudaFreeHost(h_logd_bulk_);
+    if (h_ctx_pos_) cudaFreeHost(h_ctx_pos_);
+    fr(ctx_pos_);
     fr(rb_q_); fr(rb_d_); fr(rb_pos_);
     if (!blob_shared_) fr(blob_);
     fr(landing_); if (dpend_) cudaFreeHost(dpend_); fr(tag_); fr(d_meta_); fr(xq_); fr(xil_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rope_inv_);
@@ -446,12 +450,14 @@ bool Dflash2Drafter::record_kv(int n, cudaStream_t cs, const uint8_t* xq, const 
     return true;
 }
 
-bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope) {
+bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope,
+                                    const int32_t* pos_dev, int8_t* logq_dst, float* logd_dst) {
     using namespace kernels;
     if (skip_part("ctx")) return true;
     try {
+        const int32_t* const pdev = pos_dev != nullptr ? pos_dev : (d_meta_ + 0);
         const int tap_n = (int) taps_.size() * N_;
-        if (rope) df2_rope_table_inv(d_meta_ + 0, n, rope_inv_, rt_ctx_, cs);
+        if (rope) df2_rope_table_inv(pdev, n, rope_inv_, rt_ctx_, cs);
         stamp("df2_rope_table");
         df2_quant_rows(taps, tap_n, n, xqc_, xdc_, cs);
         stamp("df2_quant_rows");
@@ -460,10 +466,12 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
         df2_rms_quant(fcy_, f32("hidden_norm.weight"), nullptr, n, N_, eps_, xqc_, xdc_, cs);
         stamp("df2_rms_quant");
         if (log_on_) {   // the ring log: these codes and scales are all the K/V of the five layers are made from (see begin_request)
-            cudaMemcpyAsync(h_logq_, xqc_, (size_t) n * N_, cudaMemcpyDeviceToHost, cs);
-            cudaMemcpyAsync(h_logd_, xdc_, (size_t) n * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs);
+            int8_t* const lq = logq_dst != nullptr ? logq_dst : h_logq_;
+            float* const ld = logd_dst != nullptr ? logd_dst : h_logd_;
+            cudaMemcpyAsync(lq, xqc_, (size_t) n * N_, cudaMemcpyDeviceToHost, cs);
+            cudaMemcpyAsync(ld, xdc_, (size_t) n * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs);
         }
-        if (!record_kv(n, cs, xqc_, xdc_, d_meta_ + 0, err)) return false;
+        if (!record_kv(n, cs, xqc_, xdc_, pdev, err)) return false;
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -912,7 +920,7 @@ bool Dflash2Drafter::rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* 
     return true;
 }
 
-bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold) {
+bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold, bool skip_rebuild) {
     resume = std::max<int64_t>(0, std::min(resume, n));
     if (cold) *cold = false;
     ++ring_stats.requests;
@@ -968,7 +976,7 @@ bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume
     // the window the first draft reads, below `resume` (the prompt's own taps cover [resume, n)): every slot that does not hold its row is rebuilt from the log
     int64_t rebuilt = 0, missing = 0;
     const int64_t lo = std::max<int64_t>(0, n - (window_ - 1)), hi = resume;
-    if (hi > lo) {
+    if (!skip_rebuild && hi > lo) {
         if (!rebuild(lo, hi, &rebuilt, &missing, err)) {
             std::fprintf(stderr, "strata dflash2: %s: the ring starts over for this request\n", err.c_str());
             invalidate_ring();
@@ -1006,6 +1014,73 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
     if (!context_wait(err)) return false;
     const OnDevice on_device(device_);
     const int tap_n = (int) taps_.size() * N_;
+    // STRATA_DF2_FAST_CTX=1 (opt-in): batch up to 2048 context rows with one position upload and one stream sync
+    // instead of syncing every 8 rows (256x fewer host-GPU stalls on 2k prefill chunks; bitwise identical kernels).
+    static const bool fast_ctx = [] {
+        const char* v = std::getenv("STRATA_DF2_FAST_CTX");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (fast_ctx && n > kRows) {
+        if (ctx_pos_ == nullptr) {
+            if (cudaMalloc((void**) &ctx_pos_, (size_t) kRing2048 * sizeof(int32_t)) != cudaSuccess ||
+                cudaHostAlloc((void**) &h_ctx_pos_, (size_t) kRing2048 * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
+                if (ctx_pos_) { cudaFree(ctx_pos_); ctx_pos_ = nullptr; }
+                if (h_ctx_pos_) { cudaFreeHost(h_ctx_pos_); h_ctx_pos_ = nullptr; }
+                (void) cudaGetLastError();
+            }
+        }
+        bool bulk_log_ok = !log_on_;
+        if (log_on_) {
+            if (h_logq_bulk_ == nullptr) {
+                if (cudaHostAlloc((void**) &h_logq_bulk_, (size_t) kRing2048 * (size_t) N_, cudaHostAllocDefault) != cudaSuccess ||
+                    cudaHostAlloc((void**) &h_logd_bulk_, (size_t) kRing2048 * (size_t) (N_ / 32) * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                    if (h_logq_bulk_) { cudaFreeHost(h_logq_bulk_); h_logq_bulk_ = nullptr; }
+                    if (h_logd_bulk_) { cudaFreeHost(h_logd_bulk_); h_logd_bulk_ = nullptr; }
+                    (void) cudaGetLastError();
+                }
+            }
+            bulk_log_ok = (h_logq_bulk_ != nullptr && h_logd_bulk_ != nullptr);
+        }
+        if (ctx_pos_ != nullptr && h_ctx_pos_ != nullptr && bulk_log_ok) {
+            for (int64_t s0 = 0; s0 < n; s0 += kRing2048) {
+                const int64_t m_tot = std::min<int64_t>(kRing2048, n - s0);
+                for (int64_t i = 0; i < m_tot; ++i) h_ctx_pos_[i] = (int32_t) (pos0 + s0 + i);
+                h_meta_[18] = epoch_;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+                if (cudaMemcpyAsync(ctx_pos_, h_ctx_pos_, (size_t) m_tot * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+                    err = std::string("dflash2: fast context pos upload: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                for (int64_t r0 = 0; r0 < m_tot; r0 += kRows) {
+                    const int m = (int) std::min<int64_t>(kRows, m_tot - r0);
+                    int8_t* const lq = log_on_ ? (h_logq_bulk_ + (size_t) r0 * (size_t) N_) : nullptr;
+                    float* const ld = log_on_ ? (h_logd_bulk_ + (size_t) r0 * (size_t) (N_ / 32)) : nullptr;
+                    if (!record_context(taps + (size_t) (s0 + r0) * (size_t) tap_n, m, cs_, err, true,
+                                        ctx_pos_ + r0, lq, ld))
+                        return false;
+                }
+                if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+                    err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (log_on_) {
+                    for (int64_t i = 0; i < m_tot; ++i) {
+                        const int64_t pos = pos0 + s0 + i;
+                        slot_pos_[(size_t) (pos % kRing)] = ((int64_t) epoch_ << 32) | pos;
+                        LogChunk& ch = cur_.writable((size_t) (pos / kLogChunk));
+                        const size_t r = (size_t) (pos % kLogChunk);
+                        std::memcpy(&ch.q[r * 2560], h_logq_bulk_ + (size_t) i * 2560, 2560);
+                        std::memcpy(&ch.d[r * 80], h_logd_bulk_ + (size_t) i * 80, 80 * sizeof(float));
+                        ch.ok[r] = 1;
+                    }
+                }
+            }
+            have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
+            ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n);
+            return true;
+        }
+    }
     for (int64_t r0 = 0; r0 < n; r0 += kRows) {
         const int m = (int) std::min<int64_t>(kRows, n - r0);
         for (int i = 0; i < m; ++i) h_meta_[i] = (int32_t) (pos0 + r0 + i);

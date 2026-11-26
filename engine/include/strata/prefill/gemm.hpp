@@ -103,6 +103,7 @@ private:
     int64_t w16_used_ = 0;
     int64_t w16_reserve_ = 2ll << 30;   // VRAM kept free after a cached weight
     bool w16_logged_ = false;
+    void w16_init();
     static constexpr int64_t kW16AutoReserve = 3ll << 30;
 public:
     /// The engine's own default for the FP16 weight cache when STRATA_PF_W16_CACHE_MIB is not set: true -> sized by the card (weights are cached while

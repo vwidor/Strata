@@ -659,12 +659,18 @@ const uint16_t* Gemm::unpad_x(const uint16_t* X, int64_t T, int64_t K, int64_t l
 }
 
 bool gemm_dequant_side() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DEQUANT_SIDE");
+        if (!v || v[0] != '1') return false;
 #if defined(__HIPCC__)
-    return false;
-#else
-    static const bool on = [] { const char* v = std::getenv("STRATA_DEQUANT_SIDE"); return v && v[0] == '1'; }();
-    return on;
+        // Safe on HIP when neither padded gfx11 GEMM nor dense MMQ shares scratch_ without events.
+        const char* pad = std::getenv("STRATA_PF_PAD");
+        const char* mmq = std::getenv("STRATA_DENSE_MMQ");
+        if ((pad && pad[0] == '1') || (mmq && mmq[0] == '1')) return false;
 #endif
+        return true;
+    }();
+    return on;
 }
 
 Gemm::~Gemm() {
@@ -1083,11 +1089,50 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     if (f16_io_) {   // X is the FP16 image (set_act_f16); W goes through the dequantization scratch as FP16
         // the only accumulating BF16 product is the BF16X2 low part, which bf16x2_mode() turns off with this path
         if (beta != 0.0f) { std::fprintf(stderr, "prefill gemm: an accumulating BF16 GEMM on the FP16 prompt path\n"); std::exit(1); }
+#ifndef STRATA_USE_HIP
+        static const bool w16_bf16 = [] {
+            const char* v = std::getenv("STRATA_PF_W16_BF16");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (w16_bf16) {
+            if (w16_budget_ < 0) w16_init();
+            if (w16_budget_ > 0) {
+                const int64_t bytes = N * K * 2;
+                uint16_t* cw = nullptr;
+                for (const W16Entry& e : w16_)
+                    if (e.p == W && e.type == -1 && e.n == N && e.k == K) { cw = e.d; break; }
+                if (cw == nullptr && w16_used_ + bytes <= w16_budget_) {
+                    size_t fb = 0, tb = 0;
+                    if (cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb > (size_t) bytes + (size_t) w16_reserve_ &&
+                        cudaMalloc((void**) &cw, (size_t) bytes) == cudaSuccess) {
+                        const unsigned blk = (unsigned) std::max<int64_t>(1, std::min<int64_t>(1024, (N * K + 255) / 256));
+                        bf16_to_f16_rows<<<blk, 256, 0, (cudaStream_t) stream_>>>(W, (__half*) cw, N * K);
+                        w16_.push_back({W, -1, N, K, cw});
+                        w16_used_ += bytes;
+                    } else {
+                        (void) cudaGetLastError();
+                        cw = nullptr;
+                        if (w16_budget_ > 0 && !w16_logged_) {
+                            w16_logged_ = true;
+                            std::fprintf(stderr, "strata prefill: FP16 weight cache %lld MiB (the card keeps %lld MiB free; STRATA_PF_W16_CACHE_MIB=0 turns it off)\n",
+                                         (long long) (w16_used_ >> 20), (long long) (w16_reserve_ >> 20));
+                        }
+                        w16_budget_ = w16_used_ > 0 ? w16_used_ : 0;
+                    }
+                }
+                if (cw != nullptr) {
+                    f16_inplace(X, cw, Y, T, N, K, ldy);
+                    return;
+                }
+            }
+        }
+#endif
         const int64_t rows = std::min<int64_t>(N, scratch_elems_ / K);
         if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min(rows, N - r0);
-            bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
+            const unsigned blk = (unsigned) std::max<int64_t>(1, std::min<int64_t>(1024, (n * K + 255) / 256));
+            bf16_to_f16_rows<<<blk, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
             f16_inplace(X, scratch_, Y + r0, T, n, K, ldy);
         }
         return;
@@ -1378,6 +1423,39 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 #endif
 }
 
+void Gemm::w16_init() {
+    const char* v = std::getenv("STRATA_PF_W16_CACHE_MIB");
+    if (v != nullptr && std::strcmp(v, "auto") == 0) {
+        w16_budget_ = 16ll << 30;
+        w16_reserve_ = kW16AutoReserve;
+    } else if (v != nullptr) {
+        w16_budget_ = (int64_t) std::atoll(v) * (1ll << 20);
+        w16_reserve_ = 2ll << 30;
+    } else {
+        w16_budget_ = w16_auto_default_().load() ? (16ll << 30) : 0;
+        w16_reserve_ = kW16AutoReserve;
+    }
+    // Optional per-device VRAM reserve override (MiB, e.g. STRATA_PF_W16_RESERVE_MIB=1300,350).
+    if (const char* rv = std::getenv("STRATA_PF_W16_RESERVE_MIB"); rv != nullptr && rv[0] != '\0') {
+        int dev = 0;
+        (void) cudaGetDevice(&dev);
+        int64_t chosen = -1;
+        int idx = 0;
+        const char* p = rv;
+        while (*p) {
+            char* end = nullptr;
+            const long long val = std::strtoll(p, &end, 10);
+            if (end == p) break;
+            if (idx <= dev) chosen = std::max<int64_t>(0, (int64_t) val) * (1ll << 20);
+            if (idx == dev) break;
+            ++idx;
+            while (*end == ',' || *end == ' ') ++end;
+            p = end;
+        }
+        if (chosen >= 0) w16_reserve_ = chosen;
+    }
+}
+
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
 #ifdef STRATA_USE_HIP
@@ -1436,29 +1514,8 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     // so a card whose expert cache fills it caches nothing and a card with room (all experts resident) caches what the
     // prompt path uses (~6 GB for Qwen3.8).  STRATA_PF_W16_CACHE_MIB=N is an explicit budget (2 GiB kept free, as before),
     // =0 turns it off.
-    if (w16_budget_ < 0) {
-        const char* v = std::getenv("STRATA_PF_W16_CACHE_MIB");
-        if (v != nullptr && std::strcmp(v, "auto") == 0) {
-            // STRATA_PF_W16_CACHE_MIB=auto (tester switch, round0212 item 7): the automatic sizing - weights are cached while the card
-            // keeps kW16AutoReserve free afterwards, so a card whose expert cache fills it caches nothing.  Not bit-exact (see below),
-            // so it is not the default until the owner says yes.
-            w16_budget_ = 16ll << 30;
-            w16_reserve_ = kW16AutoReserve;
-        } else if (v != nullptr) {
-            w16_budget_ = (int64_t) std::atoll(v) * (1ll << 20);
-            w16_reserve_ = 2ll << 30;
-        } else {
-            // INT3 turned the default off (11-01) because gemm_dequant_side_parity failed with it on sm_86 / sm_120 / sm_121.  That test builds its Gemm
-            // with a 10.5 M-element scratch, smaller than four of its weights, so uncached those take the sliced path (several GEMMs) and cached they
-            // take one full-N GEMM: not the engine.  The engine's scratch is GEMM_SCRATCH = 32 M elements and every dense projection of Qwen3.8
-            // (largest attn_q, 31.5 M) fits it, so cached and uncached are the same GEMM on the same FP16 values (gemm_w16_parity: the engine's scratch,
-            // shapes and types, bitwise).  Round0212 item 7: on when the engine says so (set_w16_auto_default: Linux CUDA with batch slots), else off
-            // as in v0.2.9.  It takes only VRAM beyond kW16AutoReserve, so a card whose expert cache fills it caches nothing.  =0 turns it off.
-            w16_budget_ = w16_auto_default_().load() ? (16ll << 30) : 0;
-            w16_reserve_ = kW16AutoReserve;
-        }
-    }
-    if (w16_budget_ > 0 && !side_scratch_) {
+    if (w16_budget_ < 0) w16_init();
+    if (w16_budget_ > 0) {
         const int64_t bytes = N * K * 2;
         uint16_t* cw = nullptr;
         for (const W16Entry& e : w16_)
