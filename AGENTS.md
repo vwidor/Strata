@@ -1,8 +1,16 @@
 # AGENTS.md
 
+**MANDATORY — Output Quality & Parity Gate (NEVER VIOLATE):** Output quality always outranks speed and VRAM savings. Never deploy, enable in a profile, or ship any engine/kernel/compiler/scheduler/runtime-flag change that could silently degrade model logits, token probabilities, greedy output, classification accuracy, or structured-output reliability.
+- **No blind changes or flag bundles:** Never enable untested optimizations or a bundle of new env flags together on a live/production service. Compiling cleanly, returning plausible text, or measuring higher `tok/s` is **not** verification.
+- **Required parity gate before enabling any change:** Every new binary, kernel, math/compiler flag (e.g. fast-math), quant/KV change, or opt-in env flag must be verified against the known-good baseline across **every execution path it can affect**:
+  1. **Kernel/unit parity:** Bitwise exact for index/routing/state-copy ops; bounded error (`rel_l2 < 1e-3`, `0` NaN/Inf) for FP16/BF16 math.
+  2. **End-to-end logit, logprob & classification parity** against the baseline across: (a) **short prompts** (windowed read), (b) **long prompts** (`>= 2,048` tokens exercising chunked prefill), (c) **cached-prefix / checkpoint / parked-slot follow-ups**, (d) **structured-output & `max_tokens=1` + `logprobs` / constrained-token probes** (including an unambiguous multi-option classification check confirming both the right choice and sharp probability mass, e.g. `> 95%`, with no option-1 bias or flattened confidence), and (e) **concurrent multi-slot batch decode** when batch/scheduler/spec-decode paths are touched.
+- **Post-deploy check & immediate rollback:** Immediately after updating a live service, run the live quality + logprobs + structured-output check. On any confidence collapse, logit mismatch, positional bias, or structured-output failure, **roll back immediately** to the known-good binary and config before debugging.
+- **Never report speed without quality:** Do not claim a speedup or keep an optimization enabled unless it has passed the parity gate above.
+
 **Git workflow:** This is our public fork. Always commit and push your changes after completing work unless explicitly told not to. Document measured findings, tuning results, profiles, and rejected experiments (e.g. in `docs/MI50_TUNING.md`) so future sessions do not repeat work. Keep docs concise and current — never bloat docs with changelogs, meta-notes about removed files/tools, or unnecessary history. **Always anonymize** all committed docs, configs, and commit messages — never include private hostnames, domains, LAN IPs, usernames, internal VM/service IDs, or private client names.
 
-**Benchmarking rule:** Use **fast verification runs** (targeted kernel micro-benchmarks or short single-pass checks of ~30–60 s directly against the running server). Do **not** run slow multi-round full-reload A/B sweeps across many arms.
+**Benchmarking rule:** Use **fast verification runs** (targeted kernel parity/micro-benchmarks or short single-pass checks of ~30–60 s directly against the running server). Do **not** run slow multi-round full-reload A/B sweeps across many arms. Speed checks never replace the mandatory quality & parity gate above.
 
 Version 0.2.17, engine 0.1.63. The public model families are
 Qwen3.8-Flash-Next and Qwen3.6-35B-A3B. Read **[docs/AI_REFERENCE.md](docs/AI_REFERENCE.md)** for model availability, APIs, hardware limits and
