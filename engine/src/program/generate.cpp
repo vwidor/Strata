@@ -20474,14 +20474,33 @@ int main(int argc, char** argv) {
                 const int64_t C = planned ? std::max<int64_t>(1, sp.chunk() / plan.chunk) * plan.chunk
                                           : std::max<int64_t>(sp.chunk(), 1);
                 const int64_t C_read = planned ? plan.chunk : C;   // what the yield test calls a chunk
+                // STRATA_PIPED_FAIR=1 (opt-in; off by default): fair chunked-prefill scheduling on pipelined groups:
+                //   - relaxes BYIELD tail check to > short_read (and checks BYIELD at pinned segment boundaries too)
+                //   - caps piece size to STRATA_PIPED_DECODE_CHUNK while slots are actively decoding (full chunks when idle)
+                //   - scales inter-piece and lead-in decode budgets by active decoding slot count, and tracks 1-piece read times
+                static const bool pr_fair = [] {
+                    const char* v = std::getenv("STRATA_PIPED_FAIR");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                static const int64_t pr_dec_chunk = [] {
+                    const char* v = std::getenv("STRATA_PIPED_DECODE_CHUNK");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
+                }();
+                auto active_decode_slots = [&]() -> int {
+                    int c = 0;
+                    for (const BSlot& s : bs)
+                        if (s.active && !s.rd_on) ++c;
+                    return c;
+                };
                 // BYIELD <ys> with the read stopped at q (nothing in flight): the part read waits in slot ys and the
                 // read ends with e = "yield" (true); false when it cannot give way there (the read goes on).  Only
                 // where the rest is read the same way after it (more than a chunk and more than a short read left),
                 // text only, and into a slot that is not decoding.
                 auto give_way = [&](int ys, int64_t q, std::string& err) -> bool {
-                    const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                    const int64_t tail_left = pr_fair ? (n - 1 - q) : (b0 - q);
+                    const bool can = ys >= 0 && ys < (int) bs.size() && !bs[(size_t) ys].active &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
-                                     b0 - q > std::max<int64_t>(C_read, o.short_read);
+                                     strata::program::byield_tail_ok(tail_left, C_read, o.short_read, pr_fair);
                     std::string ye;
                     const auto ty = Clock::now();
                     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
@@ -20830,9 +20849,32 @@ int main(int argc, char** argv) {
                 static bool pr_have_prev = false;
                 static double pr_prev_piece_ms = 0.0;   // the previous read's last full piece
                 if (pr_on) {
+                    if (pr_fair && a0 > 0) {
+                        int ys = -1;
+                        {
+                            std::lock_guard<std::mutex> lk(in_mu);
+                            for (auto it = in_lines.begin(); it != in_lines.end();) {
+                                if (it->rfind("BSTOP ", 0) == 0) {
+                                    const int b = std::atoi(it->c_str() + 6);
+                                    if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                    it = in_lines.erase(it);
+                                } else if (it->rfind("BYIELD ", 0) == 0) {
+                                    ys = std::atoi(it->c_str() + 7);
+                                    it = in_lines.erase(it);
+                                } else {
+                                    ++it;
+                                }
+                            }
+                        }
+                        if (ys >= 0 && give_way(ys, a0, e)) return false;
+                    }
+                    const int n_dec = pr_fair ? active_decode_slots() : 1;
                     const double lead =
                         pr_prev_piece_ms > 0.0
-                            ? strata::program::piped_decode_budget_ms(pr_prev_piece_ms, decode_share, pr_cap, pr_floor)
+                            ? (pr_fair ? strata::program::piped_fair_decode_budget_ms(pr_prev_piece_ms, decode_share,
+                                                                                      n_dec, pr_cap, pr_floor)
+                                       : strata::program::piped_decode_budget_ms(pr_prev_piece_ms, decode_share,
+                                                                                 pr_cap, pr_floor))
                             : (pr_cap > 0.0 ? pr_cap : std::max(pr_floor, 200.0));
                     const double since =
                         pr_have_prev ? std::chrono::duration<double, std::milli>(Clock::now() - pr_prev_end).count()
@@ -20849,11 +20891,14 @@ int main(int argc, char** argv) {
                 int64_t piece = piece_now();
                 if (piece <= 0) return run(a0, b0);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + piece);
+                    const int64_t step_piece = (pr_on && pr_fair)
+                        ? strata::program::piped_fair_piece(pr_piece, C, batch_on(), pr_dec_chunk)
+                        : piece;
+                    const int64_t r = std::min(b0, q + step_piece);
                     const auto tq = Clock::now();
                     if (!run_conc(q, r)) return false;
                     const double piece_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
-                    if (pr_on && r < b0) pr_prev_piece_ms = piece_ms;
+                    if (pr_on && (r < b0 || pr_fair)) pr_prev_piece_ms = piece_ms;
                     const int64_t piece_tokens = r - q;
                     q = r;
                     if (q >= b0) continue;
@@ -20882,8 +20927,10 @@ int main(int argc, char** argv) {
                                          (long long) piece_tokens, piece_ms, (long long) q, (long long) n);
                             continue;
                         }
-                        const double budget =
-                            strata::program::piped_decode_budget_ms(piece_ms, decode_share, pr_cap, pr_floor);
+                        const double budget = pr_fair
+                            ? strata::program::piped_fair_decode_budget_ms(piece_ms, decode_share,
+                                                                           active_decode_slots(), pr_cap, pr_floor)
+                            : strata::program::piped_decode_budget_ms(piece_ms, decode_share, pr_cap, pr_floor);
                         const int64_t rows0 = pipe_rows;
                         const auto td = Clock::now();
                         if (!piped_decode(budget, e)) return false;

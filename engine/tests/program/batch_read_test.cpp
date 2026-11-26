@@ -6,9 +6,12 @@
 #include <iterator>
 
 using strata::program::batch_read_piece;
+using strata::program::byield_tail_ok;
 using strata::program::concurrent_read_off;
 using strata::program::ConcurrentReadSetup;
 using strata::program::piped_decode_budget_ms;
+using strata::program::piped_fair_decode_budget_ms;
+using strata::program::piped_fair_piece;
 using strata::program::piped_read_lead_in;
 using strata::program::piped_read_piece;
 
@@ -80,6 +83,21 @@ int main() {
     CHECK(!piped_read_lead_in(true, true, -1.0, 400.0));
     CHECK(!piped_read_lead_in(false, true, 0.0, 400.0));
     CHECK(!piped_read_lead_in(true, false, 0.0, 400.0));
+    // piped_fair_piece: full chunks when idle, capped to decode_chunk while slots decode
+    CHECK(piped_fair_piece(0, 2048, true, 1024) == 0);
+    CHECK(piped_fair_piece(2048, 2048, false, 1024) == 2048);
+    CHECK(piped_fair_piece(2048, 2048, true, 1024) == 1024);
+    CHECK(piped_fair_piece(2048, 2048, true, 0) == 2048);
+    CHECK(piped_fair_piece(2048, 2048, true, 4096) == 2048);
+    // piped_fair_decode_budget_ms: scales by active decoding slots, clamped to [floor, cap]
+    CHECK(piped_fair_decode_budget_ms(1000.0, 1.0, 1, 3000.0, 500.0) == 1000.0);
+    CHECK(piped_fair_decode_budget_ms(1000.0, 1.0, 3, 2500.0, 500.0) == 2500.0);
+    CHECK(piped_fair_decode_budget_ms(1000.0, 1.0, 0, 2500.0, 500.0) == 1000.0);
+    // byield_tail_ok: default needs > max(chunk, short_read); fair needs > short_read
+    CHECK(!byield_tail_ok(1614, 1792, 64, false));
+    CHECK(byield_tail_ok(1614, 1792, 64, true));
+    CHECK(!byield_tail_ok(64, 1792, 64, true));
+    CHECK(byield_tail_ok(65, 1792, 64, true));
     if (fails == 0) std::printf("batch_read_test: ok\n");
     return fails == 0 ? 0 : 1;
 }

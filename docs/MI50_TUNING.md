@@ -113,24 +113,26 @@ Measured at `layer_split=26`, `--pcie-frac 0`:
 | **`--prefill 4096` + `STRATA_PF_W16_CACHE_MIB=512`** | Used `~800 MiB` extra VRAM on GPU 1 (`256` was inert: `0 MiB`) | Reduced free VRAM headroom too far; kept `--prefill 2048` |
 | **`STRATA_BATCH_SELF_COMMIT=1` + `STRATA_PIPED_MTP`** | Engine warned and disabled `STRATA_PIPED_MTP` | Mutually exclusive |
 | **`mmvq_il_parity` on HIP (as-is)** | Throws `"native_quantize_q8_1_il is CUDA only"` | Currently behind `#if !defined(__HIPCC__)` in `native_mmvq.cu:4020` |
+| **`STRATA_PIPED_CONCURRENT=1` on ROCm 5.7** | `15.7 tok/s` prose during concurrent reads (`1.9–7.9 rows/s` on `1.2k–2.5k` chunks, `31–36 rows/s` on `565–779` chunks), then **GPU 1 VM access fault (`0x7ef998600000`, past `0x2000` buffer)** after 8 concurrent reads | ROCm 5.7 lacks high-priority decode queue isolation on `gfx906` (`verify.cpp` skips stream priority on HIP) and hit a GPU 1 memory access fault under concurrent host-thread HIP graph + prefill submissions; use `STRATA_PIPED_READ_PIECE` + `STRATA_PIPED_FAIR=1` instead |
 
 ---
 
 ## 7. Recommended Dual-MI50 Production Profile (Anonymized)
 
 Copy [the four-slot run config](mi50-four-slot.example.json) and replace the placeholder paths with your local
-gfx906 binaries and model files. Use the Phase 4 engine and the matching
+gfx906 binaries and model files. Use the Phase 5 engine (`STRATA_PIPED_FAIR`) and the matching
 [rocBLAS tuning table](../terminal/tools/hip/gfx906-rocblas-2.47.0.txt). Set `cwd` to the checkout's
 `terminal` directory so the engine can find `data/expert-profile.bin`.
 
 ```sh
 cp docs/mi50-four-slot.example.json mi50-four-slot.json
-python3 terminal/serve/server.py --config mi50-four-slot.json --host 127.0.0.1 --port 11433
+STRATA_ADMIT_SHORT_FIRST=1024 STRATA_ADMIT_MAX_WAIT_S=20 \
+  python3 terminal/serve/server.py --config mi50-four-slot.json --host 127.0.0.1 --port 11433
 ```
 
 The example listens on loopback at port 11433. Check `/props` for four slots and image support.
 Four slots in two groups share a 131,072-cell KV pool. Each request has a 102,400-token context limit.
-The profile reserves 12,000 MiB on GPU 1 for a second workload and sets the watchdog to 900 seconds.
+Both MI50s are dedicated (`layer_split: 25`, 100% VRAM expert residency with dedicated `1.11 GiB` prompt buffers per GPU, watchdog `900 s`), with fair chunked-prefill interleaving (`STRATA_PIPED_FAIR=1`) enabled. If co-hosting a second workload on GPU 1, add `"--vram-reserve-later-mib", "12000"`, `"layer_split": "28"`, and `"STRATA_SPLIT_OWN_BUFFERS": "0"`.
 
 ---
 
@@ -341,6 +343,27 @@ Five opt-in `gfx906` prefill upgrades targeting the four dominant MI50 prompt bo
 | **3× Batch Prose** *(total e2e)* | `63.0 tok/s` | `84.6 tok/s` | **`82.7 tok/s`** | within run noise | **`+31.3%`** |
 | **4× Batch Code** *(total / engine rows/s)* | `83.3` / `88.9 rows/s` | `110.9–120.0` / `118.6–129.1 rows/s` | **`117.3` / `120.1 rows/s`** | level | **`+40.8%`** / **`+35.1%`** |
 | **Post-Prefill Free VRAM** *(GPU 0 / GPU 1)* | `~1.7` / `~1.9 GiB` | `1.56` / `12.0 GiB` | **`1,276 MiB` / `11,929 MiB`** | `12 GiB` reserve intact | — |
+
+### 9.13 Phase 5: Dedicated Dual-MI50 Rebalance & Fair Pipelined Prefill/Decode Scheduling (measured, 2026-11-26)
+With both MI50s dedicated to Strata (`--vram-reserve-later-mib` removed, `24,576 / 24,576` experts `100%` VRAM resident with zero-doorbell graphs on both GPUs):
+- **Rebalance (`layer_split: 28 → 25`, `STRATA_SPLIT_OWN_BUFFERS=1`, `STRATA_ADMIT_MERGE_FIRST=1`):**
+  - Both stages keep their own `1.11 GiB` prompt buffers (`CUDA0`: `1.11` of `5.44 GiB` free; `CUDA1`: `1.11` of `3.61 GiB` free → `2,092 MiB` free after load), eliminating the `2.22 GiB` per-prompt PCIe borrow/refill loan.
+  - Balanced GPU junction temperatures from `75°C / 50°C` (`split=28`) to **`61°C / 60°C`** (`split=25`), raising uncontended solo decode to **`61.2 tok/s` pure (`53.9` e2e)** prose and **`81.0 tok/s` pure (`72.7` e2e)** code (`180 W`, `256` tok, `temp=0`, thinking off).
+- **Opt-in fair chunked-prefill scheduling (`STRATA_PIPED_FAIR=1`, `STRATA_PIPED_DECODE_CHUNK=1024`, `batch_read.hpp`, `generate.cpp`, `batch_read_test` pass) + server `STRATA_ADMIT_SHORT_FIRST=1024`:**
+  - Relaxes `BYIELD` remaining-tail guard from `> max(C_read, short_read)` to `> short_read` (and checks `BYIELD` at pinned-prefix segment boundaries), so mid-size 2k–4k prefills yield cleanly to short interactive prompts instead of blocking them.
+  - Dynamically caps prefill pieces to `STRATA_PIPED_DECODE_CHUNK` (`1024`) **only while slots are actively decoding** (`batch_on()`), automatically widening back to full `2048`-token chunks when idle (zero idle prefill penalty).
+  - Scales inter-piece and back-to-back lead-in decode budgets proportionally by active decoding slot count (`piped_fair_decode_budget_ms`) and records `pr_prev_piece_ms` on single-piece reads as well.
+
+**Live Concurrent Decode Beside Continuous Back-to-Back 3.4k-Token Prefills (`--batch 4 --batch-groups 2`, `180 W`, `256` tok, `temp=0`, thinking off):**
+
+| Mode | 1× Prose beside 3.4k prefills *(gen / e2e / TTFT / max gap)* | 1× Code beside 3.4k prefills *(gen / e2e / TTFT / max gap)* | 3× Batch beside 3.4k prefills *(per-slot gen / engine rows/s)* | Stability |
+|---|---|---|---|---|
+| **Baseline** (`split=28`, no pipelined interleaving) | `~3.2 tok/s` | `~3–4 tok/s` | starved | Stable |
+| **`STRATA_PIPED_CONCURRENT=1`** (`split=25`, own buffers) | `15.7` / `12.6 tok/s` / `4.09 s` / `3.63 s` | `10.9 tok/s` *(aborted at 74 tok)* | — | **GPU 1 VM fault (ROCm 5.7)** |
+| **`STRATA_PIPED_READ_PIECE=2048`** (`SHARE=1.0`, `800–1200 ms`) | `24.1` / `22.4 tok/s` / `0.84 s` / `2.64 s` | `37.5` / `15.1 tok/s` / `10.13 s` *(BYIELD rejected)* / `1.86 s` | — | Stable |
+| **`STRATA_PIPED_FAIR=1` + `DECODE_CHUNK=1024`** (`SHARE=1.5`, `1200–2500 ms`, `ADMIT_SHORT_FIRST=1024`) | **`29.5` / `22.9 tok/s`** / `2.56 s` / **`1.95 s`** *(burst `59.4 tok/s`, p95 `46.4 ms`)* | **`35.0` / `24.0 tok/s`** / **`3.39 s`** *(BYIELD taken)* / **`1.86 s`** *(burst `69.5 tok/s`)* | **`41.6–51.4 tok/s`** / **`86.4 rows/s`** *(burst `124.5 rows/s`, agg `42.4 e2e`)* | **Stable (0 errors)** |
+
+*(Server-side `STRATA_ADMIT_SHORT_FIRST=1024` / `STRATA_ADMIT_MAX_WAIT_S=20` must be set in the server process environment, e.g., systemd drop-in, since `server.py` reads it from `os.environ` at startup.)*
 
 ## 10. Production Incident: Nightly Backup Stalls the VM's Disk (measured, 2026-11-25)
 The rig is a KVM guest. Its hypervisor backs it up every night in snapshot mode. The backup freezes the guest file system for a moment (the QEMU guest agent logs `guest-fsfreeze`, around 23:00-23:15), then copies the disk while the VM runs. In that mode a guest write to a block that is not yet backed up waits until the old block has reached the backup target ("copy-before-write"). When the backup target is slow, every write in the guest waits.

@@ -84,4 +84,30 @@ inline bool piped_read_lead_in(bool enabled, bool beside_slots, double ms_since_
            ms_since_prev_end <= kPipedLeadInWindowMs + std::max(0.0, budget_ms);
 }
 
+/// STRATA_PIPED_FAIR=1 + STRATA_PIPED_DECODE_CHUNK=N (opt-in): keep full `piped_read_piece` chunks when the server is
+/// idle (zero throughput penalty), and cap the piece to `decode_chunk` tokens while slots are actively decoding so
+/// worst-case decode pauses stay bounded and BYIELD is checked sooner.
+inline int64_t piped_fair_piece(int64_t piece_tokens, int64_t chunk, bool beside_slots, int64_t decode_chunk) {
+    const int64_t base = piped_read_piece(piece_tokens, chunk);
+    if (base <= 0) return 0;
+    if (beside_slots && decode_chunk > 0 && decode_chunk < base) return std::clamp<int64_t>(decode_chunk, 1, base);
+    return base;
+}
+
+/// STRATA_PIPED_FAIR=1: scale the pipelined inter-piece / lead-in decode share by the number of actively decoding
+/// slots so one joining prefill cannot crowd out multiple concurrent decoding users, still bounded by [floor, cap].
+inline double piped_fair_decode_budget_ms(double piece_ms, double share, int active_slots, double cap_ms,
+                                          double floor_ms) {
+    return piped_decode_budget_ms(piece_ms, std::max(0.0, share) * (double) std::max(1, active_slots), cap_ms,
+                                  floor_ms);
+}
+
+/// Whether enough unread tokens remain for BYIELD to pause the prompt read into a slot.
+/// Default (`fair == false`): more than one chunk and more than `short_read`.
+/// STRATA_PIPED_FAIR=1 (`fair == true`): more than `short_read` so mid-size 2k-4k prefills also yield to short prompts.
+inline bool byield_tail_ok(int64_t remaining, int64_t chunk, int64_t short_read, bool fair) {
+    const int64_t sr = std::max<int64_t>(short_read, 0);
+    return fair ? (remaining > sr) : (remaining > std::max<int64_t>(chunk, sr));
+}
+
 }  // namespace strata::program
